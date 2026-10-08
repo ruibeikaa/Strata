@@ -158,27 +158,18 @@ stage s+1 reads chunk c-1 - and then takes about sum_i (b + a C_i) + (S - 1) max
 stages: large or uneven chunks keep the later cards waiting (a 10.7K-token prompt in a 7680 and a 3011 chunk over
 four stages: the first stage carried 24 of the 36 s), small ones pay b again and again.
 
-With `STRATA_PREFILL_PIPE=1` the first stage measures b/a (in tokens) on the rig itself, keeps it once it has settled,
-and from then on reads each prompt in the chunk count with the least pipeline time, when that beats today's split by
-3% or more: every count from the fewest the buffers allow is tried, each chunk evened out on the 256-token grid (at
-least 512, at most the buffers' chunk; keep `--prefill auto` so long prompts may use large chunks). The measurement
-takes up to two points per prompt - the median time of its full chunks on the first stage, before it waits for the
-next one, and its last chunk when that is 25% or more shorter - and fits a Theil-Sen line over the last 16 points, so a
-prompt read while something else slowed the card moves it little. b/a settles when, with four points or more of two
-sizes (the larger 1.5x the smaller or more), two fits in a row agree within 25%; the value is then kept for the run,
-no more points are taken, and the log says so once:
-
-    strata prefill: b/a 812 tokens measured on this rig, kept for this run (STRATA_PREFILL_PIPE=812 starts with it)
-
-Until then each prompt is read in today's chunk count, evened out, which in this model is never slower. The chunks
-change a prompt's output in the last bits (the GDN state and the attention are carried across chunk boundaries), so the
-rule never follows a value that is still moving: before b/a settles and after, a prompt's chunks depend on its length
-only, and the same prompt gives the same bits for the rest of the run. Another start may settle on a slightly different
-b/a, and so on other chunks for some lengths; `STRATA_PREFILL_PIPE=<b/a>` (the value from the log) fixes it across
-starts and from the first prompt. b/a differs by an order of magnitude between rigs, which is why it is measured:
-700-900 tokens on four GP100 dies (every expert in VRAM, slow arithmetic), about 6000 on two RTX 3090 Ti (part of the
-experts streamed and dequantized per chunk, fast arithmetic). `STRATA_PREFILL_PIPE_LOG=1` prints every chunk time and
-the current fit. The chunk geometry changes the rounding, so it is opt-in. One line per prompt says what it chose:
+With `STRATA_PREFILL_PIPE=1` the first stage measures b/a (in tokens) on the rig itself and reads each prompt in the
+chunk count with the least pipeline time, when that beats today's split by 3% or more: every count from the fewest the
+buffers allow is tried, each chunk evened out on the 256-token grid (at least 512, at most the buffers' chunk; keep
+`--prefill auto` so long prompts may use large chunks). The measurement is one point per prompt - the chunk size and
+the median time of its full chunks on the first stage, before it waits for the next one - and a Theil-Sen line over
+the last 16 points, so a prompt read while something else slowed the card moves it little. Until it has points of two
+sizes (the larger 1.5x the smaller or more) it only evens out today's chunk count, which in this model is never slower.
+b/a differs by an order of magnitude between rigs, which is why it is measured: 700-900 tokens on four GP100 dies
+(every expert in VRAM, slow arithmetic), about 6000 on two RTX 3090 Ti (part of the experts streamed and dequantized
+per chunk, fast arithmetic). `STRATA_PREFILL_PIPE=<b/a>` fixes it instead of measuring; `STRATA_PREFILL_PIPE_LOG=1`
+prints every chunk time and the fitted b/a. The chunk geometry changes the rounding, so it is opt-in. One line in the
+log says what it chose:
 
     strata prefill: 10058 tokens in 1280-token chunks over 4 stages (STRATA_PREFILL_PIPE, b/a 706 measured)
 

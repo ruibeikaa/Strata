@@ -1560,10 +1560,7 @@ int64_t Prefill::stream_all_min_tokens() { return stream_all_min(); }
 // beats today's split (chunks of `cap`, the last the rest) by 3%. r differs by an order of magnitude between rigs:
 // 700-900 tokens measured on four GP100 dies (every expert in VRAM, slow arithmetic), about 6000 on two RTX 3090 Ti
 // (fast arithmetic, part of the experts streamed and dequantized per chunk), so STRATA_PREFILL_PIPE=1 measures it
-// (PipeFit) and keeps the first settled value for the rest of the run. Until then only today's chunk count is evened
-// out, which in this model is never slower. A prompt's chunks change its output in the last bits (the GDN state and
-// the attention are carried across chunk boundaries), so the rule never follows a b/a that is still moving: before it
-// settles and after, a prompt's chunks depend on its length only.
+// (PipeFit). With r not known yet only today's chunk count is evened out, which in this model is never slower.
 int64_t Prefill::pipeline_chunk(int64_t n, int64_t cap, int stages, double ratio) {
     if (stages < 2 || n <= 0 || cap <= 0) return cap;
     const double r = ratio > 0.0 ? ratio : 0.0, S1 = (double) (stages - 1);
@@ -1585,26 +1582,11 @@ int64_t Prefill::pipeline_chunk(int64_t n, int64_t cap, int stages, double ratio
     return (best < today && best_cost < 0.97 * today_cost) ? best : cap;
 }
 
-// b/a from the first stage's recent prompts, up to two points each (chunk size and the median time of its full
-// chunks; the shorter last chunk, when 25% or more shorter, on its own): a Theil-Sen line ms = b + a tokens - the
-// median slope over the pairs whose sizes differ by 25% or more, the median intercept - over points of at least two
-// sizes (the largest 1.5x the smallest or more), b and a both positive. A prompt read while something else slowed the
-// card moves the median little (a least-squares line over every chunk doubled b/a on a PH402 after one such prompt).
-// It settles when, with four points or more, two fits in a row agree within 25%: that value is kept for the run and
-// no more points are taken. The first prompt after a start (weights still faulting in) cannot settle it alone.
-bool Prefill::PipeFit::add(int64_t t, double v) {
-    if (kept > 0.0) return false;
-    tokens[at] = t;
-    ms[at] = v;
-    at = (at + 1) % kN;
-    if (n < kN) ++n;
-    const double r = ratio();
-    const bool settles = n >= 4 && r > 0.0 && last > 0.0 && std::fabs(r - last) <= 0.25 * last;
-    if (settles) kept = std::round(r);
-    last = r;
-    return settles;
-}
-
+// b/a from the first stage's recent prompts, one point each (chunk size, median time of its full chunks): a Theil-Sen
+// line ms = b + a tokens - the median slope over the pairs whose sizes differ by 25% or more, the median intercept -
+// over points of at least two sizes (the largest 1.5x the smallest or more), b and a both positive. A prompt read
+// while something else slowed the card is one point, so it moves the median little (a least-squares line over every
+// chunk doubled b/a on a PH402 after one such prompt).
 double Prefill::PipeFit::ratio() const {
     if (n < 3) return 0.0;
     double lo = 1e30, hi = 0;
@@ -1890,25 +1872,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     int stages = 1;
     for (const Prefill* p = next_; p != nullptr; p = p->next_) ++stages;
     const bool pipe_first = pipe_env != 0.0 && hand_in_ == nullptr && stages > 1;
-    if (pipe_first && !pipe_cur_ms_.empty()) {   // the last prompt's points: its full chunks' median time, its tail
+    if (pipe_first && !pipe_cur_ms_.empty()) {   // the last prompt's point: its full chunks' median time
         std::vector<double> v = pipe_cur_ms_;
         std::nth_element(v.begin(), v.begin() + (std::ptrdiff_t) (v.size() / 2), v.end());
-        bool settled = pipe_fit_.add(pipe_cur_tokens_, v[v.size() / 2]);
-        if (pipe_tail_tokens_ >= 256 && (double) pipe_cur_tokens_ >= 1.25 * (double) pipe_tail_tokens_)
-            settled = pipe_fit_.add(pipe_tail_tokens_, pipe_tail_ms_) || settled;
-        if (settled)
-            std::fprintf(stderr, "strata prefill: b/a %.0f tokens measured on this rig, kept for this run "
-                                 "(STRATA_PREFILL_PIPE=%.0f starts with it)\n", pipe_fit_.kept, pipe_fit_.kept);
+        pipe_fit_.add(pipe_cur_tokens_, v[v.size() / 2]);
         pipe_cur_ms_.clear();
-        pipe_tail_tokens_ = 0;
     }
-    const double pipe_ratio = pipe_env > 0.0 ? pipe_env : pipe_fit_.kept;
+    const double pipe_ratio = pipe_env > 0.0 ? pipe_env : pipe_fit_.ratio();
     const int64_t C = pipe_first ? pipeline_chunk(n, m.T, stages, pipe_ratio) : m.T;
     if (pipe_first && C < std::min(n, m.T))
         std::fprintf(stderr, "strata prefill: %lld tokens in %lld-token chunks over %d stages (STRATA_PREFILL_PIPE, b/a %s)\n",
                      (long long) n, (long long) C, stages,
                      pipe_ratio > 0.0 ? (std::to_string((long long) pipe_ratio) + (pipe_env > 0.0 ? " given" : " measured")).c_str()
-                                      : "not settled yet: today's chunk count, evened out");
+                                      : "not measured yet: today's chunk count, evened out");
     const bool single_chunk = hand_in_ == nullptr ? n <= C : single_chunk_;
     const bool helped = single_chunk && bind_stage_helper(n);
     if (helped) std::swap(m.pp, m.help_pp);
@@ -3597,15 +3573,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
-            // STRATA_PREFILL_PIPE=1: this stage's time for the chunk, before it waits for the next stage (until b/a is kept)
-            if (pipe_first && pipe_env < 0.0 && pipe_fit_.kept <= 0.0 && T >= 256) {
+            // STRATA_PREFILL_PIPE=1: this stage's time for the chunk, before it waits for the next stage
+            if (pipe_first && pipe_env < 0.0 && T >= 256) {
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - tsetup).count();
-                if (c0 == 0) { pipe_cur_tokens_ = T; pipe_cur_ms_.clear(); pipe_tail_tokens_ = 0; }
-                if (T == pipe_cur_tokens_) pipe_cur_ms_.push_back(ms);
-                else { pipe_tail_tokens_ = T; pipe_tail_ms_ = ms; }   // the last, shorter chunk: a point of its own
+                if (c0 == 0) { pipe_cur_tokens_ = T; pipe_cur_ms_.clear(); }
+                if (T == pipe_cur_tokens_) pipe_cur_ms_.push_back(ms);   // the last, shorter chunk is left out
                 static const bool pipe_log = [] { const char* v = std::getenv("STRATA_PREFILL_PIPE_LOG"); return v && v[0] == '1'; }();
                 if (pipe_log)
-                    std::fprintf(stderr, "strata prefill pipe: chunk at %lld of %lld (%lld tokens) %.1f ms; b/a fit %.0f\n",
+                    std::fprintf(stderr, "strata prefill pipe: chunk at %lld of %lld (%lld tokens) %.1f ms; b/a now %.0f\n",
                                  (long long) c0, (long long) n, (long long) T, ms, pipe_fit_.ratio());
             }
             // Wait only for the DIRECT successor's previous chunk. That successor
