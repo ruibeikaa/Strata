@@ -552,6 +552,97 @@ __global__ void __launch_bounds__(256) block_scores_simt_kernel(const float* __r
     }
 }
 
+// ---- the block scores tiled, bit for bit block_scores_kernel's (below sm_80; STRATA_SELECT_EXACT, default on 6.x).
+// The warp kernel gives each lane 4 of the 128 dimensions: lane l's product d_l = k.x*q.x + k.y*q.y + k.z*q.z + k.w*q.w
+// (the same expression here, so the same contraction), then the xor butterfly (offsets 16, 8, 4, 2, 1) adds the 32
+// lanes as a fixed tree: d_l + d_(l^16) first, then those pairs at distance 8, and so on; every lane ends with the same
+// bits (float addition commutes).  One thread here builds that tree for one (query, block, head) by visiting the lanes
+// in 5-bit-reversed order (0, 16, 8, 24, 4, ...): consecutive leaves are exactly the butterfly's pairs, and a
+// depth-first stack of at most four partial sums finishes each subtree as soon as its leaves are in.  The relu sum
+// over the heads keeps the warp kernel's order (0 + r0 + r1 + r2 + r3).  Bitwise the same scores, without the 5
+// shuffles per 4 products: a GEMM-like tile of 16 queries x 64 blocks per CTA, each thread 1 query x 4 blocks x 4 heads,
+// the 128 dimensions staged through shared memory in 4 slices of 8 lanes (32 values) each.  Blocks < n_bid only; the
+// tail block is block_scores_tail_kernel's, as for the FP32 tiled kernel.
+constexpr int EX_QT = 16, EX_NB = 64, EX_KS = 8 * 4 + 4;   // a key row: 8 lanes x 4 values, +4 floats (no bank conflict)
+__device__ __forceinline__ int ex_lane(int j) { return (int) (__brev((unsigned) j) >> 27); }   // 5-bit reversal
+__global__ void __launch_bounds__(256, 2) block_scores_exact_kernel(const float* __restrict__ pooled,
+                                                                    const float* __restrict__ q_idx,
+                                                                    const int32_t* __restrict__ steps, int64_t nq,
+                                                                    int64_t max_blocks, int64_t reach,
+                                                                    float* __restrict__ out) {
+    __shared__ __align__(16) float Ks[EX_NB * EX_KS];
+    __shared__ __align__(16) float4 Qs[EX_QT * IDX_HEADS * 8];
+    const int64_t q0 = (int64_t) blockIdx.y * EX_QT, b0 = (int64_t) blockIdx.x * EX_NB;
+    const int64_t qlast = (q0 + EX_QT < nq ? q0 + EX_QT : nq) - 1;
+    if (b0 >= steps[qlast * kStepCount + kStepNBid]) return;   // n_bid rises with the position (CTA-uniform)
+    const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
+    float half0[4][IDX_HEADS], half1[4][IDX_HEADS];   // slices 0+1 (lanes with bit 0 clear) and 2+3 (bit 0 set)
+#pragma unroll 1
+    for (int c = 0; c < 4; ++c) {
+        // stage slice c: leaves 8c..8c+7 of the bit-reversed order (lanes ex_lane(8c + jj)), keys and queries
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int idx = tid + i * 256, row = idx >> 3, jj = idx & 7;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (b0 + row < reach)
+                v = *reinterpret_cast<const float4*>(pooled + (b0 + row) * IDX_DIM + ex_lane(8 * c + jj) * 4);
+            *reinterpret_cast<float4*>(&Ks[row * EX_KS + jj * 4]) = v;
+        }
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int idx = tid + i * 256, qq = idx >> 5, h = (idx >> 3) & 3, jj = idx & 7;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (q0 + qq < nq)
+                v = *reinterpret_cast<const float4*>(q_idx + ((q0 + qq) * IDX_HEADS + h) * IDX_DIM + ex_lane(8 * c + jj) * 4);
+            Qs[(qq * IDX_HEADS + h) * 8 + jj] = v;
+        }
+        __syncthreads();
+        float l0[4][IDX_HEADS], l1[4][IDX_HEADS], l2[4][IDX_HEADS];
+#pragma unroll
+        for (int jj = 0; jj < 8; ++jj) {
+            float4 kv[4];
+#pragma unroll
+            for (int bi = 0; bi < 4; ++bi) kv[bi] = *reinterpret_cast<const float4*>(&Ks[(tx + 16 * bi) * EX_KS + jj * 4]);
+#pragma unroll
+            for (int h = 0; h < IDX_HEADS; ++h) {
+                const float4 q4 = Qs[(ty * IDX_HEADS + h) * 8 + jj];
+#pragma unroll
+                for (int bi = 0; bi < 4; ++bi) {
+                    const float4 k4 = kv[bi];
+                    const float d = k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;
+                    // the depth-first tree over the slice's 8 leaves (pairs, quads, the octet)
+                    if (jj == 0 || jj == 2 || jj == 4 || jj == 6) l0[bi][h] = d;
+                    else if (jj == 1 || jj == 5) l1[bi][h] = l0[bi][h] + d;
+                    else if (jj == 3) l2[bi][h] = l1[bi][h] + (l0[bi][h] + d);
+                    else {   // jj == 7: the slice's octet; slices 0+1 and 2+3 pair up, then the two halves
+                        const float oct = l2[bi][h] + (l1[bi][h] + (l0[bi][h] + d));
+                        if (c == 0) half0[bi][h] = oct;
+                        else if (c == 1) half0[bi][h] = half0[bi][h] + oct;
+                        else if (c == 2) half1[bi][h] = oct;
+                        else half1[bi][h] = half1[bi][h] + oct;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    const int64_t q = q0 + ty;
+    if (q >= nq) return;
+    const int64_t n_bid = steps[q * kStepCount + kStepNBid];
+#pragma unroll
+    for (int bi = 0; bi < 4; ++bi) {
+        const int64_t b = b0 + tx + 16 * bi;
+        if (b >= n_bid || b >= max_blocks) continue;
+        float score = 0.0f;
+#pragma unroll
+        for (int h = 0; h < IDX_HEADS; ++h) {
+            const float d = half0[bi][h] + half1[bi][h];
+            score += d > 0.0f ? d : 0.0f;
+        }
+        out[q * max_blocks + b] = score;
+    }
+}
+
 // ---- the same top-k with each query's keys read once: 1,024 threads hold up to TK_PER consecutive blocks' keys in
 // registers (contexts up to 4 * 1024 * TK_PER cells), per-warp histograms, block-wide scans. The selection rule is
 // block_topk_kernel's (radix threshold, ties to the lowest index, cells ascending): identical ids.
@@ -1159,7 +1250,25 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
                 const char* v = std::getenv("STRATA_SELECT_SIMT");
                 return v != nullptr && v[0] == '1';
             }();
-            if (!simt) return false;
+            if (!simt) {
+                // the tiled scorer bit for bit the warp kernel's (block_scores_exact_kernel): default on Pascal (6.x,
+                // measured on a P100-class GP100), STRATA_SELECT_EXACT=1 on any card below sm_80, =0 off
+                static const int exact_env = [] {
+                    const char* v = std::getenv("STRATA_SELECT_EXACT");
+                    return v == nullptr || v[0] == '\0' ? -1 : (v[0] == '0' ? 0 : 1);
+                }();
+                if (exact_env == 0 || (exact_env < 0 && cc_major[dev] != 6)) return false;
+                const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
+                const dim3 grid((unsigned) ((reach + EX_NB - 1) / EX_NB), (unsigned) ((nq + EX_QT - 1) / EX_QT));
+                if (grid.y > 65535) return false;
+                block_scores_exact_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks,
+                                                                                   reach, scores);
+                block_scores_tail_kernel<<<(unsigned) nq, 32, 0, (cudaStream_t) stream>>>(dead, q_idx, steps, max_blocks,
+                                                                                        scores);
+                const cudaError_t e = cudaGetLastError();
+                if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores (exact): %s\n", cudaGetErrorString(e)); std::exit(1); }
+                return true;
+            }
             const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
             const dim3 grid((unsigned) ((reach + SM_NB - 1) / SM_NB), (unsigned) ((nq + SM_QT - 1) / SM_QT));
             if (grid.y > 65535) return false;

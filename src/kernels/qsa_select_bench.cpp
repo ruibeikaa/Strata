@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -102,11 +103,14 @@ int main(int argc, char** argv) {
         reg_same += std::equal(ia.begin() + i * cap, ia.begin() + i * cap + w, ir.begin() + i * cap);
     }
     double max_rel = 0, sum_rel = 0, n_rel = 0;
+    int64_t bits_diff = 0, bits_all = 0;   // scores whose bytes differ (a bitwise scorer: 0)
     int64_t same_sel = 0, cells_diff = 0, cells_all = 0;
     for (int64_t i = 0; i < nq; ++i) {
         const int32_t* st = steps.data() + i * k::kStepCount;
         for (int64_t j = 0; j <= st[k::kStepNBid]; ++j) {
             const double x = a[(size_t) (i * max_blocks + j)], y = b[(size_t) (i * max_blocks + j)];
+            bits_diff += std::memcmp(&a[(size_t) (i * max_blocks + j)], &b[(size_t) (i * max_blocks + j)], 4) != 0;
+            ++bits_all;
             const double r = std::fabs(x - y) / std::max(1e-6, std::fabs(x));
             max_rel = std::max(max_rel, r);
             sum_rel += r;
@@ -173,5 +177,6 @@ int main(int argc, char** argv) {
                 "mean %.2g max %.2g; selections identical %lld/%lld, cells differing %.4f%%\n", (long long) ctx,
                 (long long) nq, (long long) active, t_old, t_new, t_old / t_new, t_tk, sum_rel / std::max(1.0, n_rel),
                 max_rel, (long long) same_sel, (long long) nq, cells_all ? 100.0 * (double) cells_diff / (double) cells_all : 0.0);
+    std::printf("scores bitwise different from the warp kernel's: %lld of %lld\n", (long long) bits_diff, (long long) bits_all);
     return acc_ok && reg_same == nq ? 0 : 1;
 }
