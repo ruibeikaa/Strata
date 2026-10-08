@@ -13,8 +13,14 @@ measured on (a Ryzen 5 7600 + RTX 5070 on PCIe 5):
                   its use counts fade.  A PC whose CPU reads the missed experts slowly (DDR3, ~24 GB/s) gains from
                   swapping more: 160 swaps every window measured +7.9% over the default tier on a Xeon E5-2673 v3 (DDR3) with an
                   RTX 4060 Ti on PCIe 3.0 x8 (Q2_0; with the swaps taking effect a window later, #764).
-The first two are measured through one engine (per-request `strata_tune` keys); the worker count and the adaptive
-tier need a restart per value.  Decode speed only: the prompt path streams every expert whatever these settings say.
+  --prefill-pipe  a layer split only: the prompt chunks that keep the stages reading at once.  The best chunk count
+                  depends on b/a, the fixed cost of a chunk over that of a token, which differs by an order of
+                  magnitude between rigs (about 700 tokens on four GP100 dies, 5000 on two RTX 3090 Ti) and costs
+                  when it is wrong (a fixed 1024 read 22-36% slower on two RTX 4090) - so it is measured here, once,
+                  as the prompt read speed of fresh prompts, rather than guessed or learned while the PC serves.
+The first two and the prompt chunks are measured through one engine (per-request `strata_tune` keys); the worker
+count and the adaptive tier need a restart per value.  Those are decode speed: the prompt path streams every expert
+whatever they say.
 
 A setting is kept only when it beats the default by more than MIN_GAIN in an interleaved re-measurement - the
 adaptive expert tier and the OS make single measurements noisy by a few percent.
@@ -45,6 +51,9 @@ MAX_NEW = 128
 # the expert tier follows a text over some windows: 128-token answers end before it shows (on a Xeon E5-2673 v3 with
 # DDR3, every 1 / 160 / 0.97 measured +0.7% with 128 tokens and +7.9% with 512-token answers), so its step uses these
 TIER_MAX_NEW = 512
+# --prefill-pipe's values: 0 the buffers' chunks (the engine default), 1 their count evened out, then b/a in tokens
+PIPE_VALUES = (0, 1, 768, 1536, 3072, 6144)
+PIPE_TOKENS = (2048, 8192)        # fresh prompts read per value (their text: the install's docs/*.md)
 PROMPTS = (
     "Write a Python function that merges two sorted lists into one sorted list, with a docstring and two tests.",
     "Explain in two paragraphs how a refrigerator moves heat from inside to outside.",
@@ -98,6 +107,57 @@ def host_worker_extras() -> list[int]:
         return []
 
 
+def doc_prompt(tok):
+    """`make(i, n)`: a fresh prompt of about n tokens - the docs' text from a running offset after a header that
+    differs for every i, so no read reuses an earlier one's cache."""
+    text = "\n\n".join(p.read_text(encoding="utf-8", errors="replace") for p in sorted((ROOT / "docs").glob("*.md")))
+    body = tok.encode(text, parse_special=False)
+    tail = tok.encode("<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", parse_special=True)
+    at = [0]
+
+    def make(i: int, n: int) -> list[int]:
+        head = tok.encode(f"<|im_start|>user\n[calibration read {i}] Summarize:\n", parse_special=True)
+        if at[0] + n > len(body):
+            at[0] = 0
+        piece = body[at[0]:at[0] + n]
+        at[0] += n
+        return head + piece + tail
+    return make
+
+
+def measure_pipe(eng, make, say=print) -> tuple[float, dict]:
+    """--prefill-pipe on one running engine (a layer split): the prompt read speed of fresh prompts per value; the best
+    against the default (0) interleaved, kept only when it is more than MIN_GAIN faster."""
+    reads = [0]
+
+    def rate(v: float) -> float:
+        ms = toks = 0.0
+        for n in PIPE_TOKENS:
+            reads[0] += 1
+            sampling = {"temperature": 0, "strata_checkpoint": False, "strata_tune": {"prefill_pipe": v}}
+            for _ in eng.generate(make(reads[0], n), 1, sampling, threading.Event()):
+                pass
+            last = eng.last or {}
+            ms += float(last.get("prompt_ms") or 0.0)
+            toks += float(last.get("prompt_read") or (last.get("prompt_tokens") or 0) - (last.get("reused") or 0))
+        return toks / (ms / 1000.0) if ms > 0 and toks > 0 else 0.0
+
+    rate(0)                                            # the first long read after a start faults the weights in
+    sweep = {}
+    for v in PIPE_VALUES:
+        sweep[v] = [rate(v)]
+        say(f"    prompt chunks {'off' if v == 0 else 'evened out' if v == 1 else f'b/a {v}'}: {sweep[v][0]:.0f} tok/s")
+    best = max(sweep, key=lambda k: sweep[k][0])
+    confirm = {0: [], best: []}
+    if best != 0:
+        for _ in range(2):
+            for k in (0, best):
+                confirm[k].append(rate(k))
+    chosen = pick(confirm, 0) if best != 0 else 0
+    return chosen, {"pipe_sweep": {str(k): v for k, v in sweep.items()},
+                    "pipe_confirm": {str(k): v for k, v in confirm.items()}}
+
+
 def pick(measured: dict, default_key, min_gain: float = MIN_GAIN):
     """The key with the best median tok/s, or `default_key` unless the best beats it by more than min_gain."""
     med = {k: statistics.median(v) for k, v in measured.items() if v}
@@ -149,7 +209,7 @@ def run(cfg: dict, say=print, start_engine=None) -> dict:
     tok = ST.Tokenizer(toks, (tpath / "merges.txt").read_text(encoding="utf-8").split("\n"),
                        json.loads((tpath / "token_type.json").read_text()))
     ids_list = [chat_ids(tok, p) for p in PROMPTS]
-    return measure(engine_args(cfg), ids_list, start_engine, say, host_worker_extras())
+    return measure(engine_args(cfg), ids_list, start_engine, say, host_worker_extras(), doc_prompt(tok))
 
 
 def engine_args(cfg: dict) -> list[str]:
@@ -175,7 +235,7 @@ def engine_error(log: str | None, since: int = 0) -> str | None:
     return next((x for x in reversed(lines) if x.startswith(("strata", "ERR"))), lines[-1] if lines else None)
 
 
-def measure(base_args: list[str], ids_list, start_engine, say=print, extra_workers=()) -> dict:
+def measure(base_args: list[str], ids_list, start_engine, say=print, extra_workers=(), long_prompt=None) -> dict:
     t0 = time.time()
     report: dict = {}
     say("  Loading the model for the measurements ...")
@@ -188,6 +248,12 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
         d_workers = int(info.get("pool_workers", 0)) or None
         s = Session(eng, ids_list)
         s.warm_up()
+        # 0. a layer split's prompt chunks (prompt read speed; independent of the decode settings below)
+        pipe = 0
+        if long_prompt is not None and "--layer-split" in base_args:
+            say("  Measuring the prompt chunks of the layer split ...")
+            pipe, rep_pipe = measure_pipe(eng, long_prompt, say)
+            report.update(rep_pipe)
         # 1. the PCIe share, at the default draft floor
         by_pcie = {}
         for f in sorted(set(PCIE_FRACS) | {round(d_pcie, 2)}):
@@ -215,6 +281,8 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
     finally:
         close(eng)
     settings = {}
+    if pipe:
+        settings["--prefill-pipe"] = str(int(pipe))
     if chosen != dflt:
         settings["--pcie-frac"] = f"{chosen[0]:.2f}"
         settings["--spec-min-p"] = f"{chosen[1]:.2f}"
@@ -284,7 +352,7 @@ def close(eng):
 
 
 DEFAULTS = {"--pcie-frac": None, "--spec-min-p": "0.5", "--pool-workers": None,   # None: the engine's own choice
-            "--adapt-every": None, "--adapt-swaps": None, "--adapt-decay": None}
+            "--adapt-every": None, "--adapt-swaps": None, "--adapt-decay": None, "--prefill-pipe": None}
 
 
 def apply(args: list[str], settings: dict) -> list[str]:
