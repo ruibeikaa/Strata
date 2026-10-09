@@ -497,6 +497,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         kcur_ = b.take<float>(T * NKV * HD); vcur_ = b.take<float>(T * NKV * HD);
         idx_raw_L_ = b.take<float>(nQ * T * ID); qidx_ = b.take<float>(T * IQ * ID);
         scores_ = b.take<float>(T * (uint64_t) max_blocks_); sel_ = b.take<int32_t>(T * (uint64_t) cap_);
+        topk_scratch_ = b.take<int32_t>((uint64_t) std::max<int64_t>(strata::kernels::qsa_topk_multi_scratch_ints(T), 1));
         attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
         attn_scratch_ = b.take<float>(T * (uint64_t) attn_scratch_floats_);
         tail_snap_ = b.take<float>(nQ * TS);
@@ -1192,7 +1193,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + t * IQ * ID, step_ + t * kStepCount, 1,
                                          max_blocks_, s, scores_ + (size_t) t * max_blocks_, cs);
                         qsa_block_topk(scores_ + (size_t) t * max_blocks_, step_ + t * kStepCount, 1, max_blocks_, cap_, s,
-                                       sel_ + (size_t) t * cap_, cs);
+                                       sel_ + (size_t) t * cap_, cs, -1, topk_scratch_);
                         qsa_kv_resolve(sx, *g_, sel_ + (size_t) t * cap_, step_ + t * kStepCount, 1, cap_, cs);
                         const QsaAttnPools px = qsa_attn_pools(sx);
                         qsa_decode_attn_batch(qcur_ + t * NH * HD, px, sel_ + (size_t) t * cap_, step_ + t * kStepCount,
@@ -1203,7 +1204,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
                                  s, scores_ + (size_t) tb * max_blocks_, cs);
                 qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
-                               sel_ + (size_t) tb * cap_, cs);
+                               sel_ + (size_t) tb * cap_, cs, -1, topk_scratch_);
                 stamp(l, 11, grp);
                 // KV streaming: the n selections' blocks resident (device-side, inside the graph)
                 qsa_kv_resolve(st, *g_, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
