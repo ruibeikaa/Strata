@@ -403,8 +403,10 @@ private:
     cudaStream_t df_side_[2] = {};
     cudaEvent_t df_fork_ = nullptr;
     cudaEvent_t df_join_[2] = {};
-    cudaGraphExec_t exec_[9] = {};
-    cudaGraphExec_t exec_nr_[9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
+    // [sel_long_][T]: 1 is the long-context QSA select (multi-CTA top-k, shuffle-free decode scores; see run())
+    cudaGraphExec_t exec_[2][9] = {};
+    cudaGraphExec_t exec_nr_[2][9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
+    int sel_long_ = 0;
     cudaGraphExec_t commit_exec_ = nullptr;
 
     // mapped staging (host pointer, device alias)

@@ -1622,7 +1622,8 @@ static bool qsa_block_scores_dx(const float* pooled, const float* dead, const fl
 #endif
 
 void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
-                      int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks) {
+                      int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks,
+                      bool decode_dx) {
     if (nq <= 0) return;
     if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > 65535) {
         std::fprintf(stderr, "qsa_block_scores: unsupported indexer geometry\n");
@@ -1632,7 +1633,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
     static const bool multi = [] { const char* v = std::getenv("STRATA_SCORES_MULTI"); return v == nullptr || std::atoi(v) != 0; }();
     if (multi && nq <= MQ && active_blocks <= 0) {   // no active count: decode (captured or not) and prefill's pooled16
 #if !defined(__HIPCC__)
-        if (qsa_block_scores_dx(pooled, dead, q_idx, steps, nq, max_blocks, scores, stream)) return;
+        if (decode_dx && qsa_block_scores_dx(pooled, dead, q_idx, steps, nq, max_blocks, scores, stream)) return;
 #endif
         // STRATA_QSA_EARLY_EXIT=0 keeps the old staging (every CTA loads the queries first); the scores are the same bits
         static const bool early = [] { const char* v = std::getenv("STRATA_QSA_EARLY_EXIT"); return v == nullptr || std::atoi(v) != 0; }();
