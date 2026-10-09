@@ -2231,7 +2231,11 @@ bool Verifier::commit(int n_keep, std::string& err) {
         // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
         // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's
         // results are read, i.e. after this graph has run.  Everything else waits on commit_done_ (wait_commit).
-        if (!g_commit_async || next_ != nullptr) {
+        // A layer split's stages too: a stage's graph writes only its own layers' state (and the PLE history, on the
+        // stage with layer 1), never a hand-off or the final rows, on the stage's own stream - which its next window
+        // follows, and run() syncs before the next stage starts.  Each stage records its own event; wait_commit
+        // walks them all.
+        if (!g_commit_async) {
             const cudaError_t se = cudaStreamSynchronize(cs_);
             if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
         } else {
