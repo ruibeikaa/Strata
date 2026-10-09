@@ -14,6 +14,9 @@ upstream; this branch keeps them together as a known-good baseline.
 | f10c6ecf | `STRATA_MMQ_RESIDENT_SORT_NE` for native-layout packs too | PR #1660 (open) |
 | c3117f22 | MoE input quantized once per token and scattered (sergqwer) | PR #1368 (open) |
 | 72223b10 | dense Q8_0 / IQ4_XS to FP16 with 16-byte stores, fused swiglu + q8_1 and combine + hc write (sergqwer) | PR #1525 (open) |
+| 1ce05bb0 | async commit on the layer split, as one GPU does (`STRATA_COMMIT_SYNC=1` restores the host wait) | local only |
+| 299782c4 | the MTP drafter's draft head (packed in place) and its 9 projections on the Pascal Q8_0 GEMV (`STRATA_MTP_Q8_SM60=0` off) | local only |
+| a7334265 a01a789e | upstream aaa323fe (`STRATA_GR_FAST`) and a bench mode for it; off on sm_60: bitwise, but flat on GP100 (T=1 +2 µs, T=4 −5..−9 µs per read) | upstream (main) |
 
 ## Build (sm_60)
 
@@ -54,8 +57,8 @@ split fall to 759 MHz.
 | 1.2K prompt, fresh | 4.9 s |
 | 35K prompt, fresh | about 52 s |
 | 301K prompt, fresh | about 369 s (815 tok/s) |
-| decode, short context | 38–44 tok/s |
-| decode, 300K context | about 36 tok/s |
+| decode, short context | 40–45 tok/s (next6: 1.4–2.1 ms less per window than without 1ce05bb0 + 299782c4) |
+| decode, 300K context | about 38.5 tok/s |
 
 Right after a start the PLE table is not yet in the OS file cache, and the first replies decode up to 25% slower until
 it is.
