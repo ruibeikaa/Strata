@@ -17,6 +17,7 @@ upstream; this branch keeps them together as a known-good baseline.
 | 1ce05bb0 | async commit on the layer split, as one GPU does (`STRATA_COMMIT_SYNC=1` restores the host wait) | local only |
 | 299782c4 | the MTP drafter's draft head (packed in place) and its 9 projections on the Pascal Q8_0 GEMV (`STRATA_MTP_Q8_SM60=0` off) | local only |
 | a7334265 a01a789e | upstream aaa323fe (`STRATA_GR_FAST`) and a bench mode for it; off on sm_60: bitwise, but flat on GP100 (T=1 +2 µs, T=4 −5..−9 µs per read) | upstream (main) |
+| c194a3b6 61f87598 | long-context QSA select: decode top-k over up to 32 CTAs per query (six capturable kernels, caller scratch) and a shuffle-free decode block scorer, the same ids and score bits; only in window graphs past 65536 cells (`STRATA_SELECT_LONG_AT`; `STRATA_TOPK_MULTI=0` / `STRATA_SCORES_DX=0` off) | local only |
 
 ## Build (sm_60)
 
@@ -58,7 +59,7 @@ split fall to 759 MHz.
 | 35K prompt, fresh | about 52 s |
 | 301K prompt, fresh | about 369 s (815 tok/s) |
 | decode, short context | 40–45 tok/s (next6: 1.4–2.1 ms less per window than without 1ce05bb0 + 299782c4) |
-| decode, 300K context | about 38.5 tok/s |
+| decode, 300K context | about 41.8 tok/s (next7: 51.9 -> 47.1 ms a window; per QSA call on one die at 300K, T=2: top-k 390 -> 72 µs, scores 217 -> 154 µs) |
 
 Right after a start the PLE table is not yet in the OS file cache, and the first replies decode up to 25% slower until
 it is.
