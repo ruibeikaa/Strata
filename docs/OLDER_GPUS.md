@@ -107,7 +107,10 @@ and i-quant blocks (Q6_K, IQ4_XS, Q4_K, IQ3_S, ...) one int at a time. Two chang
   on `STRATA_DP4A` (vmad), a shuffle sum - no barrier per row. Shapes it declines (a 6144-wide row with 7-8 columns)
   keep the usual kernel. Not bitwise the exact kernels (the per-32 products are added in another order). The packed
   copies cost their size in VRAM beside the GGUF layout the prompt path reads (Flash-Next: 2.9 GiB of dense
-  projections over the stages and 0.6 GiB for the head).
+  projections over the stages and 0.6 GiB for the head). The MTP drafter's own Q8_0 matrices take the kernel too: its
+  nine projections as packed copies (Swift 1.5: 69 MiB; the prompt path reads four of them in the GGUF layout), and
+  its draft head's token subset packed in place, at no extra VRAM, since nothing else reads it.
+  `STRATA_MTP_Q8_SM60=0` keeps the drafter on the exact kernels.
 - The GSQ-RCO packs have no Q8_0 dense matrices, so the kernel needs a copy of the model whose dense projections and head are
   Q8_0: `python tools/q8_dense_gguf.py <model>-00001-of-00002.gguf <new folder>` writes one: every shard that holds
   such matrices is converted (Swift 1.5 keeps them in both of its shards) and the rest are hard-linked beside them
