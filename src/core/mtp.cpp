@@ -63,6 +63,16 @@ bool mtp_catchup_all() {
     }();
     return on;
 }
+// Under STRATA_Q8_SM60=1 the drafter's own Q8_0 matrices (the draft head's subset, the projections) run on the Pascal
+// GEMV too; STRATA_MTP_Q8_SM60=0 keeps them on the exact kernels (the drafts differ in rounding only: the Pascal kernel
+// sums in another order)
+bool mtp_q8_sm60() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_MTP_Q8_SM60");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
 constexpr int GGML_Q8_0 = 8;
 constexpr int GGML_Q4_0 = 2;
 using Clock = std::chrono::steady_clock;
@@ -147,12 +157,20 @@ MtpDrafter::~MtpDrafter() {
     if (side_) cudaStreamDestroy(side_);
     if (sh_fork_) cudaEventDestroy(sh_fork_);
     if (sh_join_) cudaEventDestroy(sh_join_);
-    if (owns_weights_ && dense_) cudaFree(dense_);
+    if (owns_weights_ && dense_) {
+        for (const auto& t : tensors_)   // the STRATA_Q8_SM60 registrations first (a no-op for the rest)
+            if (t.kind == "q8_0") strata::kernels::native_q8_0_sm60_release(dense_ + t.off);
+        cudaFree(dense_);
+    }
     if (owns_weights_ && experts_) cudaFree(experts_);
     if (state_arena_) cudaFree(state_arena_);
     if (arena_) cudaFree(arena_);
     if (head_logits_) cudaFree(head_logits_);
-    if (owns_draft_head_ && dhead_) { strata::kernels::native_q6_k_unpack(dhead_); cudaFree(dhead_); }
+    if (owns_draft_head_ && dhead_) {
+        strata::kernels::native_q6_k_unpack(dhead_);
+        strata::kernels::native_q8_0_sm60_release(dhead_);
+        cudaFree(dhead_);
+    }
     if (owns_draft_head_ && dvocab_) cudaFree(dvocab_);
     if (ev_chain_) cudaEventDestroy(ev_chain_);
     for (cudaEvent_t e : ev_step_) if (e) cudaEventDestroy(e);
@@ -321,6 +339,26 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
                               "self_attn.v_proj.weight", "self_attn.o_proj.weight", "mlp.shared_expert.gate_proj.weight",
                               "mlp.shared_expert.up_proj.weight", "mlp.shared_expert.down_proj.weight"};
     for (const char* n : required) if (!q8(n)) { err = std::string("mtp: ") + n + " is missing (q8_0)"; return false; }
+    // STRATA_Q8_SM60=1: the projections on the Pascal GEMV (--batch's shared drafters read the same pointers), as
+    // packed copies like the main model's: the prompt path's draft_kv reads four of them in the GGUF layout (MMQ);
+    // --mtp-q4 reads its Q4_0 copies instead
+    if (shared == nullptr && dense4_ == nullptr && mtp_q8_sm60()) {
+        int packed = 0;
+        uint64_t packed_bytes = 0;
+        for (const char* n : required)
+            for (const auto& t : tensors_)
+                if (t.name == n && t.kind == "q8_0" &&
+                    strata::kernels::native_q8_0_sm60_pack(dense_ + t.off, (int) t.cols, (int) t.rows,
+                                                           ("MTP " + t.name).c_str(), true)) {
+                    ++packed;
+                    packed_bytes += t.bytes;   // a copy is the same 34 bytes per 32 values
+                }
+        vram_ += packed_bytes;
+        if (packed > 0)
+            std::fprintf(stderr, "strata mtp: %d of %zu projections on the Pascal Q8_0 GEMV (STRATA_Q8_SM60=1, %.1f MiB "
+                                 "more VRAM)\n", packed, sizeof(required) / sizeof(required[0]),
+                         (double) packed_bytes / 1048576.0);
+    }
 
     // ---- the layer's own K/V (dense attention: no indexer state is read)
     const strata::kernels::QsaShapes s = shapes_of(g);
@@ -654,6 +692,12 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             if (dhead_type_ == 14 && strata::kernels::native_q6_k_packed_enabled())   // STRATA_Q6_PACKED=1
                 strata::kernels::native_q6_k_pack(dhead_, (int) (row_bytes / 210) * 256, (int) n_dvocab_,
                                                   "MTP draft head");
+            // STRATA_Q8_SM60=1: the subset on the Pascal GEMV like the main head, but packed in place - nothing but
+            // record_rest's native_mmvq reads it (the prompt path never does), and a copy would cost its size again
+            if (dhead_type_ == GGML_Q8_0 && owns_draft_head_ && mtp_q8_sm60() && row_bytes == g_->n_embd / 32 * 34 &&
+                strata::kernels::native_q8_0_sm60_pack_in_place(dhead_, (int) g_->n_embd, (int) n_dvocab_,
+                                                                "MTP draft head"))
+                std::fprintf(stderr, "strata mtp: the draft head on the Pascal Q8_0 GEMV (STRATA_Q8_SM60=1)\n");
         }
     }
     if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;
