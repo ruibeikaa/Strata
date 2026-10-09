@@ -39,10 +39,17 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
 /// ids [nq, cap] (cells, ascending); `cap` >= the largest selection width.
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                     const QsaShapes& s, int32_t* ids, void* stream,
-                    int64_t active_blocks = -1);   ///< > 0: no query of the call has more than this many blocks (n_bid + 1;
+                    int64_t active_blocks = -1,    ///< > 0: no query of the call has more than this many blocks (n_bid + 1;
                                                    ///< the same contract as qsa_block_scores's). The register kernel is
                                                    ///< chosen by this, not by the capacity max_blocks (a long
                                                    ///< --max-context otherwise sends every short prompt to the slow one).
+                    int32_t* multi_scratch = nullptr);   ///< qsa_topk_multi_scratch_ints(nq) ints of device memory, or
+                                                         ///< null: lets a decode call (no active count) run several CTAs
+                                                         ///< per query (STRATA_TOPK_MULTI; the same ids). One call at a
+                                                         ///< time per scratch; it needs no initial value.
+
+/// Device ints a qsa_block_topk call of `nq` queries may use as multi_scratch (0 on a build without the multi-CTA path).
+int64_t qsa_topk_multi_scratch_ints(int64_t nq);
                                                    ///< CUDA uses the bound only on sm_75; HIP keeps its existing policy.
                                                    ///< Omit it for captured graphs whose context can grow after capture.
 /// The same ids on a thread-block cluster of 8 CTAs per query (sm_90+, CUDA; S19). qsa_block_topk takes it for calls
