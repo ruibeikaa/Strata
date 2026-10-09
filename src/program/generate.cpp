@@ -3016,7 +3016,10 @@ int main(int argc, char** argv) {
             }
         }
     }
-    strata::core::Verifier::set_commit_async(!multi_gpu);   // see Verifier::set_commit_async
+    // a layer split commits without the wait too (until here only one GPU did): each stage's commit runs on its own
+    // stream ahead of its next window, and every wait_commit below waits for all the stages.  Measured on 4x GP100
+    // (12,24,36): commit/emit 0.73-0.87 ms a window with the wait; STRATA_COMMIT_SYNC=1 keeps it
+    strata::core::Verifier::set_commit_async(true);   // see Verifier::set_commit_async
     // --pipeline-windows (opt-in): one conversation's windows with the two stages of a layer split overlapped.  Decided
     // here, before any stage sizes its expert cache (the second verifier per stage and the snapshots are allocated
     // after the caches, so their room is kept out of them).  What it does not support turns it off, said once.
@@ -9117,7 +9120,8 @@ int main(int argc, char** argv) {
                 return imgs_below(req_imgs, L) == pre_imgs;
             };
             const bool want_cvec = strata::kernels::cvec().loaded() ? req_cvec != 0 : true;
-            // the last request's final commit may still be running on the verifier's stream (set_commit_async):
+            // the last request's final commit may still be running on the verifiers' streams (set_commit_async; every
+            // stage of a layer split - wait_commit walks them):
             // everything below reads, restores or zeroes the session from other streams and the host (the end of the
             // last request waited already; this covers a request that ended on an error path)
             if (!ver.wait_commit(err)) {

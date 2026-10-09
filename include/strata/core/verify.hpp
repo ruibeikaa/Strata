@@ -189,13 +189,13 @@ public:
     }
     const int32_t* batch_out() const { return b_out_; }
     bool last_stage() const { return g_ != nullptr && le_ == g_->n_layers; }
-    /// commit() returns without waiting for its graph (a single-GPU session sets it): the next window follows it on
-    /// the same stream and the drafter reads nothing it writes, so it overlaps the draft. Whoever reads or writes
+    /// commit() returns without waiting for its graph (on every stage of a layer split too): the next window follows
+    /// it on the same stream and the drafter reads nothing it writes, so it overlaps the draft. Whoever reads or writes
     /// the session from another stream or the host afterwards (a new request, a checkpoint, a snapshot, the prompt
     /// path, the end of a run) calls wait_commit() first.  STRATA_COMMIT_SYNC=1 keeps the wait.
     static void set_commit_async(bool on);
-    /// Waits for the last commit graph when commit() did not (an event recorded after it, not the whole device);
-    /// false with `err` when it failed.  Free when nothing is pending.
+    /// Waits for the last commit graph when commit() did not (an event recorded after it, not the whole device), on
+    /// this stage and every later one; false with `err` when it failed.  Free when nothing is pending.
     bool wait_commit(std::string& err);
 
     // ---- PIPELINED WINDOWS (--pipeline-windows, a layer split on two GPUs).  One conversation's windows with the
