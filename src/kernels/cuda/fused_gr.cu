@@ -1039,6 +1039,7 @@ __global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m) {
     const int T = m.T;
     const int d0 = blockIdx.x * UPM_COLS;
     static_assert(LR == 40 * 8 && HC * UPM_COLS == 64 && THREADS == 256, "geometry");
+    static_assert(kFusedGrMaxT <= 8, "lane j of a row's 8 holds token j's sum and runs its epilogue");
     uint4 w[2][5];
     float rv[2] = {0.0f, 0.0f}, wn[2] = {0.0f, 0.0f}, rsc[2] = {0.0f, 0.0f}, bo[2] = {0.0f, 0.0f}, ip[2] = {0.0f, 0.0f};
     const bool apply = j < T && m.a[j < T ? j : 0].apply;
@@ -1645,7 +1646,9 @@ static bool gr_fast() {
 #if defined(__HIPCC__)
     return true;
 #else
-    return cur_dev_volta();   // CUDA: on Volta (V100-SXM2: 50.9 -> 46.7 us a read at T 1, bitwise); elsewhere opt-in
+    // CUDA: on Volta (V100-SXM2: 50.9 -> 46.7 us a read at T 1, bitwise); elsewhere opt-in.  STRATA_GR_FAST=1 runs them
+    // on any CUDA card, sm_60 included: neither kernel has an arch guard or uses cp.async (plain loads, __ldg, shuffles)
+    return cur_dev_volta();
 #endif
 }
 #else
