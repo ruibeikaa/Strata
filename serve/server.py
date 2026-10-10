@@ -828,7 +828,12 @@ class StrataEngine:
 
     # PH402 local patch: STRATA_PARK_DIR names a folder the parked conversations go to when the engine is unloaded
     # (the stop scripts' graceful path, the idle unload) and come back from when it starts, so a restart does not
-    # read them again from the first token.  Unset: as before.  Any failure is said and the stop / start goes on.
+    # read them again from the first token.  Unset (the default): as before, nothing is written.  Any failure is said
+    # and the stop / start goes on.
+    # SSD WEAR: while it is set, every unload writes the parked conversations to that disk - up to the conversation
+    # cache's budget, GBs per long conversation (the engine skips what is already there unchanged, short and stale
+    # ones, and all but 2 checkpoints each; see PARKSAVE in generate.cpp).  On a consumer TLC SSD that spends write
+    # endurance for as long as it is on, and an idle unload would add a write at every idle period.
     PARK_DIR = os.environ.get("STRATA_PARK_DIR", "").strip()
 
     def park_known(self) -> bool:
