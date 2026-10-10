@@ -31,6 +31,7 @@
 #include "strata/prefill/moe_fused.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/moe_ws.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/prefill/kernels.hpp"
 
@@ -90,6 +91,17 @@ void quantize_act_native(const float*, int64_t, int64_t, void*, void*) {}
 void experts_native(const Batch&, const NativeGeom&, int, int64_t, const void*, const void*, const int32_t*, void*,
                     float*, void*) {}
 }  // namespace strata::prefill::fused
+#endif
+#ifndef STRATA_PREFILL_WS
+// the weight-stationary experts are CUDA-only (sm_60 at run time: the PH402)
+namespace strata::prefill::ws {
+int mode() { return 0; }
+bool supported(int, int) { return false; }
+bool faster(int, double) { return false; }
+size_t chunks(const int32_t*, size_t, const int32_t*, const int32_t*, Chunk*) { return 0; }
+bool gate_up(const Layer&, void*) { return false; }
+void down(const Layer&, void*) {}
+}  // namespace strata::prefill::ws
 #endif
 
 namespace strata::prefill {
@@ -737,6 +749,10 @@ struct Prefill::Impl {
     int64_t* xoff_dev = nullptr;
     std::vector<int64_t> xoff_host;
     std::vector<char> ip_group;
+    // ws (moe_ws.hpp): a layer whose experts are all read in place - its CTAs' work, built on the host per layer and
+    // uploaded with the bounds (the device copy holds ws::max_chunks for the chunk; the host one is the unmapped path's)
+    ws::Chunk* ws_chunks = nullptr;
+    std::vector<ws::Chunk> ws_chunks_host;
     std::unique_ptr<mmq::Context> mmq_ctx;
     std::vector<int32_t> ids_host, slot_host, src_host, cnt, off;
     // set_cpu_pool: a small chunk's CPU experts. The layer's MoE input (T x N, from `mixed`) and the rows the pool
@@ -1081,8 +1097,10 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.steps_host.resize(T * strata::kernels::kStepCount);
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
     {
-        // the routing tables, the MMQ group bounds, the in-place offsets (mmq::inplace: n_expert int64)
-        const size_t need = 3 * T * K + (size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)) + 2 * (size_t) m.g->n_expert;
+        // the routing tables, the MMQ group bounds, the in-place offsets (mmq::inplace: n_expert int64), the
+        // weight-stationary layers' chunks (ws: 4 int32 each, 16-byte aligned)
+        const size_t need = 3 * T * K + (size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)) + 2 * (size_t) m.g->n_expert +
+                            4 * ws::max_chunks((int64_t) T * K, m.g->n_expert) + 3;
         const char* gc = std::getenv("STRATA_GROUP_COPY");
         if (m.grp_n < need && !(gc && gc[0] == '1')) {
             if (m.grp_host) cudaFreeHost(m.grp_host);
@@ -1225,6 +1243,7 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.ids_identity = o.take<int32_t>(T * K, ok);
         m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
         m.xoff_dev = o.take<int64_t>((size_t) m.g->n_expert, ok);
+        m.ws_chunks = (ws::Chunk*) o.take<int32_t>(4 * ws::max_chunks((int64_t) T * K, m.g->n_expert), ok);
         m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
         // (written at every run's start, not here: when serving, these are live expert-cache slots until a request
@@ -1865,6 +1884,7 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
         o.take<int32_t>(T * K, ok);
         o.take<int32_t>((size_t) (2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
         o.take<int64_t>((size_t) g.n_expert, ok);
+        o.take<int32_t>(4 * ws::max_chunks((int64_t) T * K, g.n_expert), ok);
         o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
     }
@@ -3317,6 +3337,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
                         bool ip_layer = false;              // mmq::inplace: this layer's resident groups are not gathered
                         const uint8_t* ip_base = nullptr;   // the expert cache's base, the offsets' origin
+                        bool ws_layer = false;              // ws: this layer's products weight-stationary (below)
+                        ws::Layer wl;
                         pt.mark(kPfGather, cs);
                         if (use_mmq) {
                             // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`:
@@ -3356,10 +3378,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 ip_base = m.cache->device_slot(0);
                                 m.xoff_host.assign(n, -1);
                                 m.ip_group.assign(ng, 1);
+                                bool all = true;      // every expert resident
+                                uint64_t at = 0;      // their offsets' low bits
                                 for (size_t j = 0; j < n; ++j) {
                                     const int32_t s = m.host_res[(size_t) l * m.g->n_expert + order[j]];
-                                    if (s >= 0) m.xoff_host[j] = (int64_t) (m.cache->device_slot(s) - ip_base);
-                                    else m.ip_group[j / MMQ_GROUP] = 0;
+                                    if (s >= 0) {
+                                        m.xoff_host[j] = (int64_t) (m.cache->device_slot(s) - ip_base);
+                                        at |= (uint64_t) m.xoff_host[j];
+                                    } else {
+                                        m.ip_group[j / MMQ_GROUP] = 0;
+                                        all = false;
+                                    }
                                 }
                                 if (grp_mapped) {
                                     int32_t* xh = m.grp_host + 3 * m.grp_tk + 2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2);
@@ -3367,6 +3396,41 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     copy_i32((int32_t*) m.xoff_dev, m.grp_dev + (xh - m.grp_host), (int64_t) (2 * n), m.cs);
                                 } else {
                                     cudaMemcpyAsync(m.xoff_dev, m.xoff_host.data(), n * sizeof(int64_t), cudaMemcpyHostToDevice, m.cs);
+                                }
+                                // ws (moe_ws.hpp): a layer whose experts are ALL read in place, on this GPU alone (no
+                                // peer, CPU or streamed share), runs gate/up and down as one weight-stationary launch
+                                // each, swiglu_quant once over all its rows in between, instead of a gate/up, swiglu and
+                                // down per 16-expert group - the same GU, H and Dm bits.  Not the fused layout (its Hq
+                                // holds stream_all_min() - 1 tokens' rows), nor H in floats (STRATA_DBG_NAN reads it).
+                                ws_layer = all && order_peer.empty() && rows_cpu == 0 && rows_local == T * K && !m.fused_bufs &&
+                                           (!stream_all || seq_start[(size_t) l] == seq_start[(size_t) l + 1]) &&
+                                           swiglu_quant_on() && mmq::swiglu_quant_ok(mmq_dt) && ws::supported(mmq_gt, mmq_dt) &&
+                                           ws::faster(mmq_dt, (double) rows_local / (double) n) && m.ws_chunks != nullptr &&
+                                           ((uint64_t) (uintptr_t) ip_base | at | lay.fmt[(size_t) l].down_off) % ws::kAlign == 0;
+                                if (ws_layer) {
+                                    static bool said_ws = false;
+                                    if (!said_ws) {
+                                        said_ws = true;
+                                        std::fprintf(stderr, "strata prefill: a resident layer's experts weight-stationary, one "
+                                                             "launch per product (STRATA_MMQ_WS=0: per 16-expert group)\n");
+                                    }
+                                    // the chunks: after the offsets in the mapped table (16-byte aligned), or the host copy
+                                    ws::Chunk* ch = nullptr;
+                                    if (grp_mapped) {
+                                        ch = (ws::Chunk*) (m.grp_host + (3 * m.grp_tk + 2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2) +
+                                                                         2 * m.g->n_expert + 3) / 4 * 4);
+                                    } else {
+                                        m.ws_chunks_host.resize(ws::max_chunks(T * K, m.g->n_expert));
+                                        ch = m.ws_chunks_host.data();
+                                    }
+                                    wl.nchunks = (int64_t) ws::chunks(order.data(), n, m.cnt.data(), m.bounds_host.data(), ch);
+                                    if (grp_mapped)
+                                        copy_i32((int32_t*) m.ws_chunks, m.grp_dev + ((int32_t*) ch - m.grp_host), 4 * wl.nchunks, m.cs);
+                                    else
+                                        cudaMemcpyAsync(m.ws_chunks, ch, (size_t) wl.nchunks * sizeof(ws::Chunk), cudaMemcpyHostToDevice, m.cs);
+                                    wl.gu_type = mmq_gt; wl.d_type = mmq_dt; wl.w = ip_base; wl.xoff = m.xoff_dev;
+                                    wl.down_off = (int64_t) lay.fmt[(size_t) l].down_off; wl.chunks = m.ws_chunks;
+                                    wl.rows = T * K; wl.n = (int) n; wl.xq = m.Xq; wl.gu = m.GU; wl.hq = m.Hq; wl.dm = m.Dm;
                                 }
                             }
                         } else {
@@ -3819,7 +3883,30 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
                             return true;
                         };
-                        if (!stream_all) {
+                        if (ws_layer) {
+                            // ws: the layer's gate/up in one launch (or, where the per-group MMQ is faster, its in-place
+                            // groups: the same GU rows), H of all its rows in one pass, its down in one launch
+                            stats_.experts_resident += (int64_t) order.size();
+                            pt.mark(kPfGemmGU, cs);
+                            if (!ws::gate_up(wl, m.cs)) {
+                                const size_t n = order.size();
+                                for (size_t j0 = 0; j0 < n; j0 += MMQ_GROUP) {
+                                    const size_t j1 = std::min(n, j0 + MMQ_GROUP);
+                                    int64_t maxr = 0;
+                                    for (size_t i = j0; i < j1; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
+                                    mmq::Product gu;
+                                    gu.w = ip_base; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
+                                    gu.n = (int) (j1 - j0); gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
+                                    gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
+                                    gu.xoff = m.xoff_dev + j0;
+                                    m.mmq_ctx->run(gu, m.cs);
+                                }
+                            }
+                            mmq::swiglu_quant(m.GU, m.Hq, T * K, !lay.native, m.cs);
+                            pt.mark(kPfGemmD, cs);
+                            ws::down(wl, m.cs);
+                            if (stream_all && group_gather) give_back(consumed);   // (no entries of this layer: the issuer goes on)
+                        } else if (!stream_all) {
                             size_t staged = 0;
                             size_t pending = 0;
                             const bool stream_ahead = stream_ahead_enabled();
