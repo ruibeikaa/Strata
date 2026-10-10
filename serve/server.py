@@ -745,6 +745,7 @@ class StrataEngine:
         self.wlock = threading.Lock()                   # stdin writes from several request threads
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
+        self.park_from_disk()                           # PH402 local patch: before any request reaches this engine
 
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
@@ -821,8 +822,50 @@ class StrataEngine:
 
     def unload(self):
         """Release GPU/RAM between requests, retaining the spawn config for automatic reloading."""
+        self.park_to_disk()
         self.close()
         self.unloaded = True
+
+    # PH402 local patch: STRATA_PARK_DIR names a folder the parked conversations go to when the engine is unloaded
+    # (the stop scripts' graceful path, the idle unload) and come back from when it starts, so a restart does not
+    # read them again from the first token.  Unset: as before.  Any failure is said and the stop / start goes on.
+    PARK_DIR = os.environ.get("STRATA_PARK_DIR", "").strip()
+
+    def park_known(self) -> bool:
+        """The engine file knows PARKSAVE / PARKLOAD (an engine without them would answer ERR, which the session
+        exchange treats as out of step and ends the engine)."""
+        if "_park_known" not in self.__dict__:
+            try:
+                with open(self.spawn[0], "rb") as f:
+                    self.__dict__["_park_known"] = b"PARKLOAD " in f.read()
+            except OSError:
+                self.__dict__["_park_known"] = False
+            if not self.__dict__["_park_known"] and self.PARK_DIR:
+                print(f"[strata] STRATA_PARK_DIR is set but {self.spawn[0]} has no PARKSAVE / PARKLOAD: parked "
+                      "conversations are not kept over a restart", flush=True)
+        return self.__dict__["_park_known"]
+
+    def park_to_disk(self):
+        if not self.PARK_DIR or self.batch or not self.alive() or not self.park_known():
+            return
+        try:
+            r = self.session_file("parksave", self.PARK_DIR)
+            print(f"[strata] parked conversations saved: {r['tokens']} ({r['bytes'] / 1e9:.2f} GB) to {self.PARK_DIR} "
+                  f"in {r['ms'] / 1000:.1f} s", flush=True)
+        except Exception as e:                          # never let it block the unload
+            print(f"[strata] parked conversations not saved: {e}", flush=True)
+
+    def park_from_disk(self):
+        if not self.PARK_DIR or self.batch or not self.alive() or not self.park_known():
+            return
+        if not os.path.exists(os.path.join(self.PARK_DIR, "park.manifest")):
+            return
+        try:
+            r = self.session_file("parkload", self.PARK_DIR)
+            print(f"[strata] parked conversations loaded: {r['tokens']} ({r['bytes'] / 1e9:.2f} GB) from {self.PARK_DIR} "
+                  f"in {r['ms'] / 1000:.1f} s", flush=True)
+        except Exception as e:
+            print(f"[strata] parked conversations not loaded: {e}", flush=True)
 
     RESTART_RETRY_S = 15.0   # between the tries of restart(): a dying engine's VRAM may take a while to come back
 
@@ -1656,16 +1699,19 @@ class StrataEngine:
         a step that blocks in one call (a flush, the device transfer): until the next line the wait is that step's
         explicit allowance (at most SESSION_WAIT_MAX_S) when it is longer than engine_silence_s - no more, so a step
         that never ends is still ended."""
-        if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
+        # PH402 local patch: "parksave" / "parkload" - every parked conversation to / from a folder (the engine's
+        # PARKSAVE / PARKLOAD, answered like SAVE / RESTORE with a conversation count in place of the tokens)
+        commands = {"save": "SAVE", "restore": "RESTORE", "parksave": "PARKSAVE", "parkload": "PARKLOAD"}
+        if action not in commands or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
         try:
-            self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
+            self.proc.stdin.write(f"{commands[action]} {path}\n")
             self.proc.stdin.flush()
         except OSError:
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         silence = float(self.silence_s or 0)
         heard = time.monotonic()
-        want = "SAVED" if action == "save" else "RESTORED"
+        want = "SAVED" if action in ("save", "parksave") else "RESTORED"
 
         def out_of_step(line: str) -> EngineDied:
             self.ended = True                               # not alive from now: the next request restarts it
