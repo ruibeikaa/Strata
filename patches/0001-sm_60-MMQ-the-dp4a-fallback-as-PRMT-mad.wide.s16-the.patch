@@ -1,0 +1,48 @@
+From e178765163b86c3dd1eceaa5fb5ebdfae8139607 Mon Sep 17 00:00:00 2001
+From: ruibeikaa <126486262+ruibeikaa@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 19:23:31 +0000
+Subject: [PATCH 1/2] sm_60 MMQ: the dp4a fallback as PRMT + mad.wide.s16
+ (thedrzinger, Niko1221/Strata#1639)
+
+On llama.cpp as Strata 0.1.41 pins it (3cf03257).  ggml's dp4a fallback for GPUs
+without __dp4a (sm_60) as byte permutes + 16-bit multiply-adds: the same integer
+sums, so MMQ's results are unchanged bit for bit; prompt reads 2.5-8.4% faster on
+GP100.
+---
+ ggml/src/ggml-cuda/common.cuh | 20 +++++++++++++++++---
+ 1 file changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 2e78ae4..a46a0b9 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -749,9 +749,23 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
+ #if __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
+     return __dp4a(a, b, c);
+ #else // __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
+-    const int8_t * a8 = (const int8_t *) &a;
+-    const int8_t * b8 = (const int8_t *) &b;
+-    return c + a8[0]*b8[0] + a8[1]*b8[1] + a8[2]*b8[2] + a8[3]*b8[3];
++    // sm_60: the byte pairs sign-extended into 16-bit halves by PRMT, then mad.wide.s16 on the halves (thedrzinger's
++    // form, Niko1221/Strata#1639) - the same int32 sum as the byte-wise form (every lane/byte pair and 1e9 random cases,
++    // 0 mismatches).  IQ3_XXS MMQ on a GP100: 14-23% less time per launch than byte-wise at 15-256 rows per expert,
++    // and 10-17% less than PRMT with C 16-bit products.
++    int a02, a13, b02, b13;
++    asm("prmt.b32 %0, %1, 0, 0xA280;" : "=r"(a02) : "r"(a));
++    asm("prmt.b32 %0, %1, 0, 0xB391;" : "=r"(a13) : "r"(a));
++    asm("prmt.b32 %0, %1, 0, 0xA280;" : "=r"(b02) : "r"(b));
++    asm("prmt.b32 %0, %1, 0, 0xB391;" : "=r"(b13) : "r"(b));
++    int r = c;
++    asm("{\n\t.reg .s16 al, ah, bl, bh;\n\t"
++        "mov.b32 {al, ah}, %1;\n\tmov.b32 {bl, bh}, %2;\n\t"
++        "mad.wide.s16 %0, al, bl, %0;\n\tmad.wide.s16 %0, ah, bh, %0;\n\t"
++        "mov.b32 {al, ah}, %3;\n\tmov.b32 {bl, bh}, %4;\n\t"
++        "mad.wide.s16 %0, al, bl, %0;\n\tmad.wide.s16 %0, ah, bh, %0;\n\t}"
++        : "+r"(r) : "r"(a02), "r"(b02), "r"(a13), "r"(b13));
++    return r;
+ #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
+ 
+ #endif // defined(GGML_USE_HIP)
+-- 
+2.54.0.windows.1
+

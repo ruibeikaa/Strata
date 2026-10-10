@@ -1,0 +1,382 @@
+From 31dfa76ff43de311a8327baa70716c60af10ccfe Mon Sep 17 00:00:00 2001
+From: ruibeikaa <126486262+ruibeikaa@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 14:30:49 +0000
+Subject: [PATCH 2/2] sm_60 MMQ: MoE experts read in place (offset table) and
+ the down K loop stopped at K
+
+For Strata's PH402 prompt path.  mul_mat_q gains two template switches, both off by
+default (every existing instantiation compiles to the same body):
+- pt: a launch's expert zt reads its matrix at x + tab[zt] + add (tab a device array of
+  byte offsets from the kernel's const __restrict__ base) instead of x + zt*stride, so
+  the experts need not be copied into one strided buffer.  Offsets, not pointers: a
+  by-value pointer table went to a stack frame (+12% on down) and a device table of
+  pointers lost the restrict provenance (generic LD instead of LDG.E.CI, +7%) on GP100.
+- kstop: the K loop runs whole 256-value tiles and peels a last half tile (Q2_0 and
+  IQ4_NL half-tile loaders), so a K 640 matrix is not over-read by 128 values - read in
+  place those bytes are the next expert's and can decode to inf/NaN.  The dropped half
+  met zero q8_1 activations and added +-0: the same bits.
+mul_mat_q_case_inplace<type, kstop> (no-fallback configs, tiling kernel only; aborts on
+stream-k) and DECL_MMQ_CASE_INPLACE for the caller's instances.
+---
+ ggml/src/ggml-cuda/mmq-load-tiles.cuh |  22 +++-
+ ggml/src/ggml-cuda/mmq.cuh            | 140 ++++++++++++++++++++------
+ 2 files changed, 128 insertions(+), 34 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmq-load-tiles.cuh b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
+index 7f00bad..99b703b 100644
+--- a/ggml/src/ggml-cuda/mmq-load-tiles.cuh
++++ b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
+@@ -95,7 +95,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+     }
+ }
+ 
+-template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q2_0(
++// `half` (mmq.cuh's kstop): only the tile's first half of blocks is read; the rest of the shared tile is left as it
++// was (only the first vec_dot half reads this tile)
++template <ggml_type type, int J, bool fallback, bool half = false> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q2_0(
+         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+     constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+@@ -129,6 +131,10 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+             i = min(i, i_max);
+         }
+ 
++        if (half && kbx >= blocks_per_iter/2) {
++            continue;
++        }
++
+         const block_q2_0 * bxi = (const block_q2_0 *) x + kbx0 + i*stride + kbx;
+         const int16_t    * qxi = (const int16_t *) bxi->qs + kqsx * 4;
+ 
+@@ -174,6 +180,10 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+             i = min(i, i_max);
+         }
+ 
++        if (half && scale_block >= blocks_per_iter/2) {
++            continue;
++        }
++
+         const block_q2_0 * bxi = (const block_q2_0 *) x + kbx0 + i*stride + scale_block;
+ 
+ #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+@@ -1492,7 +1502,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+     }
+ }
+ 
+-template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq4_nl(
++template <ggml_type type, int J, bool fallback, bool half = false> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq4_nl(
+         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+     constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+@@ -1522,6 +1532,10 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+             i = min(i, i_max);
+         }
+ 
++        if (half && kbx >= (MMQ_ITER_K/QK4_NL)/2) {
++            continue;
++        }
++
+         const block_iq4_nl * bxi = (const block_iq4_nl *) x + kbx0 + i*stride + kbx;
+ 
+         const int aux_q4 = get_int_b2(bxi->qs, kqsx);
+@@ -1549,6 +1563,10 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+             i = min(i, i_max);
+         }
+ 
++        if (half && kbxd >= (MMQ_ITER_K/QK4_NL)/2) {
++            continue;
++        }
++
+         const block_iq4_nl * bxi = (const block_iq4_nl *) x + kbx0 + i*stride + kbxd;
+ 
+ #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index 6923f35..648ad19 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -5,6 +5,14 @@
+ #include <climits>
+ #include <cstdint>
+ 
++// Strata (PH402, sm_60): MoE experts read in place.  With `pt` a launch's expert zt reads its matrix at
++// x + tab[zt] + add instead of x + zt*stride_channel_x: x the kernel's const __restrict__ base, tab a device array of
++// byte offsets from it (one per expert of the launch), add 0 for gate/up and the blob's down offset for down.  So the
++// experts need not be copied into one strided buffer first.  Measured on GP100: a by-value table of pointers went to
++// a stack frame (+12% on down) and a device table of POINTERS lost the restrict provenance (generic LD instead of
++// LDG.E.CI, +7% on down); offsets from the restrict base keep the original loads.
++struct mmq_xptrs { const long long * tab; long long add; };
++
+ #define MMQ_DP4A_MAX_BATCH_SIZE 64 // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
+ #define MMQ_ITER_K             256
+ #define MMQ_ITER_K_FP4         512
+@@ -859,6 +867,19 @@ static constexpr __device__ ggml_cuda_mmq_load_tiles_t ggml_cuda_mmq_get_load_ti
+     return ggml_cuda_mmq_get_util_funcs<type, J, fallback>().load_tiles;
+ }
+ 
++// kstop's last half tile: the loader that reads only the tile's first half (the formats of a K % 256 == 128 down
++// matrix in the Strata packs)
++template <ggml_type type, int J, bool fallback>
++static constexpr __device__ ggml_cuda_mmq_load_tiles_t ggml_cuda_mmq_get_load_tiles_half() {
++    if constexpr (type == GGML_TYPE_Q2_0) {
++        return ggml_cuda_mmq_load_tiles_q2_0<type, J, fallback, true>;
++    } else if constexpr (type == GGML_TYPE_IQ4_NL) {
++        return ggml_cuda_mmq_load_tiles_iq4_nl<type, J, fallback, true>;
++    } else {
++        return nullptr;
++    }
++}
++
+ template <ggml_type type, int J, bool fallback>
+ static constexpr __device__ ggml_cuda_mmq_vec_dot_t ggml_cuda_mmq_get_vec_dot() {
+     return ggml_cuda_mmq_get_util_funcs<type, J, fallback>().vec_dot;
+@@ -871,7 +892,7 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
+ 
+ // ---------------------------------------------------------------------------------------------
+ 
+-template <ggml_type type, int J, bool fallback, bool fixup>
++template <ggml_type type, int J, bool fallback, bool fixup, bool kstop = false>
+ static __device__ __forceinline__ void mul_mat_q_process_tile(
+         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
+         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+@@ -905,7 +926,10 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
+ 
+     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
+ 
+-    for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
++    // kstop: whole iterations only; a remaining half tile (K % ITER_K == ITER_K/2, checked on the host) is the peeled
++    // iteration below, so nothing past the matrix is read.  Without kstop kb0_full == kb0_stop: the original loop.
++    const int kb0_full = kstop ? kb0_start + (kb0_stop - kb0_start) / blocks_per_iter * blocks_per_iter : kb0_stop;
++    for (int kb0 = kb0_start; kb0 < kb0_full; kb0 += blocks_per_iter) {
+         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+         {
+             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+@@ -940,6 +964,32 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
+         __syncthreads();
+     }
+ 
++    if constexpr (kstop) {
++        if (kb0_full < kb0_stop) {
++            // the last half tile: only blocks [kb0_full, kb0_stop) are loaded and only the first 128-value half is
++            // multiplied.  The full iteration's second half met zero activations (the q8_1 rows are zero past K) and
++            // added +-0 to accumulators that are never -0: the same bits.
++            constexpr ggml_cuda_mmq_load_tiles_t load_tiles_half = ggml_cuda_mmq_get_load_tiles_half<type, J, fallback>();
++            static_assert(load_tiles_half != nullptr, "kstop: no half-tile loader for this type");
++            load_tiles_half(x, tile_x, offset_x + kb0_full, tile_x_max_i, stride_row_x);
++            {
++                const int * by0 = y + ncols_y * (kb0_full * qk / ne_block) * sz;
++#pragma unroll
++                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
++                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
++
++                    tile_y[l] = by0[l];
++                }
++            }
++
++            __syncthreads();
++
++            vec_dot(tile_x, tile_y, sum, 0);
++
++            __syncthreads();
++        }
++    }
++
+     if (fixup) {
+         write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(J*I), y_scale, I, I, J);
+     } else {
+@@ -950,7 +1000,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
+ 
+ // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
+ 
+-template <ggml_type type, int J, bool fallback>
++template <ggml_type type, int J, bool fallback, bool pt = false, bool kstop = false>
+ __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_get_occupancy(type, J, fallback))
+ static __global__ void mul_mat_q(
+         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
+@@ -959,7 +1009,7 @@ static __global__ void mul_mat_q(
+         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
+         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+-        const uint3 ntx) {
++        const uint3 ntx, const mmq_xptrs xptrs) {
+ 
+     // Skip unused template specializations for faster compilation:
+     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
+@@ -1050,11 +1100,14 @@ static __global__ void mul_mat_q(
+         const int tile_x_max_i = nrows_x  - it*I - 1;
+         const int tile_y_max_j = col_diff - jt*J - 1;
+ 
+-        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
++        // pt: expert zt's matrix through the offset table (no channel stride)
++        const char * x_tile = pt ? x + (xptrs.tab[zt] + xptrs.add) : x;
++        const int offset_x = pt ? it*I*stride_row_x
++                                : fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
+ 
+         constexpr bool fixup = false;
+-        mul_mat_q_process_tile<type, J, fallback, fixup>
+-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
++        mul_mat_q_process_tile<type, J, fallback, fixup, kstop>
++            (x_tile, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+              stride_row_x, ncols_y, stride_col_dst,
+              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+         return;
+@@ -1392,8 +1445,9 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
+     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
+ }
+ 
+-template <ggml_type type, int J, bool fallback>
+-static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
++template <ggml_type type, int J, bool fallback, bool pt = false, bool kstop = false>
++static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream,
++                             const mmq_xptrs xptrs = {nullptr, 0}) {
+     const int id = ggml_cuda_get_device();
+     const int cc = ggml_cuda_info().devices[id].cc;
+     const int nsm = ggml_cuda_info().devices[id].nsm;
+@@ -1406,8 +1460,12 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+ 
+     const dim3 block_dims(warp_size, nwarps, 1);
+ 
+-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false>), nbytes_shared);
+-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true>), nbytes_shared);
++    if constexpr (pt || kstop) {
++        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, fallback, pt, kstop>), nbytes_shared);
++    } else {
++        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false>), nbytes_shared);
++        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true>), nbytes_shared);
++    }
+ 
+     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
+     const int ntx  = (args.ncols_max + config.J - 1) / config.J;
+@@ -1427,14 +1485,17 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
+ 
+     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
+-        mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
++        mul_mat_q<type, J, fallback, pt, kstop><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
+              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+-             ntx_fd);
++             ntx_fd, xptrs);
+         return;
+     }
++    if constexpr (pt || kstop) {   // the offset table and the K stop exist only in the tiling kernel (Pascal: no stream-k)
++        GGML_ABORT("mmq: in-place experts need a GPU without stream-k");
++    }
+ 
+     // For the stream-k kernel it is possible to run it with tiling by setting the number of CUDA blocks equal to the number of tiles.
+     // This is worthwhile if the efficiency of tiling is high and skipping the fixup kernel is more important.
+@@ -1461,7 +1522,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+-         ntx_fd);
++         ntx_fd, mmq_xptrs{nullptr, 0});
+ 
+     if (!fixup_needed) {
+         return;
+@@ -1474,8 +1535,9 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+          ntx_fd);
+ }
+ 
+-template <ggml_type type, bool fallback>
+-void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
++template <ggml_type type, bool fallback, bool pt = false, bool kstop = false>
++void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream,
++                        const mmq_xptrs xptrs = {nullptr, 0}) {
+     const int    id    = ggml_cuda_get_device();
+     const int    cc    = ggml_cuda_info().devices[id].cc;
+     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+@@ -1503,52 +1565,52 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+ 
+     switch (J_best) {
+         case   8:
+-            launch_mul_mat_q<type,   8, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,   8, fallback, pt, kstop>(ctx, args, stream, xptrs);
+             break;
+         case  16:
+-            launch_mul_mat_q<type,  16, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,  16, fallback, pt, kstop>(ctx, args, stream, xptrs);
+             break;
+         case  24:
+-            launch_mul_mat_q<type,  24, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,  24, fallback, pt, kstop>(ctx, args, stream, xptrs);
+             break;
+         case  32:
+-            launch_mul_mat_q<type,  32, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,  32, fallback, pt, kstop>(ctx, args, stream, xptrs);
+             break;
+         case  40:
+-            launch_mul_mat_q<type,  40, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,  40, fallback, pt, kstop>(ctx, args, stream, xptrs);
+             break;
+         case  48:
+-            launch_mul_mat_q<type,  48, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,  48, fallback, pt, kstop>(ctx, args, stream, xptrs);
+             break;
+         case  56:
+-            launch_mul_mat_q<type,  56, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,  56, fallback, pt, kstop>(ctx, args, stream, xptrs);
+             break;
+         case  64:
+-            launch_mul_mat_q<type,  64, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,  64, fallback, pt, kstop>(ctx, args, stream, xptrs);
+             break;
+         case  72:
+-            launch_mul_mat_q<type,  72, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,  72, fallback, pt, kstop>(ctx, args, stream, xptrs);
+             break;
+         case  80:
+-            launch_mul_mat_q<type,  80, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,  80, fallback, pt, kstop>(ctx, args, stream, xptrs);
+             break;
+         case  88:
+-            launch_mul_mat_q<type,  88, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,  88, fallback, pt, kstop>(ctx, args, stream, xptrs);
+             break;
+         case  96:
+-            launch_mul_mat_q<type,  96, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,  96, fallback, pt, kstop>(ctx, args, stream, xptrs);
+             break;
+         case 104:
+-            launch_mul_mat_q<type, 104, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type, 104, fallback, pt, kstop>(ctx, args, stream, xptrs);
+             break;
+         case 112:
+-            launch_mul_mat_q<type, 112, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type, 112, fallback, pt, kstop>(ctx, args, stream, xptrs);
+             break;
+         case 120:
+-            launch_mul_mat_q<type, 120, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type, 120, fallback, pt, kstop>(ctx, args, stream, xptrs);
+             break;
+         case 128:
+-            launch_mul_mat_q<type, 128, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type, 128, fallback, pt, kstop>(ctx, args, stream, xptrs);
+             break;
+         default:
+             fprintf(stderr, "J_best=%d\n", J_best);
+@@ -1568,6 +1630,20 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
+     }
+ }
+ 
++// Strata (PH402): mul_mat_q_case with the experts read in place (see mmq_xptrs); `kstop` for a K % 256 == 128 matrix
++// (the down product, K 640), which would otherwise read one half tile past each matrix - into the next expert.  Only
++// the no-fallback configs (rows % 128 == 0) on GPUs without stream-k: the caller checks.
++template <ggml_type type, bool kstop>
++void mul_mat_q_case_inplace(ggml_backend_cuda_context & ctx, const mmq_args & args, const mmq_xptrs & xptrs,
++                            cudaStream_t stream) {
++    if (args.nrows_x % 128 != 0) {
++        GGML_ABORT("mmq: in-place experts need rows %% 128 == 0");
++    }
++    mul_mat_q_switch_J<type, false, true, kstop>(ctx, args, stream, xptrs);
++}
++
++#define DECL_MMQ_CASE_INPLACE(type, kstop)     template void mul_mat_q_case_inplace<type, kstop>(ggml_backend_cuda_context & ctx, const mmq_args & args, const mmq_xptrs & xptrs, cudaStream_t stream)
++
+ #define DECL_MMQ_CASE(type)                                                        \
+     template void mul_mat_q_case<type>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
+ 
+-- 
+2.54.0.windows.1
+
