@@ -40,6 +40,8 @@ void quantize_scatter(const float* x, const int32_t* slot, const int32_t* src, v
 /// [bounds[e], bounds[e+1]) of `xq` (bounds on the device, n+1 entries) times its [w_rows, w_cols] matrix into
 /// dst rows of the same indices (`ld_dst` floats apart, via `ids`: dst row = ids[row], an identity table works).
 /// `total_rows`: the rows of xq; `max_rows`: the most rows one expert has (the launch grid).
+/// `xoff` (only where inplace() is true): the experts are read where they lie - expert e's matrix at
+/// (const uint8_t*) w + xoff[e] + xadd, xoff n byte offsets on the device - and `expert_bytes` is not used.
 struct Product {
     const void* w = nullptr;
     int type = -1;
@@ -52,7 +54,16 @@ struct Product {
     int64_t total_rows = 0, max_rows = 0;
     float* dst = nullptr;
     int64_t ld_dst = 0;
+    const int64_t* xoff = nullptr;
+    int64_t xadd = 0;
 };
+
+/// Context::run can read a product's experts in place (Product::xoff) - no gather into a group buffer first, the same
+/// bits: this build has the in-place kernels for the format (gate/up: IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S with K
+/// whole 256-value tiles; down: Q2_0, IQ4_NL with K % 256 == 128, the K loop stopping at K so nothing past the matrix
+/// is read), the rows are a multiple of 128, and on every visible GPU llama.cpp's MMQ runs this format without
+/// stream-k (Pascal).  STRATA_MMQ_INPLACE=0: never (the gathered path, the A/B).
+bool inplace(int ggml_type, int64_t w_rows, int64_t w_cols);
 
 /// The launch context (llama.cpp's MMQ keeps a small scratch pool for its stream-k fixup).  One per prompt path.
 class Context {

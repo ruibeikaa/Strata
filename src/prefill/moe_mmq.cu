@@ -10,6 +10,20 @@
 #include <cstdio>
 #include <cstdlib>
 
+// mmq::inplace needs a ggml checkout whose mmq.cuh has mul_mat_q_case_inplace (builds/llama.cpp-ph402); built against
+// any other, inplace() is false and the experts are gathered as before
+#if !defined(__HIPCC__) && defined(DECL_MMQ_CASE_INPLACE)
+#define STRATA_MMQ_INPLACE_BUILT 1
+// mmq.cuh's mul_mat_q_case_inplace, instantiated in mmq_inplace_*.cu
+extern DECL_MMQ_CASE_INPLACE(GGML_TYPE_IQ2_XXS, false);
+extern DECL_MMQ_CASE_INPLACE(GGML_TYPE_IQ2_XS, false);
+extern DECL_MMQ_CASE_INPLACE(GGML_TYPE_IQ2_S, false);
+extern DECL_MMQ_CASE_INPLACE(GGML_TYPE_IQ3_XXS, false);
+extern DECL_MMQ_CASE_INPLACE(GGML_TYPE_IQ3_S, false);
+extern DECL_MMQ_CASE_INPLACE(GGML_TYPE_Q2_0, true);
+extern DECL_MMQ_CASE_INPLACE(GGML_TYPE_IQ4_NL, true);
+#endif
+
 namespace strata::prefill::mmq {
 namespace {
 
@@ -21,6 +35,20 @@ void ck(cudaError_t e, const char* what) {
 }
 
 int64_t pad512(int64_t n) { return (n + 511) / 512 * 512; }
+
+#if defined(STRATA_MMQ_INPLACE_BUILT)
+// the in-place kernels this build has: gate/up formats (K whole tiles) and down formats (K stopping on a half tile)
+bool inplace_type(ggml_type t, bool kstop) {
+    switch (t) {
+        case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S:
+            return !kstop;
+        case GGML_TYPE_Q2_0: case GGML_TYPE_IQ4_NL:
+            return kstop;
+        default:
+            return false;
+    }
+}
+#endif
 
 __global__ void copy16_kernel(const uint4* __restrict__ a, int64_t na, const uint4* __restrict__ b, int64_t nb,
                               uint4* __restrict__ ab_dst, const uint4* __restrict__ c, int64_t nc, uint4* __restrict__ c_dst) {
@@ -164,6 +192,28 @@ unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
 bool built() { return true; }
 
+bool inplace(int t, int64_t w_rows, int64_t w_cols) {
+#if !defined(STRATA_MMQ_INPLACE_BUILT)
+    (void) t; (void) w_rows; (void) w_cols;
+    return false;
+#else
+    static const bool on = [] { const char* e = std::getenv("STRATA_MMQ_INPLACE"); return e == nullptr || std::atoi(e) != 0; }();
+    const bool kstop = w_cols % MMQ_ITER_K != 0;
+    if (!on || !supported(t) || w_rows % 128 != 0 || (kstop && w_cols % MMQ_ITER_K != MMQ_ITER_K / 2) ||
+        !inplace_type((ggml_type) t, kstop))
+        return false;
+    // the K loop's tile: whole 256-value iterations on every config this format can take
+    const ggml_cuda_device_info& info = ggml_cuda_info();
+    for (int id = 0; id < info.device_count; ++id)
+        for (int J = 8; J <= 128; J += 8) {
+            const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, false, info.devices[id].cc);
+            if (c.type == GGML_TYPE_COUNT) continue;
+            if (c.stream_k || c.K_vram != MMQ_ITER_K) return false;
+        }
+    return true;
+#endif
+}
+
 bool supported(int t) {
     switch ((ggml_type) t) {
         case GGML_TYPE_Q2_0:
@@ -259,6 +309,25 @@ void Context::run(const Product& p, void* stream) {
                         p.max_rows, p.max_rows};
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
+#if defined(STRATA_MMQ_INPLACE_BUILT)
+    if (p.xoff != nullptr) {   // inplace(): the experts where they lie
+        const mmq_xptrs xp = {(const long long*) p.xoff, (long long) p.xadd};
+        switch (t) {
+            case GGML_TYPE_IQ2_XXS: mul_mat_q_case_inplace<GGML_TYPE_IQ2_XXS, false>(ctx, a, xp, s); break;
+            case GGML_TYPE_IQ2_XS: mul_mat_q_case_inplace<GGML_TYPE_IQ2_XS, false>(ctx, a, xp, s); break;
+            case GGML_TYPE_IQ2_S: mul_mat_q_case_inplace<GGML_TYPE_IQ2_S, false>(ctx, a, xp, s); break;
+            case GGML_TYPE_IQ3_XXS: mul_mat_q_case_inplace<GGML_TYPE_IQ3_XXS, false>(ctx, a, xp, s); break;
+            case GGML_TYPE_IQ3_S: mul_mat_q_case_inplace<GGML_TYPE_IQ3_S, false>(ctx, a, xp, s); break;
+            case GGML_TYPE_Q2_0: mul_mat_q_case_inplace<GGML_TYPE_Q2_0, true>(ctx, a, xp, s); break;
+            case GGML_TYPE_IQ4_NL: mul_mat_q_case_inplace<GGML_TYPE_IQ4_NL, true>(ctx, a, xp, s); break;
+            default:
+                std::fprintf(stderr, "prefill mmq: type %d has no in-place kernels\n", (int) t);
+                std::exit(1);
+        }
+        ck(cudaGetLastError(), "mul_mat_q in place");
+        return;
+    }
+#endif
     switch (t) {
 #ifdef STRATA_ORCA_Q4KS_MMQ
         case GGML_TYPE_Q5_0: mul_mat_q_case<GGML_TYPE_Q5_0>(ctx, a, s); break;

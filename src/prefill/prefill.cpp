@@ -732,6 +732,11 @@ struct Prefill::Impl {
     int32_t *ids_identity = nullptr, *bounds_dev = nullptr;
     uint8_t *grp_gu = nullptr, *grp_d = nullptr;
     std::vector<int32_t> bounds_host;
+    // mmq::inplace: the layer's resident experts as byte offsets from the expert cache's base, in MMQ order, and per
+    // group whether all of its experts are resident - such a group is read where it lies, not gathered
+    int64_t* xoff_dev = nullptr;
+    std::vector<int64_t> xoff_host;
+    std::vector<char> ip_group;
     std::unique_ptr<mmq::Context> mmq_ctx;
     std::vector<int32_t> ids_host, slot_host, src_host, cnt, off;
     // set_cpu_pool: a small chunk's CPU experts. The layer's MoE input (T x N, from `mixed`) and the rows the pool
@@ -1076,7 +1081,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.steps_host.resize(T * strata::kernels::kStepCount);
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
     {
-        const size_t need = 3 * T * K + (size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2));
+        // the routing tables, the MMQ group bounds, the in-place offsets (mmq::inplace: n_expert int64)
+        const size_t need = 3 * T * K + (size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)) + 2 * (size_t) m.g->n_expert;
         const char* gc = std::getenv("STRATA_GROUP_COPY");
         if (m.grp_n < need && !(gc && gc[0] == '1')) {
             if (m.grp_host) cudaFreeHost(m.grp_host);
@@ -1218,6 +1224,7 @@ bool Prefill::carve(size_t T, void* alloc) {
         const MmqPlan& mp = mmq_plan();
         m.ids_identity = o.take<int32_t>(T * K, ok);
         m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
+        m.xoff_dev = o.take<int64_t>((size_t) m.g->n_expert, ok);
         m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
         // (written at every run's start, not here: when serving, these are live expert-cache slots until a request
@@ -1857,6 +1864,7 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
         const MmqPlan& mp = mmq_plan();
         o.take<int32_t>(T * K, ok);
         o.take<int32_t>((size_t) (2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
+        o.take<int64_t>((size_t) g.n_expert, ok);
         o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
     }
@@ -3307,6 +3315,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;
                         const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
+                        bool ip_layer = false;              // mmq::inplace: this layer's resident groups are not gathered
+                        const uint8_t* ip_base = nullptr;   // the expert cache's base, the offsets' origin
                         pt.mark(kPfGather, cs);
                         if (use_mmq) {
                             // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`:
@@ -3329,6 +3339,35 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             } else {
                                 cudaMemcpyAsync(m.bounds_dev, m.bounds_host.data(), m.bounds_host.size() * 4,
                                                 cudaMemcpyHostToDevice, m.cs);
+                            }
+                            // mmq::inplace: a group whose experts are all resident is read where it lies in the expert
+                            // cache - the same products and bits, without the copy into the group buffers.  Its gate/up
+                            // is the blob's first 1280 rows (up right after gate), its down at the blob's down_off.
+                            ip_layer = lay.native && m.cache != nullptr && m.host_res != nullptr && m.xoff_dev != nullptr &&
+                                       n > 0 && lay.fmt[(size_t) l].up_off == mmq_gub / 2 && mmq::inplace(mmq_gt, 1280, N) &&
+                                       mmq::inplace(mmq_dt, N, 640);
+                            if (ip_layer) {
+                                static bool said = false;
+                                if (!said) {
+                                    said = true;
+                                    std::fprintf(stderr, "strata prefill: resident experts read in place by MMQ, no gather "
+                                                         "(STRATA_MMQ_INPLACE=0 gathers them)\n");
+                                }
+                                ip_base = m.cache->device_slot(0);
+                                m.xoff_host.assign(n, -1);
+                                m.ip_group.assign(ng, 1);
+                                for (size_t j = 0; j < n; ++j) {
+                                    const int32_t s = m.host_res[(size_t) l * m.g->n_expert + order[j]];
+                                    if (s >= 0) m.xoff_host[j] = (int64_t) (m.cache->device_slot(s) - ip_base);
+                                    else m.ip_group[j / MMQ_GROUP] = 0;
+                                }
+                                if (grp_mapped) {
+                                    int32_t* xh = m.grp_host + 3 * m.grp_tk + 2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2);
+                                    std::memcpy(xh, m.xoff_host.data(), n * sizeof(int64_t));
+                                    copy_i32((int32_t*) m.xoff_dev, m.grp_dev + (xh - m.grp_host), (int64_t) (2 * n), m.cs);
+                                } else {
+                                    cudaMemcpyAsync(m.xoff_dev, m.xoff_host.data(), n * sizeof(int64_t), cudaMemcpyHostToDevice, m.cs);
+                                }
                             }
                         } else {
                             gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
@@ -3708,7 +3747,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (use_mmq) {
                                 // gather the expert into its group slot (GGUF blocks, unchanged or converted)
                                 const size_t q = j % MMQ_GROUP;
-                                if (group_gather) {
+                                const bool ip = ip_layer && m.ip_group[j / MMQ_GROUP];   // read in place: no gather
+                                if (ip) {
+                                    if (slot >= 0) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
+                                } else if (group_gather) {
                                     gg.blob[q] = blob_dev;
                                     gg.n = (int) q + 1;
                                     if (slot >= 0) gg_slots[gg_nslots++] = slot;
@@ -3722,7 +3764,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 } else {
                                     mmq::gather_strata_q2(blob_dev, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
                                 }
-                                if (slot >= 0 && !group_gather) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
+                                if (slot >= 0 && !group_gather && !ip) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
                                 if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
                                 // the group's products: gate/up, swiglu, the group's H to q8_1, down
                                 const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order.size();
@@ -3731,13 +3773,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 int64_t maxr = 0;
                                 for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
                                 pt.mark(kPfGemmGU, cs);
-                                // the zeroed tail after the group's last expert (see MMQ_TAIL)
-                                cudaMemsetAsync(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, m.cs);
-                                cudaMemsetAsync(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, m.cs);
+                                // the zeroed tail after the group's last expert (see MMQ_TAIL; in place nothing past a
+                                // matrix is read)
+                                if (!ip) {
+                                    cudaMemsetAsync(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, m.cs);
+                                    cudaMemsetAsync(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, m.cs);
+                                }
                                 mmq::Product gu;
                                 gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
                                 gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
                                 gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
+                                if (ip) { gu.w = ip_base; gu.xoff = m.xoff_dev + j0; }
                                 m.mmq_ctx->run(gu, m.cs);
                                 // swiglu and H's q8_1 rows in one pass where the down type reads D4 rows
                                 const bool sq = swiglu_quant_on() && mmq::swiglu_quant_ok(mmq_dt);
@@ -3750,6 +3796,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
                                 dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
                                 dn.ld_dst = N;
+                                if (ip) { dn.w = ip_base; dn.xoff = m.xoff_dev + j0; dn.xadd = (int64_t) lay.fmt[(size_t) l].down_off; }
                                 m.mmq_ctx->run(dn, m.cs);
                                 return true;
                             }
