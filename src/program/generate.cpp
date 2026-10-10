@@ -8745,6 +8745,275 @@ int main(int argc, char** argv) {
             } busy_scope;
             stop_req.store(false);   // a STOP that arrived between requests is stale
             err.clear();
+            // PH402 local patch (not upstream): PARKSAVE <dir> | PARKLOAD <dir>, between requests.  The parked
+            // conversations - with the live one parked first on a save - to and from disk, so a restart of the route
+            // keeps them.  A parked image is one plain single-carve SavedConversation per stage (the park moved the
+            // checkpoints' stage parts apart already), so each goes to its own session file (conversation_file.hpp,
+            // format v1, bound to the same model/config identity as SAVE); a manifest, written last, lists them
+            // oldest first with a tag of this engine file and its STRATA_* environment (another build or switch set
+            // ignores the files: their state came from other arithmetic).  A load puts each conversation back in the
+            // parked list; the next request that matches one restores it the usual way.  Answers as SAVE / RESTORE
+            // do, so the server reads them the same way: SAVED / RESTORED <conversations> <bytes> <ms>, SESSION /
+            // SWAIT on the way (SESSION counts over all the files), SERR for a refusal.
+            if (line.rfind("PARKSAVE ", 0) == 0 || line.rfind("PARKLOAD ", 0) == 0) {
+                const bool save = line[4] == 'S';
+                const std::string dir = line.substr(9);
+                const auto t0 = Clock::now();
+                auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
+                auto refuse = [&](const std::string& why, strata::core::SessionError kind = strata::core::SessionError::invalid) {
+                    std::fprintf(stderr, "strata serve: park %s %s: %s\n", save ? "save" : "load", dir.c_str(), why.c_str());
+                    std::string one = why;
+                    for (char& c : one) if (c == '\n' || c == '\r') c = ' ';
+                    std::printf("SERR %s 0 %s\n", strata::core::session_error_name(kind), one.c_str());
+                    std::fflush(stdout);
+                    err.clear();
+                };
+                uint64_t moved_base = 0, moved_total = 0, moved_last = 0;
+                auto moving = [&](uint64_t done, uint64_t /*total*/) {
+                    moved_last = std::max(moved_last, moved_base + done);
+                    strata::core::progress_at(save ? "writing parked conversations, MiB" : "reading parked conversations, MiB",
+                                              (int64_t) (moved_last >> 20));
+                    strata::core::progress_allow(0);
+                    std::printf("SESSION %llu %llu\n", (unsigned long long) moved_last,
+                                (unsigned long long) std::max(moved_total, moved_last));
+                    std::fflush(stdout);
+                };
+                auto blocking = [&](const char* phase, uint64_t bytes) {
+                    const int64_t s = strata::core::session_phase_limit_s(bytes);
+                    strata::core::progress_at(phase);
+                    strata::core::progress_allow(s);
+                    std::printf("SWAIT %s %lld\n", phase, (long long) s);
+                    std::fflush(stdout);
+                };
+                strata::core::progress_at(save ? "saving parked conversations" : "loading parked conversations");
+                if (dir.empty()) { refuse("missing folder"); continue; }
+                if (o.peer_device >= 1) { refuse("parked files do not support --peer-device"); continue; }
+                if (o.batch > 0) { refuse("parked files do not support --batch"); continue; }
+                if (o.prompt_cache <= 0 || !conversations.enabled()) { refuse("the conversation cache is off"); continue; }
+                if (!ver.wait_commit(err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
+                strata::core::SessionFileIdentity id;
+                try {
+                    if (!session_identity(id, err, [&] { blocking("fingerprint", 2u << 20); })) {
+                        refuse(err, strata::core::SessionError::io);
+                        continue;
+                    }
+                } catch (const std::exception& e) {
+                    refuse(std::string("session identity: ") + e.what(), strata::core::SessionError::io);
+                    continue;
+                }
+                // what else the saved bytes depend on here: this engine file and the STRATA_* switches
+                std::string tag;
+                {
+                    strata::core::SessionIdentityBuilder b(0x5041524bULL);
+                    b.str("engine", STRATA_VERSION);
+                    std::string exe;
+#ifdef _WIN32
+                    char buf[MAX_PATH * 2] = {};
+                    if (GetModuleFileNameA(nullptr, buf, (DWORD) sizeof(buf)) > 0) exe = buf;
+                    char** envp = _environ;
+#else
+                    extern char** environ;
+                    char** envp = environ;
+#endif
+                    std::error_code ec;
+                    if (!exe.empty()) {
+                        const auto sz = std::filesystem::file_size(exe, ec);
+                        b.u64("exe_size", ec ? 0 : (uint64_t) sz);
+                        const auto mt = std::filesystem::last_write_time(exe, ec);
+                        b.i64("exe_mtime", ec ? 0 : (int64_t) mt.time_since_epoch().count());
+                    }
+                    std::vector<std::string> env;
+                    for (char** e = envp; e && *e; ++e)
+                        if (std::strncmp(*e, "STRATA_", 7) == 0) env.emplace_back(*e);
+                    std::sort(env.begin(), env.end());
+                    for (const auto& kv : env) b.str("env", kv);
+                    b.i64("stages", (int64_t) stages.size());
+                    char hex[32];
+                    std::snprintf(hex, sizeof hex, "%016llx", (unsigned long long) b.digest());
+                    tag = hex;
+                }
+                const size_t n_st = stages.size();
+                const std::string manifest = dir + "/park.manifest";
+                auto file_of = [&](size_t i, size_t s) {
+                    return dir + "/park-" + std::to_string(i) + "-s" + std::to_string(s) + ".ses";
+                };
+                // a stage's running state: the first (index 0) is `ss`; the draft layer's K/V rides with the last
+                // stage's image (with no split: the only one), as the park puts it
+                auto ss_of = [&](size_t s) -> const strata::core::SessionState& { return s == 0 ? ss : stages[s - 1]->ss; };
+                auto draft_of = [&](size_t s) -> const strata::core::QsaState* {
+                    return use_mtp && s == n_st ? &mtp.kv_state() : nullptr;
+                };
+                if (save) {
+                    if (live_ok && !live.empty() && !park_current(0)) {
+                        std::fprintf(stderr, "strata serve: park save: the live conversation could not be parked (%s); "
+                                     "saving the others\n", err.c_str());
+                        err.clear();
+                    }
+                    std::error_code ec;
+                    std::filesystem::create_directories(dir, ec);
+                    std::filesystem::remove(manifest, ec);   // the old list goes first: never old names over new files
+                    const auto& all = conversations.entries();
+                    for (const auto& e : all) moved_total += e.bytes();
+                    std::string list;
+                    size_t written = 0, bytes_all = 0;
+                    bool failed = false;
+                    for (size_t i = 0; i < all.size() && !failed; ++i) {
+                        const auto& e = all[i];
+                        if (e.stage_images.size() != n_st) {
+                            std::fprintf(stderr, "strata serve: park save: conversation %zu has %zu stage images, not %zu; "
+                                         "skipped\n", i, e.stage_images.size(), n_st);
+                            continue;
+                        }
+                        size_t conv_bytes = 0;
+                        for (size_t s = 0; s <= n_st; ++s) {
+                            const strata::core::SavedConversation& img = s == 0 ? e : e.stage_images[s - 1];
+                            strata::core::SessionWriteOptions wo;
+                            wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+                            wo.progress = moving;
+                            wo.phase = blocking;
+                            strata::core::SessionStatus st;
+                            size_t b = 0;
+                            if (!strata::core::session_file_write(file_of(written, s), img, id, b, err, wo, &st)) {
+                                refuse(err, st.error);
+                                failed = true;
+                                break;
+                            }
+                            moved_base += b;
+                            conv_bytes += b;
+                        }
+                        if (failed) break;
+                        list += "conv " + std::to_string(e.live.ids.size()) + " " + std::to_string(conv_bytes) + "\n";
+                        bytes_all += conv_bytes;
+                        ++written;
+                    }
+                    if (failed) continue;
+                    {
+                        const std::string tmp = manifest + ".tmp";
+                        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+                        f << "strata-park 1\ntag " << tag << "\nstages " << (n_st + 1) << "\n" << list << "end\n";
+                        f.close();
+                        if (!f) { refuse("cannot write " + tmp, strata::core::SessionError::io); continue; }
+                        std::filesystem::rename(tmp, manifest, ec);
+                        if (ec) { refuse("cannot publish " + manifest + ": " + ec.message(), strata::core::SessionError::io); continue; }
+                    }
+                    for (const auto& de : std::filesystem::directory_iterator(dir, ec)) {   // an older, longer list's files
+                        const std::string name = de.path().filename().string();
+                        size_t i = 0, s = 0;
+                        if (std::sscanf(name.c_str(), "park-%zu-s%zu.ses", &i, &s) == 2 && i >= written) {
+                            std::error_code rc;
+                            std::filesystem::remove(de.path(), rc);
+                        }
+                    }
+                    std::fprintf(stderr, "strata serve: park save: %zu parked conversation%s, %zu bytes to %s in %.1f ms "
+                                 "(tag %s)\n", written, written == 1 ? "" : "s", bytes_all, dir.c_str(), ms(), tag.c_str());
+                    std::printf("SAVED %zu %zu %.1f\n", written, bytes_all, ms());
+                } else {
+                    std::ifstream f(manifest, std::ios::binary);
+                    if (!f) {
+                        std::fprintf(stderr, "strata serve: park load: no %s; nothing to load\n", manifest.c_str());
+                        std::printf("RESTORED 0 0 %.1f\n", ms());
+                        std::fflush(stdout);
+                        continue;
+                    }
+                    std::string word, magic, ftag;
+                    int version = 0;
+                    size_t fstages = 0;
+                    std::vector<std::pair<size_t, size_t>> convs;   // tokens, bytes
+                    bool ok = static_cast<bool>(f >> magic >> version) && magic == "strata-park" && version == 1;
+                    ok = ok && static_cast<bool>(f >> word >> ftag) && word == "tag";
+                    ok = ok && static_cast<bool>(f >> word >> fstages) && word == "stages";
+                    while (ok && static_cast<bool>(f >> word)) {
+                        if (word == "end") break;
+                        size_t t = 0, b = 0;
+                        if (word != "conv" || !static_cast<bool>(f >> t >> b)) { ok = false; break; }
+                        convs.emplace_back(t, b);
+                    }
+                    if (!ok || word != "end") { refuse("malformed " + manifest); continue; }
+                    if (ftag != tag) {
+                        std::fprintf(stderr, "strata serve: park load: %s was saved by another engine file or STRATA_* "
+                                     "switch set (tag %s, this one %s); not loaded\n", manifest.c_str(), ftag.c_str(),
+                                     tag.c_str());
+                        std::printf("RESTORED 0 0 %.1f\n", ms());
+                        std::fflush(stdout);
+                        continue;
+                    }
+                    if (fstages != n_st + 1) {
+                        refuse("the parked files have " + std::to_string(fstages) + " stages, this engine " +
+                               std::to_string(n_st + 1));
+                        continue;
+                    }
+                    std::error_code ec;
+                    for (size_t i = 0; i < convs.size(); ++i)
+                        for (size_t s = 0; s <= n_st; ++s) {
+                            const auto sz = std::filesystem::file_size(file_of(i, s), ec);
+                            if (!ec) moved_total += (uint64_t) sz;
+                        }
+                    const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                    size_t loaded = 0, bytes_all = 0;
+                    for (size_t i = 0; i < convs.size(); ++i) {
+                        strata::core::SavedConversation image;
+                        std::vector<strata::core::SavedConversation> parts(n_st);
+                        size_t conv_bytes = 0;
+                        bool good = true;
+                        for (size_t s = 0; s <= n_st && good; ++s) {
+                            strata::core::SavedConversation& img = s == 0 ? image : parts[s - 1];
+                            try {
+                                strata::core::SessionReadLimits limits;
+                                limits.progress = moving;
+                                limits.admit = [floor, &o](uint64_t need, std::string& why) {
+                                    const auto avail = strata::core::conversation_available_memory();
+                                    if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                                    why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
+                                          std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed)";
+                                    return false;
+                                };
+                                if (!strata::core::conversation_session_read_limits(
+                                        limits, ss_of(s), g, mtp.kv_state(), (uint64_t) o.max_context, 256, err)) {
+                                    good = false;
+                                    break;
+                                }
+                                strata::core::SessionStatus st;
+                                size_t b = 0;
+                                if (!strata::core::session_file_read(file_of(i, s), id, img, b, err, limits, &st)) {
+                                    good = false;
+                                    break;
+                                }
+                                moved_base += b;
+                                conv_bytes += b;
+                            } catch (const std::bad_alloc&) {
+                                err = "out of memory";
+                                good = false;
+                                break;
+                            }
+                            if (!strata::core::conversation_snapshot_validate(img, ss_of(s), g, draft_of(s), err)) good = false;
+                        }
+                        if (!good) {
+                            std::fprintf(stderr, "strata serve: park load: conversation %zu (%zu tokens) not loaded: %s\n",
+                                         i, convs[i].first, err.c_str());
+                            err.clear();
+                            continue;
+                        }
+                        for (auto& p : parts) image.stage_images.push_back(std::move(p));
+                        const size_t tokens = image.live.ids.size();
+                        if (!conversations.put(std::move(image))) {
+                            std::fprintf(stderr, "strata serve: park load: conversation %zu (%zu tokens) does not fit the "
+                                         "conversation cache; not loaded\n", i, tokens);
+                            continue;
+                        }
+                        ++loaded;
+                        bytes_all += conv_bytes;
+                    }
+                    std::fprintf(stderr, "strata serve: park load: %zu of %zu parked conversation%s, %zu bytes from %s in "
+                                 "%.1f ms; parked=%zu bytes=%zu\n", loaded, convs.size(), convs.size() == 1 ? "" : "s",
+                                 bytes_all, dir.c_str(), ms(), conversations.size(), conversations.bytes());
+                    std::printf("RESTORED %zu %zu %.1f\n", loaded, bytes_all, ms());
+                }
+                std::fflush(stdout);
+                continue;
+            }
             // Disk sessions: SAVE <path> | RESTORE <path>, between requests (the path runs to the end of the line,
             // UTF-8).  The file holds what a parked conversation holds (conversation_file.hpp).  Answers: SAVED /
             // RESTORED <tokens> <bytes> <ms>; SERR <invalid|storage|memory|io> <published 0|1> <reason> for a refusal

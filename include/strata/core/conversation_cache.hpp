@@ -285,6 +285,8 @@ public:
 
     // The slot count, so a caller that evicts in a loop has a bound it did not invent.
     size_t slots() const { return slots_; }
+    // PH402 local: the parked conversations, least recently active first (PARKSAVE writes them in this order).
+    const std::deque<SavedConversation>& entries() const { return entries_; }
 
     // #342: drop the parked entries an outgoing conversation (its live tokens and checkpoint chain) supersedes:
     // the same conversation a turn back, whose DEEPEST checkpoint the outgoing chain still holds, so all it adds
