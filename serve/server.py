@@ -63,6 +63,7 @@ from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
+from serve.prompt_echo import PromptEcho  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -2213,6 +2214,39 @@ def layer_split_of(cfg: dict) -> bool:
     return len(gpu_list(cfg)) > 1 and "--peer-device" not in cfg["args"]
 
 
+def prompt_echo_setup(svc: "Service", cfg: dict, env: str) -> str:
+    """PH402 local: turn the prompt echo (serve/prompt_echo.py) on when the config's "prompt_echo" is true or
+    STRATA_PROMPT_ECHO=1 (STRATA_PROMPT_ECHO=0 turns it off again) and nothing here can lose its kept replies while the
+    engine keeps the conversation.  -> why it is on or off (one line for the start log)."""
+    on = cfg.get("prompt_echo", False)
+    if not isinstance(on, bool):
+        raise ValueError(f"\"prompt_echo\" must be true or false, not {on!r}")
+    env = (env or "").strip().lower()
+    if env:
+        on = env not in ("0", "false", "off", "no")
+    if not on:
+        return "not asked for (\"prompt_echo\": true or STRATA_PROMPT_ECHO=1)"
+    if StrataEngine.PARK_DIR:
+        return "STRATA_PARK_DIR is set: parked files bring conversations back after a restart, the kept replies do not"
+    if svc.slot_save_path:
+        return "slot save/restore is on: a restored conversation would come back without its kept replies"
+    if svc.vision is not None:
+        return "this server reads images"
+    if getattr(svc.engine, "batch", 0):
+        return "the engine runs requests in parallel (batch)"
+    args = [str(x) for x in cfg.get("args") or []]
+    slots = 8                                           # the engine's parked conversations (its default)
+    if "--conversation-cache-slots" in args:
+        try:
+            slots = int(args[args.index("--conversation-cache-slots") + 1])
+        except (IndexError, ValueError):
+            pass
+    svc.prompt_echo = PromptEcho(svc.im_end_id, max_entries=max(32, 2 * slots + 2),
+                                 log=lambda msg: print(msg, flush=True))
+    return (f"the next request carries the generated ids of a reply ({svc.prompt_echo.max_entries} conversations "
+            "kept, least recently used dropped first)")
+
+
 def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
@@ -2638,6 +2672,22 @@ def slot_save_dir(value, base: str | None = None) -> str:
         raise ValueError(f"slot_save_path {path} is not a directory")
     return path
 
+class PromptIds(list):
+    """A prompt's ids from Service.encode_prompt with the prompt echo on: `marked` is the rendered prompt text (with
+    mark_think_literals' marks) and `echo` the prompt echo's Hit for it.  An operation that makes a new list (a forced
+    call's opening, the images' pads) drops both, and such a request is not kept for the echo."""
+    marked: str = ""
+    echo = None
+
+
+def _special_ids(tok) -> set[int]:
+    """The ids of the tokenizer's special tokens (control and user-defined literals)."""
+    specials = getattr(tok, "special_tokens", None)
+    if isinstance(specials, dict):
+        return set(specials.values())
+    return {256 + k for k in range(len(getattr(tok, "SPECIALS", ())))}   # ByteTokenizer (tests)
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -2708,6 +2758,11 @@ class Service:
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+        # PH402 local (opt-in, "prompt_echo" / STRATA_PROMPT_ECHO=1): the next request carries the ids the model
+        # generated instead of a re-tokenization of their text (serve/prompt_echo.py).  None = off.
+        self.prompt_echo: PromptEcho | None = None
+        self.im_end_id = tokenizer.encode(IM_END, parse_special=True)[0]
+        self.special_id_set = _special_ids(tokenizer)
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -3216,17 +3271,64 @@ class Service:
         tail = "" if off else EFFORT_TURN.format(EFFORT_TEXT.get(effort, EFFORT_TEXT["medium"]))
         return history + tail + full[len(mine):]
 
-    def encode_prompt(self, messages, tools, kwargs) -> list[int]:
+    def encode_prompt(self, messages, tools, kwargs, echo: bool = False) -> list[int]:
         """The request's prompt: the template rendered and tokenized.  #537: a <think> / </think> written inside a
         message's text is encoded as the text it is, not as the model's reasoning markers (the template's own are).
         A control token's text (<|im_start|>, <|im_end|>, <|endoftext|>, ...) inside a message is text as well: only
         the control tokens the template writes are control tokens."""
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
-        if not changed:
-            return self.tok.encode(prompt, parse_special=True)
-        prompt, plain = unmark_think_literals(prompt, self.literals)
-        return self.tok.encode(prompt, parse_special=True, plain=plain)
+        echo = self.prompt_echo if echo else None
+        hit = echo.lookup(prompt) if echo is not None else None
+        rest = prompt[hit.chars:] if hit is not None else prompt   # (the marks are single characters: a cut never
+        if not changed:                                              # splits one)
+            ids = self.tok.encode(rest, parse_special=True)
+        else:
+            rest, plain = unmark_think_literals(rest, self.literals)
+            ids = self.tok.encode(rest, parse_special=True, plain=plain)
+        if hit is None:
+            return ids
+        if hit.entry is None and len(prompt) >= 65536 and echo.entries:
+            print(f"[strata] prompt echo: no kept entry matched this {len(prompt)}-character prompt "
+                  f"({len(echo.entries)} kept): tokenized as text", flush=True)
+        out = PromptIds(hit.ids + ids)
+        out.marked, out.echo = prompt, hit
+        if hit.ids:
+            print(f"[strata] prompt echo: {len(hit.ids)} of {len(out)} prompt ids kept from earlier replies "
+                  f"({'the whole last turn' if hit.full else 'up to an earlier turn'})", flush=True)
+        if hit.differs_in_reply is not None:
+            kept, sent = hit.context
+            print(f"[strata] prompt echo: the reply came back with other text at character {hit.differs_in_reply} "
+                  f"(kept {kept!r}, sent {sent!r}): echoed up to the turn before it", flush=True)
+        return out
+
+    def _echo_record(self, ids: PromptIds, raw_ids: list[int], finish: str, special: str | None) -> None:
+        """Keep a finished request for the prompt echo - only one that ended on <|im_end|> with nothing but the
+        model's own tokens after its prompt, whose reply decodes to exactly one byte string and holds no special
+        token written as ordinary text (the next prompt would have the special id there) and no literal-tag mark."""
+        echo, why, gen, canon = self.prompt_echo, special, None, None
+        if why is None and finish != "stop":
+            why = finish
+        if why is None and (not raw_ids or raw_ids[-1] != self.im_end_id):
+            why = "ended on another stop token"
+        if why is None:
+            try:
+                gen = self.tok.decode(raw_ids, errors="strict")
+            except UnicodeDecodeError:
+                why = "reply is not valid UTF-8"
+        if why is None and any(m in gen for m in self.literals.values()):
+            why = "reply holds a literal-tag mark"
+        if why is None:
+            canon = self.tok.encode(gen, parse_special=True)
+            if [t for t in canon if t in self.special_id_set] != [t for t in raw_ids if t in self.special_id_set]:
+                why = "special token written as text"
+        if why is not None:
+            echo.refuse(why)
+            return
+        source = ids.echo.entry if ids.echo is not None else None
+        if echo.record(ids.marked + gen, list(ids) + list(raw_ids), len(ids.marked), source) and canon != raw_ids:
+            print(f"[strata] prompt echo: kept a reply the tokenizer splits differently ({len(raw_ids)} ids generated, "
+                  f"{len(canon)} re-tokenized): the next turn carries the generated ids", flush=True)
 
     def _note_unreadable_tool_images(self, messages):
         """A picture a tool returned (Claude Code's Read of an image file) that this server cannot read - it has no
@@ -3262,7 +3364,7 @@ class Service:
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
         prompt; with thinking, Service.run writes it once the thinking is over."""
         fetched = self._note_unreadable_tool_images(messages)
-        ids = self.encode_prompt(messages, tools, kwargs)
+        ids = self.encode_prompt(messages, tools, kwargs, echo=True)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None
@@ -3497,6 +3599,7 @@ class Service:
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
+        inserted = False                                # the server wrote tokens of its own into the reply
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         # Only a DONE line replaces engine.last, so a request that died, errored or was disconnected must not have
         # the PREVIOUS request's decode figures recorded as its own: each pass keeps its own DONE (a segment) if
@@ -3661,6 +3764,7 @@ class Service:
                             if max_new - n - len(extra) >= 1:
                                 print("[strata] the reply ended inside its thinking with no answer: closing the "
                                       "thinking once and continuing (reasoning_close_retry)", flush=True)
+                                inserted = True
                                 for t in extra:
                                     n += 1
                                     raw_ids.append(t)
@@ -3691,6 +3795,7 @@ class Service:
                         if wrap:
                             print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
                                   flush=True)
+                        inserted = True
                         for t in extra:
                             n += 1
                             raw_ids.append(t)
@@ -3714,6 +3819,11 @@ class Service:
                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
                               "strata-<model>.json; 0 turns this off). If a new request with a short prompt does the "
                               "same, restart the server and report it (#606)", flush=True)
+                    if self.prompt_echo is not None and isinstance(ids, PromptIds):
+                        special = ("cancel" if cancel.is_set() else "reasoning recovery" if recovery_count
+                                   else "server-written tokens" if inserted or close_retried
+                                   else "stop string" if stops is not None and stops.hit is not None else None)
+                        self._echo_record(ids, raw_ids, finish, special)
                 except GeneratorExit:                   # the client disconnected mid-stream
                     finish = "disconnect"
                     raise
@@ -3723,6 +3833,12 @@ class Service:
                     with self.status_lock:
                         if st.get("busy"):
                             last = request_stats(segments)          # only this request's own DONEs count
+                            echo_hit = ids.echo if isinstance(ids, PromptIds) else None
+                            if (echo_hit is not None and echo_hit.full and last.get("reused") is not None
+                                    and last["reused"] < len(echo_hit.ids) - 1):
+                                print(f"[strata] prompt echo: the engine reused {last['reused']} of the "
+                                      f"{len(echo_hit.ids)} echoed ids (it held another end of this conversation)",
+                                      flush=True)
                             started = st.get("started", time.time())
                             cvec = (getattr(self.engine, "info", {}) or {}).get("cvec", 0)
                             loaded = str(cvec) not in ("0", "", "None")
@@ -3740,6 +3856,7 @@ class Service:
                                 "prompt_tokens": seen, "reused": last.get("reused"), "output_tokens": n,
                                 # the request's whole prompt, and the tokens read of it (None: an older engine)
                                 "prompt_total": len(ids), "prompt_read": last.get("prompt_read"),
+                                "echo_head": len(echo_hit.ids) if echo_hit is not None else None,
                                 "reasoning_recoveries": recovery_count,
                                 "reasoning_repeat_coverage": round(repeat_coverage, 3),
                                 "engine_generated": last.get("generated"),
@@ -5870,6 +5987,11 @@ def main() -> int:
         raise SystemExit("[strata] config \"reasoning_loop_recovery\" must be false, \"stop\" or \"recover\", "
                          f"not {recovery!r}")
     svc.reasoning_loop_recovery = recovery
+    try:
+        echo_why = prompt_echo_setup(svc, cfg, os.environ.get("STRATA_PROMPT_ECHO", ""))
+    except ValueError as e:
+        raise SystemExit(f"[strata] config {e}")
+    print(f"[strata] prompt echo {'on' if svc.prompt_echo is not None else 'off'}: {echo_why}", flush=True)
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
     svc.backend = cfg.get("backend")                    # "hip": the AMD cards' readings come from sysfs (#301)
