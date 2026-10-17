@@ -3755,10 +3755,14 @@ class Service:
                                   "instruction (reasoning_loop_recovery)", flush=True)
                             continue
                         if (self.reasoning_close_retry and thinking and finish == "stop" and not close_retried
-                                and not answered and not wrap and not opens and parser.state == "reasoning"
-                                and (stops is None or stops.hit is None) and not cancel.is_set()):
+                                and not answered and not wrap and not opens and parser.state in ("reasoning", "rcall")
+                                and not parser.pending and (stops is None or stops.hit is None)
+                                and not cancel.is_set()):
                             # #1053: the model wrote its reasoning and stopped before </think>: the client would get
-                            # an empty answer.  Close the thinking once and let it answer.
+                            # an empty answer.  Close the thinking once and let it answer.  Not while a call written
+                            # inside the thinking waits (#804/#1058): this stop already makes it a call, and a second
+                            # pass that wrote it again would deliver it twice.  A stop inside a held `<tool_call>`
+                            # ("rcall") is closed too: the parser lets the held text out as reasoning at the </think>.
                             close_retried = True
                             extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
                             if max_new - n - len(extra) >= 1:
@@ -3915,11 +3919,26 @@ class Service:
             if emb:
                 Path(emb).unlink(missing_ok=True)
         for ev in cut(parser.finish(finish)):
+            answered = answered or ev.kind in ("content", "tool_start", "tool_call")
             yield "event", ev
         if parser.rescued or parser.refused:
             self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
             print(f"[strata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept as "
                   f"reasoning (quoted, or the turn did not end on a stop)", flush=True)
+        if thinking and finish == "stop" and not answered and (stops is None or stops.hit is None):
+            # #1053: a reply that ended inside its thinking with nothing for the client, logged whether
+            # reasoning_close_retry is on or not (still inside it: the retry was off or did not apply; out of it after
+            # a retry: the continuation wrote nothing either)
+            why = None
+            if parser.state in ("reasoning", "rcall"):
+                why = ("reasoning_close_retry did not apply (a call inside the thinking was waiting, or no room left "
+                       "under max_tokens)" if self.reasoning_close_retry else
+                       "reasoning_close_retry: true in strata-<model>.json closes it once and lets it answer")
+            elif close_retried:
+                why = "closing the thinking once (reasoning_close_retry) brought none either"
+            if why:
+                print(f"[strata] the reply ended inside its thinking with no answer (no content, no tool call, "
+                      f"{thinking_n} thinking tokens): {why}", flush=True)
         if stops is not None and stops.hit is None and stops.held:
             yield "event", Event("content", stops.flush())     # the held tail was not a stop string after all
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
