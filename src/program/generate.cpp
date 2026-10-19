@@ -20,6 +20,7 @@
 #include "strata/core/device.hpp"
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/expert_nibble.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/conversation_memory.hpp"
@@ -113,7 +114,13 @@
 #include <set>
 #include <vector>
 
+#if defined(STRATA_NATIVE_EXPERTS)
+#include "ggml.h"   // P1 part D: the reference dequantizers the 4-bit fill's startup check compares a converted slot with
+#endif
+
+
 namespace {
+namespace nib = strata::core::nibble;
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
 // pinning a large arena into two CUDA contexts leaves WDDM refusing every later allocation (the 5080 + 3090 rig);
 // a Linux driver has no such limit (#253: the 8 GiB cap cost a 4090 + 3060 split 3x of its prompt speed).
@@ -278,6 +285,7 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
         if (slot < 0) continue;
         const SwapHome home = locate(s.layer);
         const strata::core::OnDevice on(home.dev);
+        strata::core::nibble::guard_raw(s.layer, "the adaptive tier's copy back (resident_stage_swaps)");
         if (const cudaError_t e = cudaMemcpyAsync(src.exchange_buffer(q), home.cache->device_slot(slot),
                             (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer), cudaMemcpyDeviceToHost,
                             home.stream); e != cudaSuccess) {
@@ -1565,6 +1573,338 @@ double pcie_frac_for_gbps(double gbps, double base) {
     return gbps <= 0.0 ? base : base * std::min(1.0, gbps / 20.0);
 }
 
+// ---- P1 part D (STRATA_EXPERT_NIBBLE=1; strata/core/expert_nibble.hpp, analysis 2026-10-19-p1-stack/D_DESIGN.md).
+// Everything below runs only with the switch on.
+
+/// The largest slot an expert cache can hold for this pack: the GGUF `max_blob`, or a converted layer's 4-bit slot when
+/// that is larger (the sizings that count slots of the largest blob would otherwise come out short of a full cache and
+/// leave converted experts out of VRAM, which the switch refuses).  `max_blob` exactly with the switch off.
+uint64_t nibble_max_slot_bytes() {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    uint64_t m = lay.max_blob;
+    if (nib::any_on())
+        for (int64_t l = 0; l < lay.n_layers; ++l) m = std::max<uint64_t>(m, nib::slot_bytes(l));
+    return m;
+}
+
+#if defined(STRATA_NATIVE_EXPERTS)
+/// The startup check of one converted slot, read back (`hashed` bytes) against its GGUF blob `raw` and the hash the
+/// device recorded for it: the hash against expert_nibble.hpp's host reference; the down rows byte for byte; and every
+/// gate/up weight the 4-bit slot gives (code, scale byte and fp16 d) put through the expression ggml's reference
+/// dequantizer uses, bit for bit against what that dequantizer makes of the GGUF block.  Empty when it all agrees.
+std::string nibble_check_slot(int64_t l, const uint8_t* slot, uint64_t dev_hash, const uint8_t* raw) {
+    const nib::LayerVram& L = nib::layer(l);
+    char buf[256];
+    const uint64_t h = nib::hash_host(slot, L.hashed);
+    if (h != dev_hash) {
+        std::snprintf(buf, sizeof buf, "the device slot hash %016llx differs from the host reference %016llx",
+                      (unsigned long long) dev_hash, (unsigned long long) h);
+        return buf;
+    }
+    if (std::memcmp(slot + nib::kDownOff, raw + L.raw_down_off, (size_t) L.down_bytes) != 0)
+        return "the down rows differ from the GGUF blob's";
+    const ggml_type_traits* tr = ggml_get_type_traits((ggml_type) L.gu_type);
+    if (tr == nullptr || tr->to_float == nullptr) return "ggml has no dequantizer for this type";
+    std::vector<float> ref((size_t) nib::kNEmbd), got((size_t) nib::kNEmbd);
+    for (int64_t r = 0; r < nib::kRows; ++r) {
+        const uint8_t* row = raw + (r < nib::kNFf ? (uint64_t) r * L.raw_gu_row
+                                                  : L.raw_up_off + (uint64_t) (r - nib::kNFf) * L.raw_gu_row);
+        tr->to_float(row, ref.data(), nib::kNEmbd);
+        for (int64_t k = 0; k < nib::kItems; ++k) {
+            uint32_t q[4];
+            std::memcpy(q, slot + nib::code_off(r, k), sizeof q);
+            int8_t gv[32];
+            nib::decode_item(L.gu_type, q, gv);
+            const int sc = slot[nib::scale_off(r, k)];
+            ggml_fp16_t dh;
+            std::memcpy(&dh, slot + nib::d_off(r, k / 8), sizeof dh);
+            const float d = ggml_fp16_to_fp32(dh);
+            for (int j = 0; j < 32; ++j) {
+                // dequantize_row_iq2_s / _iq3_xxs / _iq3_s: (the scale step) * |grid byte| * (+-1.f)
+                const float db = L.gu_type == nib::kIQ2_S   ? d * (0.5f + ((j < 16 ? sc : sc >> 4) & 0xf)) * 0.25f
+                               : L.gu_type == nib::kIQ3_XXS ? d * (0.5f + sc) * 0.5f
+                                                            : d * sc;
+                const int a = gv[j] < 0 ? -(int) gv[j] : (int) gv[j];
+                float v = db * a;
+                if (gv[j] < 0) v = -v;
+                got[(size_t) (k * 32 + j)] = v;
+            }
+        }
+        if (std::memcmp(ref.data(), got.data(), ref.size() * sizeof(float)) != 0) {
+            size_t c = 0;
+            while (c < ref.size() && std::memcmp(&ref[c], &got[c], sizeof(float)) == 0) ++c;
+            std::snprintf(buf, sizeof buf, "row %lld column %zu: the 4-bit slot gives %.9g, the GGUF block %.9g",
+                          (long long) r, c, (double) got[c], (double) ref[c]);
+            return buf;
+        }
+    }
+    return {};
+}
+#endif
+
+/// One expert cache's converted slots.  The startup fill hands a converted layer's pairs to `add` instead of
+/// `fill_slot_blocking`; per layer, `kBatch` GGUF blobs at a time go H2D into one staging buffer (the bytes
+/// fill_slot_blocking would copy, from the host arena, which is still there: arenafree comes after the fill), M2's
+/// transcoder writes the codes, scales and d into the slots and round-trips every item (each item that does not counts
+/// against its layer in `d_bad`), the GGUF down rows are copied D2D behind them, and each slot's hash is recorded on
+/// the device for STRATA_EXPERT_NIBBLE_RECHECK.  One stream, so the staging buffer's reuse is ordered without events;
+/// the transcode and the hash (~85 ms a die) are small next to the H2D copies (3-4 s a die).  The device arrays live as
+/// long as the process (RECHECK reads them); `finish` frees the staging buffer.
+struct NibbleCache {
+    static constexpr int64_t kBatch = 64;
+    struct Pending { int32_t expert, slot; const uint8_t* blob; };
+    struct Batch { int32_t layer; int64_t at, n; };
+    strata::core::ExpertCache* cache = nullptr;
+    int dev = 0;                                         ///< the cache's device
+    std::vector<std::vector<Pending>> pending;           ///< per layer: queued, at most kBatch
+    std::vector<Batch> batches;                          ///< what was transcoded and hashed, in that order
+    std::vector<std::pair<int32_t, int32_t>> pairs;      ///< (layer, expert) of each converted slot, in that order
+    std::vector<int32_t> slots;                          ///< and its slot
+    unsigned long long* h_ptrs = nullptr;                ///< pinned: the slots' device addresses, in that order
+    unsigned long long* d_ptrs = nullptr;                ///< the same on the device (the transcoder's and hash's input)
+    unsigned long long* d_ref = nullptr;                 ///< each slot's hash as loaded
+    unsigned long long* d_now = nullptr;                 ///< RECHECK's
+    unsigned long long* d_bad = nullptr;                 ///< per layer: items that did not round-trip
+    uint8_t* staging = nullptr;
+    uint64_t raw_max = 0;
+    cudaStream_t stream = nullptr;
+    int64_t cap = 0, n = 0;
+    uint64_t bytes_in = 0;
+    double seconds = 0;
+
+    bool active() const { return cache != nullptr; }
+
+    static std::string cuda_fail(const char* what, cudaError_t e) {
+        return std::string(what) + ": " + cudaGetErrorString(e);
+    }
+
+    /// For `c` on the current device, `want` converted pairs at most.
+    bool begin(strata::core::ExpertCache& c, int64_t want, std::string& err) {
+        if (cudaGetDevice(&dev) != cudaSuccess) dev = 0;
+        cache = &c;
+        cap = want > 0 ? want : 1;
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        pending.assign((size_t) lay.n_layers, {});
+        for (int64_t l = 0; l < lay.n_layers; ++l)
+            if (nib::layer(l).on) raw_max = std::max<uint64_t>(raw_max, nib::layer(l).raw_bytes);
+        cudaError_t e = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+        if (e == cudaSuccess) e = cudaMallocHost((void**) &h_ptrs, (size_t) cap * 8);
+        if (e == cudaSuccess) e = cudaMalloc((void**) &d_ptrs, (size_t) cap * 8);
+        if (e == cudaSuccess) e = cudaMalloc((void**) &d_ref, (size_t) cap * 8);
+        if (e == cudaSuccess) e = cudaMalloc((void**) &d_now, (size_t) cap * 8);
+        if (e == cudaSuccess) e = cudaMalloc((void**) &d_bad, (size_t) lay.n_layers * 8);
+        if (e == cudaSuccess) e = cudaMemsetAsync(d_bad, 0, (size_t) lay.n_layers * 8, stream);
+        if (e == cudaSuccess) e = cudaMalloc((void**) &staging, (size_t) ((uint64_t) kBatch * raw_max));
+        if (e != cudaSuccess) {
+            err = cuda_fail("the 4-bit fill's buffers", e);
+            return false;
+        }
+        return true;
+    }
+
+    bool add(int32_t layer, int32_t expert, int32_t slot, const uint8_t* blob, std::string& err) {
+        auto& q = pending[(size_t) layer];
+        q.push_back({expert, slot, blob});
+        return (int64_t) q.size() < kBatch || flush(layer, err);
+    }
+
+    bool flush(int32_t layer, std::string& err) {
+        auto& q = pending[(size_t) layer];
+        if (q.empty()) return true;
+        const auto t0 = std::chrono::steady_clock::now();
+        const nib::LayerVram& L = nib::layer(layer);
+        const int64_t k = (int64_t) q.size();
+        if (n + k > cap) {
+            err = "the 4-bit fill was given more converted pairs than it counted";
+            return false;
+        }
+        cudaError_t e = cudaSuccess;
+        for (int64_t i = 0; i < k && e == cudaSuccess; ++i) {
+            uint8_t* dst = cache->device_slot(q[(size_t) i].slot);
+            if (dst == nullptr) {
+                err = "the 4-bit fill: slot " + std::to_string(q[(size_t) i].slot) + " is outside the cache";
+                return false;
+            }
+            h_ptrs[n + i] = (unsigned long long) (uintptr_t) dst;
+            e = cudaMemcpyAsync(staging + (uint64_t) i * L.raw_bytes, q[(size_t) i].blob, (size_t) L.raw_bytes,
+                                cudaMemcpyHostToDevice, stream);
+        }
+        if (e == cudaSuccess)
+            e = cudaMemcpyAsync(d_ptrs + n, h_ptrs + n, (size_t) k * 8, cudaMemcpyHostToDevice, stream);
+        if (e != cudaSuccess) {
+            err = cuda_fail("the 4-bit fill's copies in", e);
+            return false;
+        }
+        auto m2 = [&](const char* what, int rc) -> bool {   // iq_kernels.cu's: a CUDA error code
+            if (rc == 0) return true;
+            err = std::string("the 4-bit ") + what + ": " + cudaGetErrorString((cudaError_t) rc);
+            return false;
+        };
+        if (!m2("transcoder", nib::transcode(L, staging, k, d_ptrs + n, d_bad + layer, (void*) stream))) return false;
+        for (int64_t i = 0; i < k && e == cudaSuccess; ++i)
+            e = cudaMemcpyAsync((uint8_t*) (uintptr_t) h_ptrs[n + i] + nib::kDownOff,
+                                staging + (uint64_t) i * L.raw_bytes + L.raw_down_off, (size_t) L.down_bytes,
+                                cudaMemcpyDeviceToDevice, stream);
+        if (e != cudaSuccess) {
+            err = cuda_fail("the 4-bit fill's down rows", e);
+            return false;
+        }
+        if (!m2("slot hash", nib::hash_slots(L, d_ptrs + n, k, d_ref + n, (void*) stream))) return false;
+        for (const Pending& p : q) {
+            pairs.emplace_back(layer, p.expert);
+            slots.push_back(p.slot);
+        }
+        batches.push_back({layer, n, k});
+        n += k;
+        bytes_in += (uint64_t) k * L.raw_bytes;
+        q.clear();
+        seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        return true;
+    }
+
+    /// The rest of the queue, then waits: false (with `err` naming every layer) when an item did not round-trip.
+    bool finish(std::string& err) {
+        for (int32_t l = 0; l < (int32_t) pending.size(); ++l)
+            if (!flush(l, err)) return false;
+        const auto t0 = std::chrono::steady_clock::now();
+        cudaError_t e = cudaStreamSynchronize(stream);
+        std::vector<unsigned long long> bad(pending.size(), 0);
+        if (e == cudaSuccess) e = cudaMemcpy(bad.data(), d_bad, bad.size() * 8, cudaMemcpyDeviceToHost);
+        if (staging != nullptr) (void) cudaFree(staging);
+        staging = nullptr;
+        seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (e != cudaSuccess) {
+            err = cuda_fail("the 4-bit fill", e);
+            return false;
+        }
+        for (size_t l = 0; l < bad.size(); ++l)
+            if (bad[l] != 0) {
+                char b[192];
+                std::snprintf(b, sizeof b, "%slayer %zu (%s): %llu items did not round-trip", err.empty() ? "" : "; ", l,
+                              nib::fmt_name(nib::layer((int64_t) l).gu_type), bad[l]);
+                err += b;
+            }
+        if (!err.empty()) {
+            err += " - the 4-bit code does not hold these weights (STRATA_EXPERT_NIBBLE_SKIP=<layers> keeps a layer's "
+                   "GGUF blocks)";
+            return false;
+        }
+        return true;
+    }
+
+    /// The startup check of converted pair (layer, expert) - see nibble_check_slot - with `raw` its GGUF blob.
+    bool check(int32_t layer, int32_t expert, const uint8_t* raw, std::string& err) const {
+        int64_t at = -1;
+        for (size_t i = 0; i < pairs.size() && at < 0; ++i)
+            if (pairs[i].first == layer && pairs[i].second == expert) at = (int64_t) i;
+        if (at < 0 || raw == nullptr) {
+            err = "the 4-bit check: no converted slot or no GGUF blob for layer " + std::to_string(layer) + " expert " +
+                  std::to_string(expert);
+            return false;
+        }
+#if defined(STRATA_NATIVE_EXPERTS)
+        const nib::LayerVram& L = nib::layer(layer);
+        std::vector<uint8_t> got((size_t) L.hashed);
+        unsigned long long h = 0;
+        cudaError_t e = cudaMemcpy(got.data(), cache->device_slot(slots[(size_t) at]), got.size(), cudaMemcpyDeviceToHost);
+        if (e == cudaSuccess) e = cudaMemcpy(&h, d_ref + at, 8, cudaMemcpyDeviceToHost);
+        if (e != cudaSuccess) {
+            err = cuda_fail("the 4-bit check's read back", e);
+            return false;
+        }
+        const std::string why = nibble_check_slot(layer, got.data(), h, raw);
+        if (!why.empty()) {
+            err = "layer " + std::to_string(layer) + " expert " + std::to_string(expert) + " (" +
+                  nib::fmt_name(L.gu_type) + "): " + why;
+            return false;
+        }
+        return true;
+#else
+        err = "the 4-bit check needs a build with native experts";
+        return false;
+#endif
+    }
+
+    /// STRATA_EXPERT_NIBBLE_RECHECK: every converted slot's hash again, on the device, against the one recorded at load.
+    /// False with the first slot that differs (or a CUDA error) in `err`; `bad_layer` its layer (-1: an error).
+    bool recheck(std::string& err, int64_t& bad_layer) {
+        bad_layer = -1;
+        if (n == 0) return true;
+        const strata::core::OnDevice on(dev);
+        for (const Batch& b : batches) {
+            const int rc = nib::hash_slots(nib::layer(b.layer), d_ptrs + b.at, b.n, d_now + b.at, (void*) stream);
+            if (rc != 0) {
+                err = cuda_fail("the slot hash", (cudaError_t) rc);
+                return false;
+            }
+        }
+        std::vector<unsigned long long> ref((size_t) n), now((size_t) n);
+        cudaError_t e = cudaStreamSynchronize(stream);
+        if (e == cudaSuccess) e = cudaMemcpy(ref.data(), d_ref, (size_t) n * 8, cudaMemcpyDeviceToHost);
+        if (e == cudaSuccess) e = cudaMemcpy(now.data(), d_now, (size_t) n * 8, cudaMemcpyDeviceToHost);
+        if (e != cudaSuccess) {
+            err = cuda_fail("the slot hash read back", e);
+            return false;
+        }
+        for (int64_t i = 0; i < n; ++i)
+            if (ref[(size_t) i] != now[(size_t) i]) {
+                char b[224];
+                std::snprintf(b, sizeof b, "CUDA%d: layer %d expert %d (slot %d) hashes %016llx, %016llx at load", dev,
+                              (int) pairs[(size_t) i].first, (int) pairs[(size_t) i].second, (int) slots[(size_t) i],
+                              now[(size_t) i], ref[(size_t) i]);
+                err = b;
+                bad_layer = pairs[(size_t) i].first;
+                return false;
+            }
+        return true;
+    }
+};
+
+/// With STRATA_EXPERT_NIBBLE=1, why this start cannot have 4-bit slots (empty: nothing here stops it).  The half of
+/// D_DESIGN.md section 7 that the build, the GPUs, the environment and the options decide, before anything is
+/// allocated; the full residency, the loans, the prompt chunk and the headroom are checked where they are known.
+std::string nibble_refusal(const Options& o, bool multi_gpu) {
+    const nib::Config& c = nib::config();
+    if (!c.error.empty()) return c.error;
+#if defined(STRATA_USE_HIP) || !defined(STRATA_NATIVE_EXPERTS)
+    (void) o;
+    (void) multi_gpu;
+    return "the 4-bit slots are for a CUDA build with native experts (the PH402's)";
+#else
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count <= 0) {
+        (void) cudaGetLastError();
+        return "no CUDA device";
+    }
+    for (int d = 0; d < count; ++d) {
+        cudaDeviceProp p{};
+        if (cudaGetDeviceProperties(&p, d) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return "cannot read CUDA" + std::to_string(d) + "'s properties";
+        }
+        if (p.major != 6 || p.minor != 0)
+            return "CUDA" + std::to_string(d) + " (" + p.name + ") is compute capability " + std::to_string(p.major) +
+                   "." + std::to_string(p.minor) + ": the 4-bit slots and their kernels are for cc 6.0 (the PH402's "
+                   "GP100) only";
+    }
+    if (std::string e = nib::env_conflicts(); !e.empty()) return e;
+    if (o.peer_device >= 1) return "--peer-device (its cache holds GGUF blobs)";
+    for (const int r : o.expert_cache_remote)
+        if (r > 0) return "remote expert caches (--expert-cache-device1..3 hold GGUF blobs)";
+    if (o.kv_grow) return "--kv-grow (the elastic K/V moves slots at their GGUF size)";
+    if (o.vram_elastic) return "--vram-elastic (it refills slots with GGUF blobs)";
+    if (o.expert_profile.empty())
+        return "no --expert-profile (every expert of a converted layer must be VRAM-resident from the profile fill)";
+    if (o.expert_cache == 0) return "--expert-cache 0 (no VRAM slots to convert)";
+    const char* trim_env = std::getenv("STRATA_STAGE_TRIM");
+    const bool trim = o.trim_stage_weights || (trim_env != nullptr && trim_env[0] != 0 && std::string(trim_env) != "0");
+    if (multi_gpu && !trim)
+        return "a layer split without the stage trim (STRATA_STAGE_TRIM=1 or --trim-stage-weights): without it the "
+               "4-bit slots do not fit the last stage";
+    return {};
+#endif
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2443,6 +2783,45 @@ int main(int argc, char** argv) {
         }
     }
     const bool native_pack = strata::kernels::cpu::expert_layout().native;
+    // ---- P1 part D: STRATA_EXPERT_NIBBLE=1 keeps the gate/up experts of IQ2_S / IQ3_XXS / IQ3_S layers as 4-bit codes in
+    // their VRAM slots (strata/core/expert_nibble.hpp; analysis 2026-10-19-p1-stack/D_DESIGN.md).  Unset or 0: nothing
+    // here runs, no table is set, and every slot size below is the GGUF blob's, as before.  On: the start is refused
+    // before anything is allocated if anything would read a converted slot as GGUF blocks or write GGUF bytes into one;
+    // the per-layer table is set before the first slot estimate; the adaptive tier is off (it swaps GGUF blobs in and
+    // out of slots).  The residency, the loans, the prompt chunk and the headroom are checked where they are known.
+    const bool nib_asked = nib::config().on || nib::config().error.rfind("STRATA_EXPERT_NIBBLE=", 0) == 0;
+    const int64_t nib_chunk_asked = o.prefill_chunk;   // an explicit --prefill N must stay N (the chunking is in the bits)
+    if (nib_asked) {
+        std::string why = nibble_refusal(o, multi_gpu);
+        if (why.empty()) {
+            nib::set_layers(nib::plan_layers(strata::kernels::cpu::expert_layout(), why));
+            if (why.empty() && !nib::any_on())
+                why = "no layer of this pack is IQ2_S / IQ3_XXS / IQ3_S at 2560 x 640 among STRATA_EXPERT_NIBBLE_FMTS "
+                      "and outside STRATA_EXPERT_NIBBLE_SKIP";
+        }
+        if (!why.empty()) {
+            std::fprintf(stderr, "strata generate: STRATA_EXPERT_NIBBLE refuses the start: %s\n", why.c_str());
+            return 1;
+        }
+        o.adapt_swaps = 0;
+        o.peer_adapt_swaps = 0;
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        int64_t n_on = 0, by_fmt[3] = {0, 0, 0};
+        uint64_t more = 0;
+        for (int64_t l = 0; l < lay.n_layers; ++l) {
+            const nib::LayerVram& v = nib::layer(l);
+            if (!v.on) continue;
+            ++n_on;
+            ++by_fmt[v.gu_type == nib::kIQ2_S ? 0 : v.gu_type == nib::kIQ3_XXS ? 1 : 2];
+            more += (v.slot_bytes - (v.raw_bytes + 255) / 256 * 256) * (uint64_t) lay.n_expert;
+        }
+        std::fprintf(stderr, "strata generate: STRATA_EXPERT_NIBBLE: %lld of %lld layers keep their gate/up experts as 4-bit "
+                             "codes in VRAM (IQ2_S %lld, IQ3_XXS %lld, IQ3_S %lld), %.2f GiB more VRAM than their GGUF "
+                             "blobs for all %lld experts of each; the adaptive tier is off (--adapt-swaps 0)%s\n",
+                     (long long) n_on, (long long) lay.n_layers, (long long) by_fmt[0], (long long) by_fmt[1],
+                     (long long) by_fmt[2], (double) more / 1073741824.0, (long long) lay.n_expert,
+                     nib::config().recheck ? "; STRATA_EXPERT_NIBBLE_RECHECK: every slot's hash after each request" : "");
+    }
     // STRATA_EARLY_REMOTE_CONTEXTS=1: create EVERY secondary context here, like CUDA1's.  Under WSL2 the driver's
     // pinned/mapped host budget (dxg gpadl, ~1 GiB) is spent by CUDA0's weights and MTP before the later loop runs,
     // and a new context then fails with cudaErrorMemoryAllocation (CUDA2: "cudaSetDevice(2) failed: out of memory").
@@ -2988,7 +3367,7 @@ int main(int argc, char** argv) {
             const auto& lay = strata::kernels::cpu::expert_layout();
             int64_t pairs_bytes = 0;
             for (const auto& pr : prof)
-                pairs_bytes += native_pack ? ((int64_t) lay.blob_bytes(pr.first) + 255) / 256 * 256 : (int64_t) lay.max_blob;
+                pairs_bytes += native_pack ? ((int64_t) nib::slot_bytes(pr.first) + 255) / 256 * 256 : (int64_t) lay.max_blob;
             size_t fb = 0, tb = 0;
             cudaMemGetInfo(&fb, &tb);
             const int64_t session = (int64_t) strata::core::session_bytes(g, o.max_context, K, 0, g.n_layers);
@@ -3381,7 +3760,7 @@ int main(int argc, char** argv) {
             total_mass += (mass[r] = hi - lo);
         }
         auto cost = [&](int64_t l) -> int64_t {
-            return native_pack ? ((int64_t) lay.blob_bytes(l) + 255) / 256 * 256 : (int64_t) lay.max_blob;
+            return native_pack ? ((int64_t) nib::slot_bytes(l) + 255) / 256 * 256 : (int64_t) lay.max_blob;
         };
         // the predicted window time (ms) of a placement, and the routed mass its caches hold
         std::vector<int64_t> held_cnt((size_t) ns, 0);   // per-stage fill count, for the startability gate
@@ -4353,7 +4732,7 @@ int main(int argc, char** argv) {
         for (const auto& d : slot_mtp)
             mtp_bind += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first;
-        const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+        const int64_t blob = (int64_t) nibble_max_slot_bytes();   // max_blob (P1 part D: or a larger 4-bit slot)
         int64_t slots = ((int64_t) free_b - reserve) / blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
@@ -4438,7 +4817,7 @@ int main(int argc, char** argv) {
         free_b = strata::core::device_free_bytes(); (void) total_b;
         const int64_t prefill_mib = owned_prefill_mib();
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + pipe_first;
-        const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob, 0);
+        const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) nibble_max_slot_bytes(), 0);
         if (o.expert_cache > fit) {
             // a WARNING that names the knob: the user asked for this size, and gets fewer slots
             std::fprintf(stderr, "strata generate: WARNING: layer split: --expert-cache %d leaves no room for the "
@@ -4458,21 +4837,20 @@ int main(int argc, char** argv) {
     uint64_t per_layer_bytes = 0;
     if (native_pack && o.expert_cache > 0 && o.expert_cache_per_layer) {
         const size_t free_b = strata::core::device_free_bytes();   // the same reading the shared-cache sizing uses
-        const auto& lay = strata::kernels::cpu::expert_layout();
         const int asked = o.expert_cache;
-        const uint64_t budget = (uint64_t) asked * lay.max_blob;
+        const uint64_t budget = (uint64_t) asked * nibble_max_slot_bytes();
         size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
         uint64_t sum = 0;
         for (int64_t l = 0; l < g.n_layers; ++l)
-            sum += (lay.blob_bytes(l) + 255) / 256 * 256;
+            sum += (nib::slot_bytes(l) + 255) / 256 * 256;
         int64_t q = sum > 0 ? (int64_t) (cap / sum) : 0;
         if (q > g.n_expert) q = g.n_expert;
         if (q > 0) {
             per_layer_bytes = sum;
             sized_slots.reserve((size_t) q * (size_t) g.n_layers);
             for (int64_t l = 0; l < g.n_layers; ++l) {
-                const int64_t b = (int64_t) lay.blob_bytes(l);
+                const int64_t b = (int64_t) nib::slot_bytes(l);
                 for (int64_t s = 0; s < q; ++s) sized_slots.push_back(b);
             }
             o.expert_cache = (int) sized_slots.size();
@@ -4484,17 +4862,16 @@ int main(int argc, char** argv) {
     } else if (native_pack && o.expert_cache > 0 && !profile.empty()) {
         size_t free_b = 0, total_b = 0;
         free_b = strata::core::device_free_bytes(); (void) total_b;
-        const auto& lay = strata::kernels::cpu::expert_layout();
-        const uint64_t budget = (uint64_t) o.expert_cache * lay.max_blob;   // what the uniform sizing granted
+        const uint64_t budget = (uint64_t) o.expert_cache * nibble_max_slot_bytes();   // what the uniform sizing granted
         uint64_t used = 0;
         const size_t keep_free = ((size_t) o.vram_reserve_mib << 20) + (size_t) pipe_first;
         size_t free_room = free_b > keep_free ? free_b - keep_free : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
         for (const auto& pr : profile) {
-            const uint64_t b = (lay.blob_bytes(pr.first) + 255) / 256 * 256;
+            const uint64_t b = (nib::slot_bytes(pr.first) + 255) / 256 * 256;
             if (used + b > cap) break;
             used += b;
-            sized_slots.push_back((int64_t) lay.blob_bytes(pr.first));
+            sized_slots.push_back((int64_t) nib::slot_bytes(pr.first));
         }
         // #831: the sized-slots loop walks the profile's pairs, so the profile's length is the ceiling; an explicit
         // --expert-cache above it used to be cut with no word.  A warning only (what is allocated does not change).
@@ -4529,13 +4906,12 @@ int main(int argc, char** argv) {
             if (keep_bytes <= 0) { o.expert_cache = 0; sized_slots.clear(); return false; }
             if (per_layer_bytes > 0) {
                 // Cutting the list short would put one layer's blob in the next layer's range.
-                const auto& lay = strata::kernels::cpu::expert_layout();
                 int64_t q = keep_bytes / (int64_t) per_layer_bytes;
                 if (q > g.n_expert) q = g.n_expert;
                 sized_slots.clear();
                 if (q <= 0) { o.expert_cache = 0; return false; }
                 for (int64_t l = 0; l < g.n_layers; ++l) {
-                    const int64_t b = (int64_t) lay.blob_bytes(l);
+                    const int64_t b = (int64_t) nib::slot_bytes(l);
                     for (int64_t s = 0; s < q; ++s) sized_slots.push_back(b);
                 }
                 o.expert_cache = (int) sized_slots.size();
@@ -4659,6 +5035,9 @@ int main(int argc, char** argv) {
     // admission finds no room and every non-profiled expert stays a CPU miss.  That is what makes the profile
     // the policy rather than a hint.
     int64_t prefilled = 0;
+    // P1 part D: each cache's converted slots (only with STRATA_EXPERT_NIBBLE=1; RECHECK reads them per request)
+    NibbleCache nib_x;
+    std::vector<NibbleCache> nib_st;
     if (!profile.empty() && srcp != nullptr) {
         // #369 (dag08): per layer, a full layer skips only its own pairs - each layer takes its hottest experts until
         // its range is full (one full layer used to end the whole fill, leaving most layers empty)
@@ -4679,6 +5058,14 @@ int main(int argc, char** argv) {
         }
         const auto fill_t0 = std::chrono::steady_clock::now();
         uint64_t fill_bytes = 0;
+        if (nib::any_on()) {   // P1 part D: the converted layers' pairs go through the 4-bit fill instead
+            int64_t conv = 0;
+            for (int64_t i = 0; i < want; ++i) conv += nib::layer(profile[(size_t) i].first).on ? 1 : 0;
+            if (conv > 0 && !nib_x.begin(xcache, conv, err)) {
+                std::fprintf(stderr, "strata generate: STRATA_EXPERT_NIBBLE: %s\n", err.c_str());
+                return 1;
+            }
+        }
         for (int64_t i = 0; i < want; ++i) {
             if (!per_layer && srcp == &src && src.unbuffered() && i % 64 == 0) {
                 if (ahead.valid()) ahead.get();
@@ -4692,8 +5079,10 @@ int main(int argc, char** argv) {
                 break;
             }
             const uint8_t* b = srcp->blob_stable(profile[(size_t) i].first, profile[(size_t) i].second);
-            if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first))) {
+            const bool nib_pair = nib_x.active() && nib::layer(profile[(size_t) i].first).on;   // P1 part D
+            if (b == nullptr || !(nib_pair ? nib_x.add(profile[(size_t) i].first, profile[(size_t) i].second, slot, b, err)
+                                           : xcache.fill_slot_blocking(slot, b, err,
+                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first)))) {
                 std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
                              (long long) i, err.c_str());
                 return 1;
@@ -4701,15 +5090,39 @@ int main(int argc, char** argv) {
             fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
             ++prefilled;
         }
+        if (nib_x.active() && !nib_x.finish(err)) {
+            std::fprintf(stderr, "strata generate: STRATA_EXPERT_NIBBLE: CUDA0: %s\n", err.c_str());
+            return 1;
+        }
         const double fill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - fill_t0).count();
         // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
         // about bytes produces a plausible token, which is this project's most expensive failure mode; the
         // cache's own `verify_slot` is the check and it costs one 1.38 MB D2H at startup.
-        if (prefilled > 0 && !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
+        // (P1 part D: a converted slot holds 4-bit codes, not the blob's bytes - the 4-bit check below is its check)
+        if (prefilled > 0 && !nib::layer(profile[0].first).on &&
+            !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
                                 srcp->blob_stable(profile[0].first, profile[0].second), err,
                                 (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
+        }
+        if (nib_x.active() && nib_x.n > 0) {
+            // P1 part D: the hottest converted pair read back and checked against its GGUF blob (dequantized), its
+            // down rows and the host reference of its slot hash.  Every item of every converted slot was already
+            // round-tripped by the transcoder; this is the end-to-end check of the fill as it is wired.
+            size_t c = 0;
+            while (c < (size_t) want && !nib::layer(profile[c].first).on) ++c;
+            if (!nib_x.check(profile[c].first, profile[c].second, srcp->blob_stable(profile[c].first, profile[c].second),
+                             err)) {
+                std::fprintf(stderr, "strata generate: STRATA_EXPERT_NIBBLE: CUDA0: %s\n", err.c_str());
+                return 1;
+            }
+            std::set<int32_t> ls;
+            for (const auto& pr : nib_x.pairs) ls.insert(pr.first);
+            std::fprintf(stderr, "strata generate: STRATA_EXPERT_NIBBLE: CUDA0: %lld slots of %zu layers transcoded to 4-bit "
+                                 "codes (%.2f s, every item round-tripped, slot hashes recorded); layer %d expert %d checked "
+                                 "against its GGUF blob\n", (long long) nib_x.n, ls.size(), nib_x.seconds,
+                         (int) profile[c].first, (int) profile[c].second);
         }
         mem_mark("the profile fill");
         std::fprintf(stderr, "strata generate: pre-filled %lld of %lld slots from the profile in %.1f s (%.0f MB/s); "
@@ -4734,10 +5147,10 @@ int main(int argc, char** argv) {
         std::vector<int64_t> sized;
         int64_t used = 0;
         for (const auto& pr : st.profile) {
-            const int64_t b = native_pack ? ((int64_t) lay.blob_bytes(pr.first) + 255) / 256 * 256 : (int64_t) lay.max_blob;
+            const int64_t b = native_pack ? ((int64_t) nib::slot_bytes(pr.first) + 255) / 256 * 256 : (int64_t) lay.max_blob;
             if (used + b > room) break;
             used += b;
-            sized.push_back((int64_t) lay.blob_bytes(pr.first));
+            sized.push_back((int64_t) nib::slot_bytes(pr.first));
         }
         // #841: a stage's cache can fail to open with the VRAM free (the card's allocation is also charged to the
         // Windows commit, or the free figure ran high): it is tried again with 90% of the slots, up to 3 times, each
@@ -4761,24 +5174,56 @@ int main(int argc, char** argv) {
             return 1;
         }
         int64_t filled = 0;
+        NibbleCache& nib_c = nib_st.emplace_back();   // P1 part D: this stage's converted slots
+        if (nib::any_on()) {
+            int64_t conv = 0;
+            for (const auto& pr : st.profile) conv += nib::layer(pr.first).on ? 1 : 0;
+            if (conv > 0 && !nib_c.begin(st.cache, conv, err)) {
+                std::fprintf(stderr, "strata generate: STRATA_EXPERT_NIBBLE: CUDA%d: %s\n", st.dev, err.c_str());
+                return 1;
+            }
+        }
         for (const auto& pr : st.profile) {
             if (filled >= st.cache.slots()) break;
             const int32_t slot = st.cache.admit(pr.first, pr.second);
             if (slot == strata::core::kNotResident) break;
             const uint8_t* b = srcp->blob_stable(pr.first, pr.second);
-            if (b == nullptr || !st.cache.fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(pr.first))) {
+            const bool nib_pair = nib_c.active() && nib::layer(pr.first).on;   // P1 part D
+            if (b == nullptr || !(nib_pair ? nib_c.add(pr.first, pr.second, slot, b, err)
+                                           : st.cache.fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(pr.first)))) {
                 std::fprintf(stderr, "strata generate: layer split, CUDA%d profile fill failed at pair %lld: %s\n",
                              st.dev, (long long) filled, err.c_str());
                 return 1;
             }
             ++filled;
         }
-        if (filled == 0 || !st.cache.verify_slot(st.cache.slot_of(st.profile[0].first, st.profile[0].second),
-                                                 srcp->blob_stable(st.profile[0].first, st.profile[0].second), err,
-                                                 (int64_t) lay.blob_bytes(st.profile[0].first))) {
+        if (nib_c.active() && !nib_c.finish(err)) {
+            std::fprintf(stderr, "strata generate: STRATA_EXPERT_NIBBLE: CUDA%d: %s\n", st.dev, err.c_str());
+            return 1;
+        }
+        // (P1 part D: a converted slot holds 4-bit codes, not the blob's bytes - the 4-bit check below is its check)
+        if (filled == 0 || (!nib::layer(st.profile[0].first).on &&
+                            !st.cache.verify_slot(st.cache.slot_of(st.profile[0].first, st.profile[0].second),
+                                                  srcp->blob_stable(st.profile[0].first, st.profile[0].second), err,
+                                                  (int64_t) lay.blob_bytes(st.profile[0].first)))) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d expert cache: %s\n", st.dev,
                          filled == 0 ? "nothing filled" : err.c_str());
             return 1;
+        }
+        if (nib_c.active() && nib_c.n > 0) {   // P1 part D: as CUDA0's above
+            size_t c = 0;
+            while (c < st.profile.size() && !nib::layer(st.profile[c].first).on) ++c;
+            const auto& pc = st.profile[c];
+            if (!nib_c.check(pc.first, pc.second, srcp->blob_stable(pc.first, pc.second), err)) {
+                std::fprintf(stderr, "strata generate: STRATA_EXPERT_NIBBLE: CUDA%d: %s\n", st.dev, err.c_str());
+                return 1;
+            }
+            std::set<int32_t> ls;
+            for (const auto& pr : nib_c.pairs) ls.insert(pr.first);
+            std::fprintf(stderr, "strata generate: STRATA_EXPERT_NIBBLE: CUDA%d: %lld slots of %zu layers transcoded to 4-bit "
+                                 "codes (%.2f s, every item round-tripped, slot hashes recorded); layer %d expert %d checked "
+                                 "against its GGUF blob\n", st.dev, (long long) nib_c.n, ls.size(), nib_c.seconds,
+                         (int) pc.first, (int) pc.second);
         }
         std::fprintf(stderr, "strata generate: layer split: CUDA%d runs layers %lld-%lld, expert cache %lld slots "
                              "(%.2f GiB), %lld of its %zu profiled pairs; slot 0 verified\n",
@@ -4787,6 +5232,42 @@ int main(int argc, char** argv) {
     }
     if (multi_gpu)
         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
+    if (nib::any_on()) {
+        // P1 part D: every expert of every converted layer must be in VRAM, in the cache of the card that runs the
+        // layer (a miss would be computed from the GGUF blob by the CPU or over PCIe - correct, but the arena is freed
+        // once all is resident, and the switch is only measured fully resident).  Then no slot is written again.
+        int64_t n_conv = 0;
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            if (!nib::layer(l).on) continue;
+            ++n_conv;
+            const strata::core::ExpertCache* owner = &xcache;
+            int owner_dev = 0;
+            if (multi_gpu && !split_at.empty() && l >= split_at[0]) {
+                owner = nullptr;
+                for (const auto& stp : stages)
+                    if (l >= stp->lb && l < stp->le) { owner = &stp->cache; owner_dev = stp->dev; }
+            }
+            int64_t missing = 0, first = -1;
+            for (int64_t e = 0; e < g.n_expert; ++e)
+                if (owner == nullptr || owner->slot_of(l, e) == strata::core::kNotResident) {
+                    if (first < 0) first = e;
+                    ++missing;
+                }
+            if (missing > 0) {
+                std::fprintf(stderr, "strata generate: STRATA_EXPERT_NIBBLE refuses the start: layer %lld (%s) has %lld of its %lld "
+                                     "experts out of CUDA%d's VRAM (expert %lld the first) - every expert of a converted "
+                                     "layer must be resident (a profile that ranks every pair, room on the card, or "
+                                     "STRATA_EXPERT_NIBBLE_SKIP=%lld)\n", (long long) l, nib::fmt_name(nib::layer(l).gu_type),
+                             (long long) missing, (long long) g.n_expert, owner_dev, (long long) first, (long long) l);
+                return 1;
+            }
+        }
+        xcache.seal();
+        for (auto& stp : stages) stp->cache.seal();
+        std::fprintf(stderr, "strata generate: STRATA_EXPERT_NIBBLE: all %lld experts of the %lld converted layers are "
+                             "VRAM-resident as 4-bit slots; the expert caches are sealed (nothing writes a slot from here on)\n",
+                     (long long) g.n_expert, (long long) n_conv);
+    }
 
     // ---- LAYER 2: exact startability probe on the live free figures.  Every session, cache and batch slot is
     // carved by now, so `cudaMemGetInfo` reads what serve's own_fits (5855-5869) will read.  Run serve's own
@@ -5946,6 +6427,7 @@ int main(int argc, char** argv) {
                 if (!cold.empty() && cold.back().first < heat(oi)) {
                     vi = cold.back().second;
                     const int32_t vs = host_res[(size_t) vi];
+                    nib::guard_raw(layer, "the elastic K/V's slot move (kvg_ensure)");
                     if (xcache.slot_offset(vs + 1) - xcache.slot_offset(vs) < lay.blob_bytes(layer) ||
                         cudaMemcpy(xcache.device_slot(vs), xcache.device_slot((int32_t) kvg.lo),
                                    (size_t) lay.blob_bytes(layer), cudaMemcpyDeviceToDevice) != cudaSuccess)
@@ -6048,6 +6530,7 @@ int main(int argc, char** argv) {
                 if (host_res[i] >= 0 || lay.blob_bytes(l) > room) continue;
                 const uint8_t* b = srcp->blob_stable(l, e);
                 if (b == nullptr) continue;
+                nib::guard_raw(l, "the elastic K/V's refill (kvg_trim)");
                 cudaMemcpyAsync(xcache.device_slot((int32_t) s), b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice,
                                 nullptr);
                 filled.emplace_back(i, (int32_t) s);
@@ -6600,6 +7083,38 @@ int main(int argc, char** argv) {
                                      "off (setup: --vision no), close other programs using the GPU, use a shorter "
                                      "context, or read prompts in smaller chunks (--prefill 512)\n");
             return 1;
+        }
+        if (nib::any_on()) {
+            // P1 part D: the prompt path keeps its own buffers (a loan is refilled with GGUF blobs), reads in the chunk
+            // it reads without the switch (the chunking is part of the reply's bits: auto's ceiling, or --prefill N),
+            // and every card keeps 1.5 GiB free after its prompt buffers.  Any of them not so: refused, never a
+            // quietly different reply.
+            std::string why;
+            const int64_t expect = o.prefill_auto ? std::max<int64_t>(8192, std::min<int64_t>(o.prefill_auto_max, o.max_context))
+                                                  : nib_chunk_asked;   // auto: its ceiling (auto_ceiling above)
+            if (any_loan) why = "the prompt path borrows expert-cache slots (a loan is refilled with GGUF blobs)";
+            else if (o.prefill_chunk > 0 && o.prefill_chunk != expect)
+                why = "the prompt chunk is " + std::to_string(o.prefill_chunk) + " tokens, not the " + std::to_string(expect) +
+                      " it is without the switch (that would change the replies' bits)";
+            std::string room;
+            for (size_t i = 0; why.empty() && i <= stages.size(); ++i) {
+                const int dev = i == 0 ? -1 : stages[i - 1]->dev;
+                const strata::core::OnDevice on(dev);
+                size_t fb = 0, tb = 0;
+                if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) { (void) cudaGetLastError(); continue; }
+                char b[64];
+                std::snprintf(b, sizeof b, "CUDA%d %.2f GiB", dev < 0 ? 0 : dev, (double) fb / 1073741824.0);
+                room += (room.empty() ? "" : ", ") + std::string(b);
+                if (fb < (3ull << 29))
+                    why = std::string(b) + " free after the prompt buffers, under the 1.5 GiB the switch keeps";
+            }
+            if (!why.empty()) {
+                std::fprintf(stderr, "strata serve: STRATA_EXPERT_NIBBLE refuses the start: %s (STRATA_EXPERT_NIBBLE_SKIP=<layers> "
+                                     "keeps some layers' GGUF blocks and their smaller slots)\n", why.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata serve: STRATA_EXPERT_NIBBLE: prompt chunk %lld, no loan; free after the prompt "
+                                 "buffers: %s\n", (long long) o.prefill_chunk, room.c_str());
         }
         if (peer.valid() && o.peer_prefill_rows != 0) {
             const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
@@ -7583,6 +8098,7 @@ int main(int argc, char** argv) {
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = fenced_slots.empty() ? host_res[out] : fenced_slots[si];
                 const uint8_t* b = srcp->blob_stable(s.layer, s.in);
+                nib::guard_raw(s.layer, "the adaptive tier's copy in");
                 const int stn = multi_gpu ? stage_of(s.layer) : 0;   // the swap stays in the layer's own cache
                 GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
                 const strata::core::OnDevice on(gs ? gs->dev : -1);
@@ -7757,6 +8273,7 @@ int main(int argc, char** argv) {
                 const strata::core::OnDevice on(h.dev);
                 for (const ASwap& w : aswaps) {
                     if (w.home != hi || !w.exchange) continue;
+                    nib::guard_raw(w.layer, "the async adaptive tier's copy back (a_back)");
                     if (const cudaError_t e = cudaMemcpyAsync(src.exchange_buffer(w.j), h.cache->device_slot(w.slot),
                                                               (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer),
                                                               cudaMemcpyDeviceToHost, h.stream); e != cudaSuccess) {
@@ -7785,6 +8302,7 @@ int main(int argc, char** argv) {
         auto a_in_one = [&](const ASwap& w, const uint8_t* b) {   // step 2: one copy in (H2D), on its home's stream
             AHome& h = ahomes[(size_t) w.home];
             const strata::core::OnDevice on(h.dev);
+            nib::guard_raw(w.layer, "the async adaptive tier's copy in (a_in_one)");
             if (const cudaError_t e = cudaMemcpyAsync(h.cache->device_slot(w.slot), b,
                                                       (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer),
                                                       cudaMemcpyHostToDevice, h.stream); e != cudaSuccess) {
@@ -11309,6 +11827,27 @@ int main(int argc, char** argv) {
                 live_imgs = imgs_below(req_imgs, (int64_t) live.size());
                 live_ok = o.prompt_cache > 0 && req_ckpt;   // ckpt=0: nothing to continue or park (#830)
             }
+            if (nib::config().recheck && nib::any_on() && !cancelled) {
+                // P1 part D, STRATA_EXPERT_NIBBLE_RECHECK=1 (debug): every converted slot's hash again on its own
+                // device, against the hash recorded at load - a path that wrote a slot after the seal is found here
+                std::string rerr;
+                int64_t bad_layer = -1;
+                const auto rt0 = Clock::now();
+                bool ok = nib_x.recheck(rerr, bad_layer);
+                int64_t checked = nib_x.n;
+                for (size_t i = 0; ok && i < nib_st.size(); ++i) {
+                    ok = nib_st[i].recheck(rerr, bad_layer);
+                    checked += nib_st[i].n;
+                }
+                if (!ok) {
+                    std::fprintf(stderr, "strata serve: STRATA_EXPERT_NIBBLE_RECHECK: %s\n", rerr.c_str());
+                    if (bad_layer >= 0) nib::fatal(bad_layer, "STRATA_EXPERT_NIBBLE_RECHECK", "a slot changed after the load");
+                    std::fflush(stderr);
+                    std::abort();
+                }
+                std::fprintf(stderr, "strata serve: STRATA_EXPERT_NIBBLE_RECHECK: %lld 4-bit slots hash as at load (%.0f ms)\n",
+                             (long long) checked, std::chrono::duration<double, std::milli>(Clock::now() - rt0).count());
+            }
             static const bool state_hash = std::getenv("STRATA_STATE_HASH") != nullptr;
             if (state_hash && !cancelled && o.prompt_cache > 0) {   // every finished request, ckpt=0 too (parity gates)
                 // DEBUG: a fingerprint of every part of the session over the positions it holds ([0, L)), and
@@ -11659,6 +12198,11 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: prompt chunk auto: %lld tokens\n", (long long) o.prefill_chunk);
             } else if (chunk != o.prefill_chunk) {
                 k = 0;                                 // a fixed chunk that does not fit: its own buffers, as before
+            }
+            if (k > 0 && nib::any_on()) {   // P1 part D: the lent slots would be refilled with GGUF blobs
+                std::fprintf(stderr, "strata generate: STRATA_EXPERT_NIBBLE refuses the start: the prompt path would borrow %lld "
+                                     "cache slots (--no-prefill-borrow keeps its own buffers)\n", (long long) k);
+                return 1;
             }
             const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
             if (k > 0) {   // the lent slots are refilled after the prompt
@@ -12150,6 +12694,7 @@ int main(int argc, char** argv) {
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = host_res[out];
                 const uint8_t* b = srcp->blob_stable(s.layer, s.in);
+                nib::guard_raw(s.layer, "the adaptive refill's copy in");
                 const size_t blob_n = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer);
                 // asynchronous: the copies run while the MTP drafts; the next window waits for them
                 if (slot < 0 || b == nullptr) {

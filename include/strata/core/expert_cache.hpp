@@ -201,6 +201,14 @@ public:
     /// Slots filled so far, for the startup report.
     int64_t fills() const { return fills_; }
 
+    /// P1 part D (STRATA_EXPERT_NIBBLE=1, include/strata/core/expert_nibble.hpp): called once the startup fill has
+    /// written every slot (some of them as 4-bit codes, not GGUF blocks) and checked them.  From then on no slot may
+    /// be written through this class: `fill_slot`, `fill_slot_blocking` and `fill_slot_queued` stop the engine (they
+    /// would write GGUF bytes, possibly into a 4-bit slot, and a wrong expert gives a plausible token, never an
+    /// error), and `admit` claims nothing.  Never called with the switch off: an unsealed cache is the one above.
+    void seal() { sealed_ = true; }
+    bool sealed() const { return sealed_; }
+
     /// The elastic K/V (--kv-grow): the arena in a VMM range (vmm.hpp) instead of one cudaMalloc, so the K/V can take
     /// single chunks of it and give them back. Applies to the next `open`; ignored where VMM is not available.
     static void set_vmm(bool enabled);
@@ -240,6 +248,7 @@ private:
     std::vector<int32_t> layer_next_;   ///< [n_layers] -> that layer's next free slot
     std::vector<uint64_t> off_;         ///< plan v0.3 P6: slot offsets (slots + 1 entries) when sized
     int64_t admitted_ = 0;
+    bool sealed_ = false;               ///< P1 part D: `seal` was called (no slot is written after it)
 };
 
 }  // namespace strata::core
