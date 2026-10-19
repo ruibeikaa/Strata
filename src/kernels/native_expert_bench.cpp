@@ -2,11 +2,23 @@
 // another, bit for bit, and each one's time.
 //
 //     build/native_expert_bench <shard1.gguf> <layer[,layer...]> <groups> <tokens per group> <ref mode> <mode> [iters]
+//     build/native_expert_bench --nibble <shard.gguf> <layer[,layer...]> [--t 1,2,3,4,5,6] [--share 0,50] [--plans 200]
+//                               [--trials 7] [--hist gu_shape_hist.txt]
 //
 // Modes are STRATA_EXP_MODE values.  A group is one expert (distinct blobs, ~2 MB each, so G >= 8 does not fit
 // in L2); its entries read distinct tokens of an 8-token window.  The output must be bitwise equal to the
 // reference mode's: the verify window's text depends on it.
+//
+// --nibble (P1 part D, D_DESIGN.md section 8(e)): the layer's 512 experts as GGUF blobs (P, the production kernels)
+// and as 4-bit slots made by the engine's transcoder (N: native_expert_layout_nib, expert_nibble.hpp's variant table
+// at max_group_entries = T); the verify window's whole expert step (gate/up + SwiGLU/q8_1 + down) and its gate/up
+// phase alone, per (T, sharing) over `--plans` top-10 routings (gate G1a's two extremes: 0% or 50% of a token's
+// experts shared with the previous token's), every plan's out rows compared byte for byte first; interleaved trials,
+// medians.  `--hist`: STRATA_GU_SHAPE_HIST's file (gate G1b; decode records only) replayed instead - per launch size t
+// of the layer's format, plans drawn from the recorded G and per-group entry counts, the times weighted by the
+// recorded launches.
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/core/expert_nibble.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 
@@ -14,10 +26,14 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <map>
+#include <memory>
 #include <random>
 #include <sstream>
 #include <string>
@@ -26,8 +42,11 @@
 namespace cpu = strata::kernels::cpu;
 namespace K = strata::kernels;
 
+int nibble_main(int argc, char** argv);
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
+    if (argc >= 2 && std::strcmp(argv[1], "--nibble") == 0) return nibble_main(argc, argv);
     if (argc < 7) {
         std::fprintf(stderr, "usage: native_expert_bench <shard1.gguf> <layer[,layer]> <groups> <tokens> <ref mode> <mode> [iters]\n");
         return 2;
@@ -166,5 +185,448 @@ int main(int argc, char** argv) {
         cudaFree(dstart); cudaFree(dn); cudaFree(ddst); cudaFree(dtok);
     }
     std::printf("native_expert_bench: %d differing\n", failures);
+    return failures ? 1 : 0;
+}
+
+// ------------------------------------------------------------------------------------------------ --nibble
+namespace {
+
+namespace nib = strata::core::nibble;
+
+#define NB_CK(x)                                                                                                    \
+    do {                                                                                                            \
+        cudaError_t e_ = (x);                                                                                       \
+        if (e_ != cudaSuccess) {                                                                                    \
+            std::fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #x, cudaGetErrorString(e_));                 \
+            std::exit(2);                                                                                           \
+        }                                                                                                           \
+    } while (0)
+
+struct NbPlan {
+    int ng = 0, ne = 0, t = 0;
+    std::vector<int> gid, start, tok, dst;
+};
+
+// G1a's routing: t tokens of top-10, `share` % of each token's experts the previous token's; groups by first
+// appearance (resident_plan_kernel's order), entries in token order
+NbPlan nb_route(std::mt19937& rng, int t, int share) {
+    std::vector<int> ids, prev, cur;
+    for (int k = 0; k < t; ++k) {
+        cur.clear();
+        const bool sh = k > 0 && share > 0;
+        if (sh) {
+            std::vector<int> p = prev;
+            std::shuffle(p.begin(), p.end(), rng);
+            cur.assign(p.begin(), p.begin() + 10 * share / 100);
+        }
+        while ((int) cur.size() < 10) {
+            const int e = (int) (rng() % 512u);
+            if (std::find(cur.begin(), cur.end(), e) != cur.end()) continue;
+            if (sh && std::find(prev.begin(), prev.end(), e) != prev.end()) continue;
+            cur.push_back(e);
+        }
+        std::shuffle(cur.begin(), cur.end(), rng);
+        ids.insert(ids.end(), cur.begin(), cur.end());
+        prev = cur;
+    }
+    NbPlan p;
+    p.t = t;
+    std::map<int, std::vector<int>> by;   // expert -> its entries (j = token * 10 + k)
+    std::vector<int> first;
+    for (int j = 0; j < (int) ids.size(); ++j) {
+        if (by.find(ids[j]) == by.end()) first.push_back(ids[j]);
+        by[ids[j]].push_back(j);
+    }
+    for (int e : first) {
+        p.gid.push_back(e);
+        p.start.push_back(p.ne);
+        for (int j : by[e]) {
+            p.tok.push_back(j / 10);
+            p.dst.push_back(j);
+            ++p.ne;
+        }
+    }
+    p.start.push_back(p.ne);
+    p.ng = (int) p.gid.size();
+    return p;
+}
+
+// a plan of G groups whose entry counts are drawn from `nh` (n -> groups recorded), summing to 10 t where a draw allows
+NbPlan nb_from_hist(std::mt19937& rng, int t, int G, const std::map<int, double>& nh) {
+    std::vector<int> ns;
+    std::vector<double> w;
+    for (const auto& kv : nh)
+        if (kv.first >= 1 && kv.first <= t) {
+            ns.push_back(kv.first);
+            w.push_back(kv.second);
+        }
+    if (ns.empty()) {
+        ns.push_back(1);
+        w.push_back(1);
+    }
+    std::discrete_distribution<int> pick(w.begin(), w.end());
+    std::vector<int> sz(G, 1), best_sz;
+    const int want = 10 * t;
+    int best = -1;
+    for (int tries = 0; tries < 400; ++tries) {
+        int sum = 0;
+        for (int g = 0; g < G; ++g) sum += sz[g] = ns[(size_t) pick(rng)];
+        if (best < 0 || std::abs(sum - want) < std::abs(best - want)) {
+            best = sum;
+            best_sz = sz;
+        }
+        if (sum == want) break;
+    }
+    NbPlan p;
+    p.t = t;
+    std::vector<int> experts(512);
+    for (int i = 0; i < 512; ++i) experts[i] = i;
+    std::shuffle(experts.begin(), experts.end(), rng);
+    int j = 0;
+    for (int g = 0; g < G; ++g) {
+        p.gid.push_back(experts[(size_t) g % 512]);
+        p.start.push_back(p.ne);
+        std::vector<int> toks(t);
+        for (int k = 0; k < t; ++k) toks[k] = k;
+        std::shuffle(toks.begin(), toks.end(), rng);
+        const int n = std::min(best_sz[g], t);
+        std::sort(toks.begin(), toks.begin() + n);
+        for (int k = 0; k < n; ++k) {
+            p.tok.push_back(toks[k]);
+            p.dst.push_back(j++);
+            ++p.ne;
+        }
+    }
+    p.start.push_back(p.ne);
+    p.ng = G;
+    return p;
+}
+
+struct NbDev {
+    unsigned long long* ptr = nullptr;
+    int32_t *start = nullptr, *ng = nullptr, *tok = nullptr, *dst = nullptr;
+};
+NbDev nb_upload(const NbPlan& p, const uint8_t* base, size_t stride) {
+    NbDev d;
+    std::vector<unsigned long long> hp(std::max(1, p.ng));
+    for (int g = 0; g < p.ng; ++g) hp[g] = (unsigned long long) (base + (size_t) p.gid[g] * stride);
+    NB_CK(cudaMalloc((void**) &d.ptr, hp.size() * 8));
+    NB_CK(cudaMalloc((void**) &d.start, (size_t) (p.ng + 1) * 4));
+    NB_CK(cudaMalloc((void**) &d.ng, 4));
+    NB_CK(cudaMalloc((void**) &d.tok, (size_t) std::max(1, p.ne) * 4));
+    NB_CK(cudaMalloc((void**) &d.dst, (size_t) std::max(1, p.ne) * 4));
+    NB_CK(cudaMemcpy(d.ptr, hp.data(), hp.size() * 8, cudaMemcpyHostToDevice));
+    NB_CK(cudaMemcpy(d.start, p.start.data(), (size_t) (p.ng + 1) * 4, cudaMemcpyHostToDevice));
+    NB_CK(cudaMemcpy(d.ng, &p.ng, 4, cudaMemcpyHostToDevice));
+    if (p.ne) {
+        NB_CK(cudaMemcpy(d.tok, p.tok.data(), (size_t) p.ne * 4, cudaMemcpyHostToDevice));
+        NB_CK(cudaMemcpy(d.dst, p.dst.data(), (size_t) p.ne * 4, cudaMemcpyHostToDevice));
+    }
+    return d;
+}
+void nb_free(NbDev& d) {
+    cudaFree(d.ptr);
+    cudaFree(d.start);
+    cudaFree(d.ng);
+    cudaFree(d.tok);
+    cudaFree(d.dst);
+}
+
+// STRATA_GU_SHAPE_HIST (gate G1b): per (gu_type, t) the launches by G and the groups by n, decode records only
+struct NbHist {
+    std::map<int, std::map<int, std::map<int, double>>> G, N;   // [gu_type][t][G or n] = count
+};
+bool nb_read_hist(const std::string& path, NbHist& h) {
+    std::ifstream f(path);
+    if (!f) return false;
+    std::map<int, int> fmt;   // layer -> gu_type
+    std::string line;
+    bool keep = true;
+    struct Row {
+        char k;
+        int l, T, t, x;
+        double c;
+    };
+    std::vector<Row> rows;
+    while (std::getline(f, line)) {
+        if (line.rfind("# gu-shape-hist", 0) == 0) {
+            keep = line.find(" why prompt") == std::string::npos;
+            continue;
+        }
+        std::istringstream ss(line);
+        std::string k;
+        ss >> k;
+        if (k == "F") {
+            int l, gt, dt;
+            if (ss >> l >> gt >> dt) fmt[l] = gt;
+            continue;
+        }
+        if (!keep || (k != "G" && k != "N")) continue;
+        Row r{ k[0], 0, 0, 0, 0, 0 };
+        if (ss >> r.l >> r.T >> r.t >> r.x >> r.c) rows.push_back(r);
+    }
+    for (const Row& r : rows) {
+        const auto it = fmt.find(r.l);
+        if (it == fmt.end()) continue;
+        (r.k == 'G' ? h.G : h.N)[it->second][r.t][r.x] += r.c;
+    }
+    return !rows.empty();
+}
+
+std::vector<int> nb_ints(const std::string& s) {
+    std::vector<int> v;
+    std::stringstream ss(s);
+    std::string t;
+    while (std::getline(ss, t, ',')) v.push_back(std::atoi(t.c_str()));
+    return v;
+}
+
+}  // namespace
+
+int nibble_main(int argc, char** argv) {
+    if (argc < 4) {
+        std::fprintf(stderr, "usage: native_expert_bench --nibble <shard.gguf> <layer[,layer]> [--t 1,2,3,4,5,6] [--share 0,50] "
+                             "[--plans 200] [--trials 7] [--hist gu_shape_hist.txt]\n");
+        return 2;
+    }
+    const std::string shard = argv[2];
+    const std::vector<int> layers = nb_ints(argv[3]);
+    std::vector<int> Ts = { 1, 2, 3, 4, 5, 6 }, shares = { 0, 50 };
+    int plans = 200, trials = 7;
+    std::string hist_path;
+    for (int i = 4; i + 1 < argc; i += 2) {
+        const std::string a = argv[i];
+        if (a == "--t") Ts = nb_ints(argv[i + 1]);
+        else if (a == "--share") shares = nb_ints(argv[i + 1]);
+        else if (a == "--plans") plans = std::atoi(argv[i + 1]);
+        else if (a == "--trials") trials = std::atoi(argv[i + 1]);
+        else if (a == "--hist") hist_path = argv[i + 1];
+        else {
+            std::fprintf(stderr, "unknown option %s\n", a.c_str());
+            return 2;
+        }
+    }
+    NbHist hist;
+    if (!hist_path.empty() && !nb_read_hist(hist_path, hist)) {
+        std::fprintf(stderr, "--hist %s: no decode records\n", hist_path.c_str());
+        return 2;
+    }
+    std::unique_ptr<strata::GgufModel> model;
+    try {
+        model = std::make_unique<strata::GgufModel>(strata::GgufModel::open(shard));
+    } catch (const std::exception& ex) {
+        std::fprintf(stderr, "native_expert_bench: %s\n", ex.what());
+        return 2;
+    }
+    cudaDeviceProp prop{};
+    NB_CK(cudaGetDeviceProperties(&prop, 0));
+    char bus[64] = {};
+    NB_CK(cudaDeviceGetPCIBusId(bus, sizeof bus, 0));
+    std::printf("device 0: %s, bus %s, cc %d.%d\n", prop.name, bus, prop.major, prop.minor);
+    const int64_t H = nib::kNEmbd, FF = nib::kNFf;
+    constexpr int kTokMax = 8;
+    int failures = 0;
+    cudaStream_t s;
+    NB_CK(cudaStreamCreate(&s));
+    cudaEvent_t e0, e1;
+    NB_CK(cudaEventCreate(&e0));
+    NB_CK(cudaEventCreate(&e1));
+    // the activations: kTokMax tokens of normal floats, quantized as the verify window quantizes them
+    std::mt19937 rng(20261019);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> x((size_t) kTokMax * H);
+    for (auto& v : x) v = nd(rng);
+    void *dx = nullptr, *dxq = nullptr, *dscr = nullptr;
+    float* dout = nullptr;
+    const int64_t cap = (int64_t) kTokMax * 10;
+    NB_CK(cudaMalloc(&dx, x.size() * 4));
+    NB_CK(cudaMalloc(&dxq, (size_t) kTokMax * H / 32 * 36));
+    NB_CK(cudaMalloc(&dscr, K::native_expert_scratch_bytes(cap, FF)));
+    NB_CK(cudaMalloc((void**) &dout, (size_t) cap * H * 4));
+    NB_CK(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+    K::quantize_q8_1_rows((const float*) dx, kTokMax, H, dxq, s);
+    for (int l : layers) {
+        const char* roles[3] = { "gate", "up", "down" };
+        const strata::TensorInfo* t[3] = {};
+        size_t sh[3] = {};
+        for (int r = 0; r < 3; ++r) t[r] = model->find("blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.weight", &sh[r]);
+        if (!t[0] || !t[1] || !t[2]) {
+            std::printf("layer %d: no expert tensors\n", l);
+            ++failures;
+            continue;
+        }
+        cpu::NativeFmt f;
+        std::string err;
+        if (!cpu::native_fmt((int) t[0]->type, (int) t[2]->type, H, FF, f, err)) {
+            std::printf("layer %d: %s\n", l, err.c_str());
+            ++failures;
+            continue;
+        }
+        nib::Config c;
+        c.on = true;
+        const nib::LayerVram V = nib::plan_layer(l, f, c);
+        if (!V.on) {
+            std::printf("layer %d: %s is not converted\n", l, ggml_type_name((ggml_type) f.gu_type));
+            continue;
+        }
+        // the 512 blobs (P) and their 4-bit slots (N, the engine's transcoder)
+        std::vector<uint8_t> host((size_t) 512 * f.bytes);
+        const size_t dn_role = f.bytes - f.down_off;
+        for (int e = 0; e < 512; ++e) {
+            uint8_t* b = host.data() + (size_t) e * f.bytes;
+            std::memcpy(b, model->shard(sh[0]).tensor_data(*t[0]) + (size_t) e * f.up_off, f.up_off);
+            std::memcpy(b + f.up_off, model->shard(sh[1]).tensor_data(*t[1]) + (size_t) e * f.up_off, f.up_off);
+            std::memcpy(b + f.down_off, model->shard(sh[2]).tensor_data(*t[2]) + (size_t) e * dn_role, dn_role);
+        }
+        uint8_t *raw = nullptr, *slots = nullptr;
+        unsigned long long *dp = nullptr, *dbad = nullptr;
+        NB_CK(cudaMalloc((void**) &raw, host.size()));
+        NB_CK(cudaMalloc((void**) &slots, (size_t) 512 * V.slot_bytes));
+        NB_CK(cudaMalloc((void**) &dp, 512 * 8));
+        NB_CK(cudaMalloc((void**) &dbad, 8));
+        NB_CK(cudaMemcpy(raw, host.data(), host.size(), cudaMemcpyHostToDevice));
+        std::vector<unsigned long long> hp(512);
+        for (int e = 0; e < 512; ++e) hp[e] = (unsigned long long) (slots + (size_t) e * V.slot_bytes);
+        NB_CK(cudaMemcpy(dp, hp.data(), 512 * 8, cudaMemcpyHostToDevice));
+        NB_CK(cudaMemset(dbad, 0, 8));
+        for (int e0 = 0; e0 < 512; e0 += 64)
+            if (nib::transcode(V, raw + (size_t) e0 * V.raw_bytes, 64, dp + e0, dbad, s) != 0) return 2;
+        for (int e = 0; e < 512; ++e)
+            NB_CK(cudaMemcpyAsync(slots + (size_t) e * V.slot_bytes + nib::kDownOff, raw + (size_t) e * V.raw_bytes + V.raw_down_off,
+                                  V.down_bytes, cudaMemcpyDeviceToDevice, s));
+        unsigned long long bad = 0;
+        NB_CK(cudaMemcpyAsync(&bad, dbad, 8, cudaMemcpyDeviceToHost, s));
+        NB_CK(cudaStreamSynchronize(s));
+        if (bad) {
+            std::printf("layer %d: %llu items do not round-trip\n", l, bad);
+            ++failures;
+            continue;
+        }
+        const auto Lr = K::native_expert_layout(f.gu_type, f.d_type, H, FF);
+        const auto Ln = K::native_expert_layout_nib(f.gu_type, f.d_type, H, FF);
+        std::printf("layer %2d %-7s/%-6s: 512 experts, blob %zu B, 4-bit slot %llu B\n", l, nib::fmt_name(f.gu_type),
+                    ggml_type_name((ggml_type) f.d_type), f.bytes, (unsigned long long) V.slot_bytes);
+        // one set of plans: every plan's out rows compared first, then P and N timed interleaved, phase 0 (the whole
+        // step) and 1 (gate/up + SwiGLU/q8_1), us per launch (median of the trials)
+        auto bench = [&](const std::vector<NbPlan>& ps, int tt, double us[2][2]) -> long long {
+            std::vector<NbDev> dr(ps.size()), dn(ps.size());
+            for (size_t i = 0; i < ps.size(); ++i) {
+                dr[i] = nb_upload(ps[i], raw, f.bytes);
+                dn[i] = nb_upload(ps[i], slots, V.slot_bytes);
+            }
+            const int64_t cp = std::max<int64_t>((int64_t) tt * 10, 1);
+            auto launch = [&](int arm, size_t i) {
+                const NbDev& d = arm ? dn[i] : dr[i];
+                K::native_expert_grouped(arm ? Ln : Lr, d.ptr, d.start, d.ng, d.dst, d.tok, std::max<int64_t>(cp, ps[i].ng),
+                                         std::max<int64_t>(cp, ps[i].ne), dxq, dscr, dout, s, 0, tt);
+            };
+            long long diff = 0;
+            std::vector<uint8_t> a((size_t) cap * H * 4), b(a.size());
+            K::native_expert_set_mode(-1, 0);
+            for (size_t i = 0; i < ps.size(); ++i) {
+                const size_t n = (size_t) ps[i].ne * H * 4;
+                NB_CK(cudaMemsetAsync(dout, 0xFF, a.size(), s));
+                launch(0, i);
+                NB_CK(cudaMemcpyAsync(a.data(), dout, n, cudaMemcpyDeviceToHost, s));
+                NB_CK(cudaMemsetAsync(dout, 0x00, a.size(), s));
+                launch(1, i);
+                NB_CK(cudaMemcpyAsync(b.data(), dout, n, cudaMemcpyDeviceToHost, s));
+                NB_CK(cudaStreamSynchronize(s));
+                diff += std::memcmp(a.data(), b.data(), n) != 0;
+            }
+            for (int ph = 0; ph < 2; ++ph) {
+                K::native_expert_set_mode(-1, ph);
+                std::vector<float> tm[2];
+                for (int arm = 0; arm < 2; ++arm)
+                    for (size_t i = 0; i < std::min<size_t>(ps.size(), 20); ++i) launch(arm, i);
+                for (int tr = 0; tr < trials; ++tr)
+                    for (int arm = 0; arm < 2; ++arm) {
+                        NB_CK(cudaEventRecord(e0, s));
+                        for (size_t i = 0; i < ps.size(); ++i) launch(arm, i);
+                        NB_CK(cudaEventRecord(e1, s));
+                        NB_CK(cudaEventSynchronize(e1));
+                        float ms = 0;
+                        NB_CK(cudaEventElapsedTime(&ms, e0, e1));
+                        tm[arm].push_back(1e3f * ms / (float) ps.size());
+                    }
+                for (int arm = 0; arm < 2; ++arm) {
+                    std::sort(tm[arm].begin(), tm[arm].end());
+                    us[ph][arm] = tm[arm][tm[arm].size() / 2];
+                }
+            }
+            K::native_expert_set_mode(-1, 0);
+            for (size_t i = 0; i < ps.size(); ++i) {
+                nb_free(dr[i]);
+                nb_free(dn[i]);
+            }
+            return diff;
+        };
+        if (hist_path.empty()) {
+            for (int tt : Ts) {
+                if (tt < 1 || tt > kTokMax) continue;
+                for (int share : shares) {
+                    std::vector<NbPlan> ps;
+                    double G = 0;
+                    for (int i = 0; i < plans; ++i) {
+                        ps.push_back(nb_route(rng, tt, share));
+                        G += ps.back().ng;
+                    }
+                    double us[2][2];
+                    const long long diff = bench(ps, tt, us);
+                    std::printf("  T=%d share %2d%% (G %.2f): step P %7.2f N %7.2f us x%.3f | gate/up+swiglu P %7.2f N %7.2f us x%.3f | %s\n",
+                                tt, share, G / plans, us[0][0], us[0][1], us[0][0] / us[0][1], us[1][0], us[1][1],
+                                us[1][0] / us[1][1], diff ? "DIFFERS" : "bitwise equal");
+                    if (diff) {
+                        std::printf("      %lld of %d plans differ\n", diff, plans);
+                        ++failures;
+                    }
+                }
+            }
+        } else {
+            const auto gi = hist.G.find(f.gu_type);
+            if (gi == hist.G.end()) {
+                std::printf("  --hist: no launches of %s recorded\n", nib::fmt_name(f.gu_type));
+            } else {
+                double wsum = 0, step[2] = { 0, 0 }, gu[2] = { 0, 0 };
+                for (const auto& tg : gi->second) {
+                    const int tt = tg.first;
+                    if (tt < 1 || tt > kTokMax) continue;
+                    double launches = 0, Gm = 0;
+                    std::vector<int> gs;
+                    std::vector<double> gw;
+                    for (const auto& kv : tg.second) {
+                        launches += kv.second;
+                        Gm += kv.first * kv.second;
+                        gs.push_back(kv.first);
+                        gw.push_back(kv.second);
+                    }
+                    if (launches <= 0) continue;
+                    std::discrete_distribution<int> pickG(gw.begin(), gw.end());
+                    const auto& nh = hist.N[f.gu_type][tt];
+                    std::vector<NbPlan> ps;
+                    for (int i = 0; i < plans; ++i) ps.push_back(nb_from_hist(rng, tt, std::max(1, gs[(size_t) pickG(rng)]), nh));
+                    double us[2][2];
+                    const long long diff = bench(ps, tt, us);
+                    std::printf("  hist t=%d: %.0f launches, mean G %.2f: step P %7.2f N %7.2f us x%.3f | gate/up+swiglu P %7.2f N %7.2f us x%.3f | %s\n",
+                                tt, launches, Gm / launches, us[0][0], us[0][1], us[0][0] / us[0][1], us[1][0], us[1][1],
+                                us[1][0] / us[1][1], diff ? "DIFFERS" : "bitwise equal");
+                    if (diff) ++failures;
+                    wsum += launches;
+                    for (int a = 0; a < 2; ++a) {
+                        step[a] += launches * us[0][a];
+                        gu[a] += launches * us[1][a];
+                    }
+                }
+                if (wsum > 0)
+                    std::printf("  hist, weighted by launches: step P %.2f N %.2f us x%.3f | gate/up+swiglu P %.2f N %.2f us x%.3f\n",
+                                step[0] / wsum, step[1] / wsum, step[0] / step[1], gu[0] / wsum, gu[1] / wsum, gu[0] / gu[1]);
+            }
+        }
+        cudaFree(raw);
+        cudaFree(slots);
+        cudaFree(dp);
+        cudaFree(dbad);
+    }
+    std::printf("native_expert_bench --nibble: %d failing\n", failures);
     return failures ? 1 : 0;
 }
