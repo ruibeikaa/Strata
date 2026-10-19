@@ -116,6 +116,15 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_test(NAME conversation_file_test COMMAND conversation_file_test)
 endif()
 
+# ==== BEGIN P1 part B, M2: pl_sched_test ===============================================================================
+# The pipelined decode loop's scheduler (src/program/pl_sched.*), a host state machine, against a symbolic GPU: the
+# 10-17 trace, random worlds, every small world with every ending, and the old pw-2 loop operation for operation.
+# CPU only (no CUDA); exits 0 when every check passes.
+add_executable(pl_sched_test src/program/pl_sched_test.cpp src/program/pl_sched.cpp)
+target_include_directories(pl_sched_test PRIVATE src/program)
+target_link_libraries(pl_sched_test PRIVATE strata_warnings)
+# ==== END P1 part B, M2: pl_sched_test =================================================================================
+
 if(STRATA_HIP_GFX906)
   if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
     set(CMAKE_HIP_ARCHITECTURES gfx906 CACHE STRING "HIP architectures" FORCE)
@@ -549,6 +558,44 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(strata src/program/generate.cpp)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+  # P1 part B, M3: the new pipelined decode loop's scheduler (pl_sched, host code; its test is pl_sched_test above)
+  target_sources(strata PRIVATE src/program/pl_sched.cpp)
+
+  # ==== BEGIN P1 part B, M1: mtp_chain_parity ==========================================================================
+  # The draft chain at up to 11 outputs (MtpDrafter::kChainMax) checked against the code it replaced:
+  # src/core/mtp.cpp and include/strata/core/mtp.hpp as they were at STRATA_MTP_PARITY_BASE, copied out of git into
+  # the build directory with the class renamed (MtpDrafterBase), so one process runs the old and the new chain on the
+  # same model files.  Built only on request (--target mtp_chain_parity); skipped when git or the commit is missing.
+  if(STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP)
+    set(STRATA_MTP_PARITY_BASE "daeed844" CACHE STRING "The commit mtp_chain_parity checks the draft chain against")
+    set(_mtp_base_dir "${CMAKE_CURRENT_BINARY_DIR}/mtp_parity_base")
+    set(_mtp_base_r1 1)
+    set(_mtp_base_r2 1)
+    find_package(Git QUIET)
+    if(GIT_FOUND)
+      execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${CMAKE_CURRENT_SOURCE_DIR}" show
+                              "${STRATA_MTP_PARITY_BASE}:src/core/mtp.cpp"
+                      OUTPUT_VARIABLE _mtp_base_cpp RESULT_VARIABLE _mtp_base_r1 ERROR_QUIET)
+      execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${CMAKE_CURRENT_SOURCE_DIR}" show
+                              "${STRATA_MTP_PARITY_BASE}:include/strata/core/mtp.hpp"
+                      OUTPUT_VARIABLE _mtp_base_hpp RESULT_VARIABLE _mtp_base_r2 ERROR_QUIET)
+    endif()
+    if(_mtp_base_r1 EQUAL 0 AND _mtp_base_r2 EQUAL 0)
+      string(REPLACE "#include \"strata/core/mtp.hpp\"" "#include \"mtp_base.hpp\"" _mtp_base_cpp "${_mtp_base_cpp}")
+      # written through configure_file so an unchanged copy keeps its timestamp (no rebuild on every configure)
+      file(WRITE "${_mtp_base_dir}/mtp_base.hpp.in" "${_mtp_base_hpp}")
+      file(WRITE "${_mtp_base_dir}/mtp_base.cpp.in"
+           "// generated: src/core/mtp.cpp at ${STRATA_MTP_PARITY_BASE}, class renamed\n#define MtpDrafter MtpDrafterBase\n${_mtp_base_cpp}")
+      configure_file("${_mtp_base_dir}/mtp_base.hpp.in" "${_mtp_base_dir}/mtp_base.hpp" COPYONLY)
+      configure_file("${_mtp_base_dir}/mtp_base.cpp.in" "${_mtp_base_dir}/mtp_base.cpp" COPYONLY)
+      add_executable(mtp_chain_parity EXCLUDE_FROM_ALL src/core/mtp_chain_parity.cpp "${_mtp_base_dir}/mtp_base.cpp")
+      target_include_directories(mtp_chain_parity PRIVATE "${_mtp_base_dir}" ${_strata_gpu_include_directories})
+      target_link_libraries(mtp_chain_parity PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+    else()
+      message(STATUS "mtp_chain_parity: not configured (git show ${STRATA_MTP_PARITY_BASE} failed)")
+    endif()
+  endif()
+  # ==== END P1 part B, M1: mtp_chain_parity ============================================================================
 
   if(STRATA_ENABLE_HIP)
     enable_testing()
