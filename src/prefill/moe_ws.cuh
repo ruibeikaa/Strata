@@ -36,12 +36,101 @@ __device__ __forceinline__ Chunk cta_work(const Chunk* __restrict__ chunks, int&
     return Chunk{c.x, c.y, c.z, c.w};
 }
 
+// ---- the gate/up products' shared pieces (moe_ws_gu_iq2.cu's IQ2_XS / IQ2_S kernels and moe_ws_gu_nib.cu's 4-bit
+// kernels): a CTA of kGuNT threads = kGuNT weight rows, K 128 values a step, the step's q8_1 rows in shared memory
+constexpr int kGuNT = 128;
+constexpr uint32_t PX = 0x002B1908u, PY = 0x00D5E7F8u;   // codes 0-2: +8 +25 +43 | codes 4-6: -8 -25 -43
+
+// the step's activations of IQ2_XS / IQ2_S and the 4-bit kernels: nt consecutive 144-B block_q8_1_mmq, d4 -> dy_s,
+// int8 -> int16 pairs
+template <int TPP>
+__device__ __forceinline__ void stage_act(const block_q8_1_mmq* __restrict__ xq, const int hc, const int total_rows,
+                                          const int trow0, const int nt, int (*act_s)[4][16], float (*dy_s)[4]) {
+    constexpr int NA = (TPP * 36 + kGuNT - 1) / kGuNT;
+    int av[NA];
+    const int* xr = (const int*) (xq + (size_t) hc * total_rows + trow0);
+#pragma unroll
+    for (int i = 0; i < NA; ++i) {
+        const int idx = threadIdx.x + i * kGuNT;
+        if (idx < nt * 36) av[i] = __ldg(xr + idx);
+    }
+#pragma unroll
+    for (int i = 0; i < NA; ++i) {
+        const int idx = threadIdx.x + i * kGuNT;
+        if (idx < nt * 36) {
+            const int t = idx / 36, wd = idx - t * 36;
+            if (wd < 4) {
+                dy_s[t][wd] = __int_as_float(av[i]);
+            } else {
+                const int m = wd - 4;
+                int lo, hi;
+                split2(av[i], lo, hi);
+                *(int2*) &act_s[t][m / 8][2 * (m % 8)] = make_int2(lo, hi);
+            }
+        }
+    }
+}
+
+// IQ2_XS / IQ2_S: sub-block s's 16 int16-pair words wv and scales d0 / d1 against the tokens (vec_dot_q8_0_16_q8_1's
+// epilogue).  CVT 0: four XMAD chains and I2F; 1: two chains seeded with kMagicI (exact for the 16-value sums,
+// |sum| <= 16 * 43 * 127 < 2^22)
+template <int TPP, int CVT, int TG>
+__device__ __forceinline__ void mac16(const int (&wv)[16], const float dx0, const float dx1, const int s,
+                                      const int (*act_s)[4][16], const float (*dy_s)[4], const int nt, float (&acc)[TPP]) {
+#pragma unroll
+    for (int t0 = 0; t0 < TPP; t0 += TG) {
+        if (t0 < nt) {
+#pragma unroll
+            for (int t = t0; t < t0 + TG; ++t) {
+                const int4* a4 = (const int4*) act_s[t][s];
+                const int4 a0 = a4[0], a1 = a4[1], a2 = a4[2], a3 = a4[3];
+                const float dy = dy_s[t][s];
+                float fa, fb;   // float(sum of values 0-15), float(sum of values 16-31): exact
+                if constexpr (CVT == 0) {
+                    int s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+                    s0 = mad2(wv[0], a0.x, s0); s1 = mad2(wv[1], a0.y, s1); s0 = mad2(wv[2], a0.z, s0); s1 = mad2(wv[3], a0.w, s1);
+                    s0 = mad2(wv[4], a1.x, s0); s1 = mad2(wv[5], a1.y, s1); s0 = mad2(wv[6], a1.z, s0); s1 = mad2(wv[7], a1.w, s1);
+                    s2 = mad2(wv[8], a2.x, s2); s3 = mad2(wv[9], a2.y, s3); s2 = mad2(wv[10], a2.z, s2); s3 = mad2(wv[11], a2.w, s3);
+                    s2 = mad2(wv[12], a3.x, s2); s3 = mad2(wv[13], a3.y, s3); s2 = mad2(wv[14], a3.z, s2); s3 = mad2(wv[15], a3.w, s3);
+                    fa = __int2float_rn(s0 + s1);
+                    fb = __int2float_rn(s2 + s3);
+                } else {
+                    int sa = kMagicI, sb = kMagicI;
+                    sa = mad2(wv[0], a0.x, sa); sb = mad2(wv[8], a2.x, sb);
+                    sa = mad2(wv[1], a0.y, sa); sb = mad2(wv[9], a2.y, sb);
+                    sa = mad2(wv[2], a0.z, sa); sb = mad2(wv[10], a2.z, sb);
+                    sa = mad2(wv[3], a0.w, sa); sb = mad2(wv[11], a2.w, sb);
+                    sa = mad2(wv[4], a1.x, sa); sb = mad2(wv[12], a3.x, sb);
+                    sa = mad2(wv[5], a1.y, sa); sb = mad2(wv[13], a3.y, sb);
+                    sa = mad2(wv[6], a1.z, sa); sb = mad2(wv[14], a3.z, sb);
+                    sa = mad2(wv[7], a1.w, sa); sb = mad2(wv[15], a3.w, sb);
+                    fa = __fsub_rn(__int_as_float(sa), kMagicF);
+                    fb = __fsub_rn(__int_as_float(sb), kMagicF);
+                }
+                float tf = __fmaf_rn(fa, dx0, 0.0f);
+                tf = __fmaf_rn(fb, dx1, tf);
+                acc[t] = __fmaf_rn(tf, dy, acc[t]);
+            }
+        }
+    }
+}
+
+// d0 / d1 = ((ls & 15 | ls >> 4) * d + d / 2) / 4 as production's SASS computes them
+__device__ __forceinline__ void scales16(const int ls, const int dbits, float& d0, float& d1) {
+    const float d = __half2float(__ushort_as_half((unsigned short) (dbits & 0xFFFF)));
+    const float dh = __fmul_rn(d, 0.5f);
+    d0 = __fmul_rn(__fmaf_rn(d, __int2float_rn(ls & 0x0F), dh), 0.25f);
+    d1 = __fmul_rn(__fmaf_rn(d, __int2float_rn(ls >> 4), dh), 0.25f);
+}
+
 // one launch of a layer's product, the variant picked by u (rows per routed expert); grid = nchunks x pieces
 void gu_iq2_xxs(const Layer& L, double u, cudaStream_t s);
 void gu_iq2_xs(const Layer& L, double u, cudaStream_t s);
 void gu_iq2_s(const Layer& L, double u, cudaStream_t s);
 void gu_iq3_xxs(const Layer& L, double u, cudaStream_t s);
 void gu_iq3_s(const Layer& L, double u, cudaStream_t s);
+// P1 part D (K1): a layer whose gate/up experts are 4-bit codes (Layer::gu_nib; IQ2_S, IQ3_XXS, IQ3_S; moe_ws_gu_nib.cu)
+void gu_nib(const Layer& L, double u, cudaStream_t s);
 void dn_q2_0(const Layer& L, double u, cudaStream_t s);
 void dn_iq4_nl(const Layer& L, double u, cudaStream_t s);
 

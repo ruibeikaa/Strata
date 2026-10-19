@@ -53,9 +53,14 @@ struct Layer {
     float* gu = nullptr;             ///< [rows][1280], the rows MMQ writes through identity ids
     const void* hq = nullptr;        ///< H's q8_1 rows: ONE mmq::swiglu_quant over all `rows` rows of gu
     float* dm = nullptr;             ///< [rows][2560]
+    /// P1 part D (K1), STRATA_EXPERT_NIBBLE=1: the gate/up experts are 4-bit codes in their slots
+    /// (strata/core/expert_nibble.hpp's layout; down_off = its kDownOff), read by moe_ws_gu_nib.cu's kernels - the
+    /// production WS kernels' GU rows, bit for bit.  false: the GGUF blocks, as before.
+    bool gu_nib = false;
 };
 /// The layer's gate/up into gu, one launch; false (nothing launched) where the per-group MMQ is to run instead (mode 2,
-/// or not faster at this u) - the same GU rows either way.
+/// or not faster at this u) - the same GU rows either way.  A gu_nib layer has no per-group MMQ (the caller stops on
+/// false).
 bool gate_up(const Layer& L, void* stream);
 /// The layer's down from hq into dm, one launch.
 void down(const Layer& L, void* stream);

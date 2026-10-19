@@ -1,5 +1,5 @@
 // src/prefill/moe_ws.cu - see include/strata/prefill/moe_ws.hpp: which layers and products take the weight-stationary
-// kernels (moe_ws_gu_iq2.cu, moe_ws_gu_iq3.cu, moe_ws_down.cu), their work tables and launches.
+// kernels (moe_ws_gu_iq2.cu, moe_ws_gu_iq3.cu, moe_ws_gu_nib.cu, moe_ws_down.cu), their work tables and launches.
 #include "common.cuh"
 #include "mmq.cuh"
 
@@ -100,6 +100,10 @@ bool gate_up(const Layer& L, void* stream) {
     const double u = (double) L.rows / L.n;
     if (mode() != 1 || !faster(L.gu_type, u)) return false;
     const cudaStream_t s = (cudaStream_t) stream;
+    if (L.gu_nib) {   // P1 part D (K1): the 4-bit slots' kernels (moe_ws_gu_nib.cu), the same GU rows
+        detail::gu_nib(L, u, s);
+        return true;
+    }
     switch (L.gu_type) {
         case GGML_TYPE_IQ2_XXS: detail::gu_iq2_xxs(L, u, s); break;
         case GGML_TYPE_IQ2_XS: detail::gu_iq2_xs(L, u, s); break;

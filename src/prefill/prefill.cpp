@@ -33,6 +33,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/moe_ws.hpp"
 #include "strata/core/peer_experts.hpp"
+#include "strata/core/expert_nibble.hpp"
 #include "strata/prefill/kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -2989,6 +2990,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
                     const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
                     const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
+                    // P1 part D (K1), STRATA_EXPERT_NIBBLE=1: a layer whose gate/up experts are 4-bit codes in their
+                    // slots is read by the WS kernels only (ws::Layer::gu_nib); every other expert path below reads
+                    // GGUF blocks, so it stops there instead (expert_nibble.hpp's fatal: never a wrong answer)
+                    const core::nibble::LayerVram& nib_l = core::nibble::layer(l);
                     // --peer-device: MMQ only, whether or not the peer took the prompt path (set_peer can decline), as
                     // fused_ring() sized the ring and the buffers for it
                     const bool no_peer = !core::peer_portable();
@@ -3020,6 +3025,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     bool cpu_arm = true;                  // auto: this layer may share (false: the arm without)
                     int cpu_set = -1;                     // auto: the wall events' set, -1 when not measured
                     bool cpu_cold = false;                // auto: one-time costs in the window (no reading)
+                    if (fused_l && nib_l.on) core::nibble::fatal(l, "the prompt path's fused int8 experts", "they read GGUF blocks");
                     if (fused_l) {
                         if (static bool said = false; !said) {
                             said = true;
@@ -3416,7 +3422,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                            (!stream_all || seq_start[(size_t) l] == seq_start[(size_t) l + 1]) &&
                                            swiglu_quant_on() && mmq::swiglu_quant_ok(mmq_dt) && ws::supported(mmq_gt, mmq_dt) &&
                                            ws::faster(mmq_dt, (double) rows_local / (double) n) && m.ws_chunks != nullptr &&
-                                           ((uint64_t) (uintptr_t) ip_base | at | lay.fmt[(size_t) l].down_off) % ws::kAlign == 0;
+                                           ((uint64_t) (uintptr_t) ip_base | at |
+                                            (nib_l.on ? nib_l.down_off : lay.fmt[(size_t) l].down_off)) % ws::kAlign == 0;
                                 if (ws_layer) {
                                     static bool said_ws = false;
                                     if (!said_ws) {
@@ -3439,13 +3446,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     else
                                         cudaMemcpyAsync(m.ws_chunks, ch, (size_t) wl.nchunks * sizeof(ws::Chunk), cudaMemcpyHostToDevice, m.cs);
                                     wl.gu_type = mmq_gt; wl.d_type = mmq_dt; wl.w = ip_base; wl.xoff = m.xoff_dev;
-                                    wl.down_off = (int64_t) lay.fmt[(size_t) l].down_off; wl.chunks = m.ws_chunks;
+                                    wl.down_off = (int64_t) (nib_l.on ? nib_l.down_off : lay.fmt[(size_t) l].down_off);
+                                    wl.chunks = m.ws_chunks; wl.gu_nib = nib_l.on;
                                     wl.rows = T * K; wl.n = (int) n; wl.xq = m.Xq; wl.gu = m.GU; wl.hq = m.Hq; wl.dm = m.Dm;
                                 }
                             }
                         } else {
                             gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
                         }
+                        if (nib_l.on && !ws_layer)
+                            core::nibble::fatal(l, "the prompt path",
+                                                !use_mmq    ? "no MMQ for the layer (the FP16 path dequantizes GGUF blocks)"
+                                                : !ip_layer ? "its experts are not read in place (MMQ gathers GGUF blocks)"
+                                                            : "not weight-stationary (an expert not resident on this GPU alone, the "
+                                                              "fused layout, or STRATA_MMQ_WS / swiglu_quant off): the per-group "
+                                                              "MMQ reads GGUF blocks");
                         // multi-GPU: the peer's share, enqueued before the primary's own experts so both cards work at once
                         peer_now = use_mmq && !order_peer.empty();
                         if (peer_now) {
@@ -3791,6 +3806,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         int gg_nslots = 0;   // ring slots gathered by the next flush
                         auto flush = [&]() {
                             if (gg.n <= gg.first) return;
+                            if (nib_l.on) core::nibble::fatal(l, "the prompt path's group gather", "it copies GGUF blocks");
                             const auto& f = lay.fmt[(size_t) l];
                             if (gg_nslots > 0) {   // the copies land in order: the last one covers the others
                                 pt.mark(kPfWaitCopy, cs);
@@ -3816,6 +3832,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // one expert's products from its blob on the device; `slot` (a ring slot, or -1 for a resident
                         // expert) is released once the blob is read
                         auto compute = [&](size_t j, const uint8_t* blob_dev, int slot) -> bool {
+                            if (nib_l.on)
+                                core::nibble::fatal(l, "the prompt path's per-expert products",
+                                                    use_mmq ? "the per-group MMQ (in place or gathered) reads GGUF blocks"
+                                                            : "the FP16 path dequantizes GGUF blocks");
                             const int32_t e = order[j];
                             pt.mark(kPfDequant, cs);
                             if (use_mmq) {
@@ -3899,6 +3919,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             stats_.experts_resident += (int64_t) order.size();
                             pt.mark(kPfGemmGU, cs);
                             if (!ws::gate_up(wl, m.cs)) {
+                                if (wl.gu_nib)
+                                    core::nibble::fatal(l, "ws::gate_up", "declined (STRATA_MMQ_WS=2, or not faster at this u): "
+                                                                          "the per-group in-place MMQ reads GGUF blocks");
                                 const size_t n = order.size();
                                 for (size_t j0 = 0; j0 < n; j0 += MMQ_GROUP) {
                                     const size_t j1 = std::min(n, j0 + MMQ_GROUP);
