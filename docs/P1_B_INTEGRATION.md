@@ -1,7 +1,12 @@
 # 部分 B：M1–M4 联调（深度 2：N2 / B0）—— 2026-10-19
 
 工作树 `builds\strata-p1b`（分支 `p1-b`，HEAD `b227571e` = daeed844 + M1 `11ec28f7` + M2 `caf0612b` + M3a `b227571e`）。
-- 引擎代码这一轮**一行没改**：联调里查出来的两处不一致都在 M4 的 Python 工具里，已修。
+
+> **修复轮（第 7 节，同日晚）**：两份复核（`B-review-identity.md`、`B-review-engineering.md`）的 5 条 major 已全部改完，
+> p1-b 上新增 3 个代码提交（M1 `7efe310d`、M2 `cda5afcb`、M3 `5671ad9f`），M4 工具同步改了。**第 4 节的 G2 判据按第 7.4
+> 节读**：状态摘要只在同一个 `end` 时比较，每臂多 3 个请求（含停放后续写）。被测 exe 换成修复轮的产物（sha256 前 16 位
+> `83bcd8d38ca73e69`）。下面第 0–6 节保留联调当时的原文。
+- 引擎代码这一轮**一行没改**：联调里查出来的两处不一致都在 M4 的 Python 工具里，已修。（修复轮改了引擎，见第 7 节。）
 - GPU 只用了板 B 的 die 4（19:00）和 die 5（1A:00），用之前 `nvidia-smi --query-compute-apps` 查过，两颗都空着，没有等。
 - 路由一个没碰。生产文件（`engine-sm60`、`scripts\`、`runtime-state`）没碰。
 
@@ -194,4 +199,85 @@ python -I F:\AI-Speed-Optimization\analysis\2026-10-19-p1-stack\B-test\ab_d3.py 
   - `d3lib.py.orig`。
 - `B-test\d3lib.py`：已修改（第 3 节）。
 - `B-test\compare_timing.py`：新增。
-- 提交：`p1-b` 上一个提交，只加本文件的副本 `docs/P1_B_INTEGRATION.md`。引擎代码没有改动可提交；M4 工具不在引擎树里。
+- 提交：`p1-b` 上的 `42a0734a`，只加本文件的副本 `docs/P1_B_INTEGRATION.md`（提交时的版本，不含这个哈希）。引擎代码没有改动可提交；M4 工具不在引擎树里。
+
+## 7. 修复轮（Fix pass）—— 2026-10-19 晚
+
+依据：`B-review-identity.md` 第 2.1、2.2 节，`B-review-engineering.md` 第 1、2、3 节。五条 major 全部处理。
+
+- GPU 只用了板 B 的 die 4（19:00）和 die 5（1A:00），跑之前 `nvidia-smi --query-compute-apps` 查过：只有 01:00、02:00（3090 Ti）上有别的进程，两颗都空着，没有等。
+- 路由一个没碰；生产文件（`engine-sm60`、`scripts\`、`runtime-state`）没碰。
+- 旧的 pw-2 循环仍然逐字节不变（第 7.3 节）。不设新开关时的行为也不变：改动全在新循环、槽位池（pl_ns > 2）和 DEBUG 开关后面。
+
+### 7.0 结论
+
+| # | 复核意见 | 改在哪 | 结果 |
+|---|---|---|---|
+| 1 | 状态比较不看 `end`：被 max_new 截断的最后一个窗口提交自己的 a+1，S 臂和流水线各臂切窗不同，`end` 不同时四个哈希必然不同，P、N2、B0 对 S 会大量误报 "!"（identity 2.1、engineering 1） | M4：`d3lib.py`、`ab_d3.py`、`stress_d3.py` | `RE_STATE` 取 `end`、`loop`；只在同一个 `end` 时比较，不同 `end` 记 "~"（不可比），单独计数；N2、B0 对 P 比，P 对 S 比；硬条件改成"可比的全部相同，且每臂可比的 ≥ `--min-state`（默认 3）"；加了一个以 EOS 结尾的请求和一次停放后续写。合成数据核对 PASS |
+| 2 | `chain_n` 语义不一致：引擎的 `chain_n()` 是"已排进的输出数"，调度器当成钳位后的 n_out，开了 `chain_stop` 的 mode B 会卡死；mock 按另一种语义，测不出（identity 2.2） | M1：`MtpDrafter::chain_cap()`；M2：`PlIo::chain_cap()`、`launch_chain`、`chain_round`、mock | 调度器发链后读 `chain_cap()`，链结束（r == 1）时用 `chain_n()` 重新取实际排了多少。mock 改成引擎语义：**把调度器临时改回旧读法，(c) 穷举 mode B 有 42,698 / 57,600 个世界报 deadlock；改回后 0**。全量 PASS |
+| 3 | 额外槽的图在第一个流水线请求时才捕获，失败就 `return 1`；shrink 之后预留不退回、也不说（engineering 2） | M3：`pl_prepare`、`pl_pool_shrink` | 先捕获槽 0、1（失败照旧报错），再捕获槽 ≥ 2；失败就释放这些槽的验证器、hand-off、快照，池子退回 2 个槽，说一次原因。shrink 时打一行"CUDA0 / 其他段各有多少 MiB 白留到重启"。新加 DEBUG 测试开关 `STRATA_PIPELINE_POOL_FAIL=capture` |
+| 4 | 选模式只看 `pl_ns < 3`，不按深度；`begin` 失败就 `die` 退出整个 serve（engineering 3） | M2：`Sched::check`；M3：选模式、新循环入口 | 按深度选：B 要 4 个槽，B0 要 3 个，N2 要 2 个，不够就用旧循环并说一次原因。调度器配置在排任何操作之前先过 `Sched::check`，过不了就说一次原因、这个请求走旧循环 |
+| 5 | `die` 之前不打调度器状态（engineering 3 后半） | M2：`Sched::dump`；M3：`die` | 新循环出错时先打一行调度器状态：mode、ns、end、nwin、ndoom、撤销（seq、slot、keep、pending）、每个窗口和 doomed 的 seq/uid/slot/T/p/fr/fl/com、held、链的状态、各槽 owner（`*` = 源已发链）。新循环结束和池子 shrink 时，看门狗表的槽 2..4 清空（engineering 5 的 minor 顺手做了） |
+
+### 7.1 引擎提交（p1-b，一个模块一个，没有署名行）
+
+| 提交 | 模块 | 文件 | 内容 |
+|---|---|---|---|
+| `7efe310d` | M1 | `mtp.hpp`、`mtp_chain_parity.cpp` | `chain_cap()` 访问器（= n_out 钳位后，`chain_extend` 的上限）；`chain_n()` 的注释写明"到现在为止排进的数"。对拍程序在开着的链发出时核对 `chain_cap() == 11`、`chain_n() == min(nq, 11)`，在上下文边核对两者都等于钳位后的数 |
+| `cda5afcb` | M2 | `pl_sched.hpp/.cpp`、`pl_sched_test.cpp` | `PlIo::chain_cap()`；`launch_chain` 用它定 `ch_.n`；`chain_round` 在 r == 1 时取 `min(ch_.n, io.chain_n())`。`Sched::check(Config)`（`begin` 先调它，错误信息带模式要几个槽、有几个）；`Sched::dump()`。mock：`chain_cap()` 返回钳位后的 n，`chain_n()` 按 `Timing::chain_n_engine` 返回"已排进的数"（默认，引擎语义）或旧读法；随机世界里 1/4 用旧读法（由种子另算，不动原来的随机流，所以世界和联调时相同） |
+| `5671ad9f` | M3 | `generate.cpp` | `f_chain_cap`；选模式按深度；调度器配置挪到新循环入口之前、`Sched::check` 不过就置 `pl_want` 走旧循环（`pl_want` 去掉 `const`，旧循环那一块没动）；`CHECK_STATE` 的 `loop` 标签按实际跑的循环（`pl_go`）；`pl_prepare` 分两段捕获、槽 ≥ 2 失败就 shrink；额外快照的释放抽成 `pl_snaps_drop_x`（启动时的失败路径也用它）；`pl_pool_shrink` 打白留的 MiB、清看门狗表、stage 0 的验证器在自己的设备上释放；`die` 打 `Sched::dump()` |
+
+- 每请求的退回路径（都只说一次）：
+  - 启动时池子就小：`--pipeline-windows 3` 但 NS < 4 → "depth 3 needs 4 slots …; today's loop"（M3b 删掉 B→B0 降级之后才会走到；现在 pw 3 仍按 B0 跑）；B0 但 NS < 3 → "the per-stage undo needs 3 slots …"。
+  - 第一次 `pl_prepare` 时额外槽捕获失败：启动后的第一个流水线请求打 "the slot pool stays at two slots: slot q's graphs on stage s: …" 和 "N MiB of CUDA0 and M MiB of every later stage's card stay kept out of the expert caches for the k slots it does not hold (until a restart)"。这个请求打 "the new pipelined loop cannot run this request (pl_sched: slots out of range (mode B0 needs 3, has 2)); today's loop"，之后的请求打 "the per-stage undo needs 3 slots …"。都按旧循环跑，回复不变。
+- 白留的显存（池子从 NS 退到 2 时）：CUDA0 = 160 × (NS − 2) MiB + (NS − 2) 份 GDN 快照；其他每颗 die = 160 × (NS − 2) MiB。B0（NS 3）约 188 / 160 MiB，B（NS 4）约 376 / 320 MiB。
+
+### 7.2 M4 工具（不在引擎树里，`B-test\` 下原地改，改前的副本在 `B-FIX-work\*.orig`）
+
+- `d3lib.py`：
+  - `RE_STATE` 加可选的 `end (-?\d+) loop (\S+)`（旧引擎不打也能解析）。
+  - `state_digest` 对 (st, gdn, kv, idx, ple, end) 求摘要，**不含 `loop`**（各臂的循环名本来就不同）。
+  - 新增 `state_end`、`state_loop`、`state_cmp(r, ref)`：`=` 同 end 相同，`!` 同 end 不同，`~` end 不同（不可比），空 = 没得比。
+  - 道理：同一个 `end` 时两臂提交的 token 序列一样（都是串行的输出的前缀），掩码下的状态必须逐位相同；`end` 不同就什么也说明不了。
+- `ab_d3.py`：
+  - 每个请求记 `state_end`、`state_loop`。
+  - 比较对象：N2、B0、X（以及 B0F）对 P（窗口逻辑相同，`end` 多半相同）；P 对 S；新循环各臂另外对 S 在同 `end` 时再比一次。`!` 列出请求名、臂、`end`。
+  - summary 每臂一行：相同 / 不同 / 不可比的条数。G2、G3 的状态判据改成"同 end 的全部相同，且每臂可比的 ≥ `--min-state`（默认 3）"；可比的不够时写 "too few comparable requests"，不当成失败也不打勾。
+  - 六条短请求之后加 3 个请求：
+    - `eos_zh`："只回答一个字：好。"，512 token，以 EOS 结束，各臂提交的 token 数一样，状态能和 S 比；
+    - `park_other`：另一段会话（`eos_zh` 那段被停放）；
+    - `cont_eos_zh`：回到 `eos_zh` 那段会话（助手轮用 S 臂的回复），续写 300 token。它的回复哈希依赖 `eos_zh` 解码留下的状态，这就是设计第 9 节第 5 步的"停放 → 恢复 → 续写"，提前放进 G2。看它 serve 行的 `reused`：如果只复用到第一轮提示，说明会话缓存没带上解码后的状态，这一条就退化成普通的回复比对。
+  - 新的可选臂 `B0F`（只在 `--arms` 里点名时跑）：B0 + `STRATA_PIPELINE_POOL_FAIL=capture`。热身后记录有没有 "slot pool stays at two slots"、白留 MiB 那一行、退回旧循环的那一行；不应有第四行 timing；回复要 = S，状态对 P 比。
+- `stress_d3.py`：每个请求记 `state_end`；状态先和 S 比，`end` 不同就和本 case 里第一个同 `end` 的配置比，都没有就记 `~`。summary 报"同 end 比了多少、不可比多少"，只有同 end 不同才算失败。
+- `d3route.py`：`PIPE_KEYS` 加 `STRATA_PIPELINE_POOL_FAIL`，换臂时清掉，不会漏进下一臂。
+
+### 7.3 复跑的测试
+
+| 测试 | 结果 | 输出 |
+|---|---|---|
+| 构建 `strata pl_sched_test mtp_chain_parity` | `BUILD_OK`。`generate.cpp` 新增行只有全树都有的 C4996；`pl_sched*.cpp` 在 `/W4` 下 0 警告。`strata.exe` sha256 前 16 位 **`83bcd8d38ca73e69`**，`--help` 能跑 | `B-FIX-build.log` |
+| `pl_sched_test` 全量 | **PASS，0 失败**，425 s（和对拍同时跑）。输出除了耗时，和联调那次（`B-INT-work\pl_sched_test_full_out.txt`）**逐字相同**：调度器在引擎语义下的行为和原来在旧 mock 下一样。(d) N2 对旧循环 802,830 个世界逐行相同 | `B-FIX-work\pl_sched_test_full_out.txt` |
+| `pl_sched_test --quick` | PASS，20.6 s | `B-FIX-work\pl_sched_test_quick_out.txt` |
+| mock 能不能抓到旧问题 | 把 `launch_chain` 临时改回 `ch_.n = io.chain_n()`：`--quick --only c` 里 mode B **42,698 / 57,600 FAIL**，第一条是 "deadlock: the loop waits and nothing can happen on the GPU"；N2、B0 不受影响。改回后重编、全量 PASS | `B-FIX-work\pl_sched_test_oldread_c_out.txt` |
+| `mtp_chain_parity`（板 B） | die 4 种子 1 × 300 轮、die 5 种子 7 × 400 轮都 **PASS**，七项计数和联调时完全相同，新加的 `chain_cap` 检查都过 | `B-FIX-work\parity_seed1_d4.log`、`parity_seed7_d5.log` |
+| 旧 pw-2 循环逐字节 | daeed844 第 10482–11113 行（41,376 字节）在新文件里出现 **1 次**，没有 diff 操作落在里面 | `B-FIX-work\check_oldloop_out.txt` |
+| 解析器对引擎格式 | `check_parsers.py` PASS（状态行带 `end 812 loop B0`） | `B-FIX-work\check_parsers_out.txt` |
+| 状态比较工具 | `B-FIX-work\check_state_tools.py`（新）：从 `generate.cpp` 的格式串重建状态行；`end`/`loop` 解析、摘要不含 `loop`、`~`/`!`/`=` 三种结果；合成的 G2 运行（S 在 7/11 个请求上 `end` 不同）不再误报、状态判据打勾；同 end 改一个 GDN 哈希就报 "different: code_en: B0 vs P"、判据不打勾；`stress_d3` 合成矩阵不同 end 不算失败。14 项全 PASS | `B-FIX-work\check_state_tools_out.txt` |
+| 回归 | `trace_d3.py` 跑 10-17 trace（带 `--log`），输出和 `B-test\trace_d3_1017_out.txt` 逐字相同 | `B-FIX-work\trace_d3_1017_recheck.txt` |
+
+- 真机冒烟：仍然没有。单颗 die 装不下模型；两条退回路径（池子 shrink、按深度选模式）只能在 8190 上看（第 7.4 节的 `B0F` 臂）。
+
+### 7.4 对第 4 节命令的影响
+
+- 命令不变。每臂多 3 个请求，约多 1–2 分钟。
+- G2 判据改为：
+  - 回复哈希 S = P = N2 = B0 = P0，**11/11**（8 条原请求 + `eos_zh` + `park_other` + `cont_eos_zh`）；mtp-v2 参考哈希只有原来 8 条有。
+  - 状态：N2、B0 对 P，P 对 S，同 `end` 的全部相同，每臂可比的 ≥ 3。表里 `~` 是"end 不同、不可比"，不是失败。
+  - 其余（N2 ±1%、B0 ≥ +1.0%、F 降 ≥ 0.7 ms、`restage` ≤ 5%）不变。
+- 可选：加 `--arms S,P,B0F` 单跑一次退回路径（约 15 分钟）。看 `results.jsonl` 里 B0F 热身那一行的 `pool_fallback`、`reserved_note`、`fallback_note` 都是 true，回复哈希 = S。
+
+### 7.5 给 M3b 的（这一轮之后还剩的）
+
+- M3a 第 8 节第 1 条（`chain_cap`）已做；第 2 条 `set_chain_max(11)`（identity 2.3）、第 3 条删 B→B0 降级、读 `STRATA_MTP_CHAIN_STOP`/`CHAIN_MAX` 仍待 M3b。删降级后，pw 3 但 NS < 4 的引擎会走"depth 3 needs 4 slots"那条退回，而不是退出。
+- 调度器其他不变量断言失败仍然 `die`（现在会先打 `Sched::dump()`）。engineering 第 4 节的池子退回测试钩子只做了 `capture` 一种；`init`、`snap` 两种和 io 错误注入（engineering 6.2）留给 M3b。
+- engineering 的 minor 没在这一轮做：`stage_room` 后段的快照预留、验证器登记 16 个的提示、`static_assert`、`pl_sched_test` 的 CMake 位置、`CHECK_STATE` 的逐格拷贝慢。
