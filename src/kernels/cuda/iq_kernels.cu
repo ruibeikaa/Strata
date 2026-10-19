@@ -3691,4 +3691,29 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     check("native_expert_grouped/down");
 }
 
+// ---------------------------------------------------------------- P1 gate G1b: the gate/up launch shapes
+// STRATA_GU_SHAPE_HIST (verify.cpp): one warp before a layer's VRAM gate/up launch reads the plan that launch reads
+// (counts[0] = G expert groups, start[0..G] their entry ranges, counts[2] = the PCIe share's groups) and counts into
+// `rec` = [g_bins: launches by G][n_bins: groups by entries n][1: PCIe groups].  It reads the plan and writes only
+// `rec`, so the window's arithmetic is untouched.
+namespace {
+__global__ void gu_shape_hist_kernel(const int32_t* __restrict__ counts, const int32_t* __restrict__ start,
+                                     uint32_t* __restrict__ rec, int g_bins, int n_bins) {
+    const int G = min(max(counts[0], 0), 1024);
+    if (threadIdx.x == 0) {
+        atomicAdd(rec + min(G, g_bins - 1), 1u);
+        atomicAdd(rec + g_bins + n_bins, (uint32_t) max(counts[2], 0));
+    }
+    for (int i = threadIdx.x; i < G; i += blockDim.x) {
+        const int n = start[i + 1] - start[i];
+        atomicAdd(rec + g_bins + min(max(n, 0), n_bins - 1), 1u);
+    }
+}
+}  // namespace
+
+void gu_shape_hist(const int32_t* counts, const int32_t* start, uint32_t* rec, int g_bins, int n_bins, void* stream) {
+    gu_shape_hist_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(counts, start, rec, g_bins, n_bins);
+    check("gu_shape_hist");
+}
+
 }  // namespace strata::kernels

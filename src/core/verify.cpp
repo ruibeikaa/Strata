@@ -45,6 +45,7 @@
 #include <algorithm>
 #include <atomic>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -55,6 +56,12 @@
 #include <cstring>
 #include <exception>
 #include <immintrin.h>
+
+namespace strata::kernels {
+// iq_kernels.cu, P1 gate G1b (STRATA_GU_SHAPE_HIST below): declared here rather than in iq_kernels.hpp, so the
+// switch stays inside the two files it lives in
+void gu_shape_hist(const int32_t* counts, const int32_t* start, uint32_t* rec, int g_bins, int n_bins, void* stream);
+}  // namespace strata::kernels
 
 namespace strata::core {
 namespace {
@@ -268,6 +275,130 @@ const int64_t g_test_stall = [] {
     const char* e = std::getenv("STRATA_TEST_VERIFY_STALL");
     return e != nullptr ? (int64_t) std::atoll(e) : (int64_t) 0;
 }();
+
+// P1 gate G1b - STRATA_GU_SHAPE_HIST=<path> (read-only, off by default): the shapes of the decode gate/up launches.
+// Before every layer's VRAM gate/up launch the verify graph runs one warp (gu_shape_hist, iq_kernels.cu) that reads
+// the device plan that launch reads (counts, start) and counts, per (layer, window T, the launch's tokens t):
+// launches by their expert groups G, groups by their entries n, and the PCIe share's groups.  Guessed windows count
+// too (their launches run whether or not the tokens are kept).  The counters live on the device, cumulative; every
+// wait_commit at the end of a chain (the end of a request, its start, and the end of a prompt read through verify
+// windows, labelled "prompt") appends what each idle verifier added since its last record to <path>, as does a
+// verifier going away.  Nothing a window computes is read or written
+// besides the plan (read) and the counters, so replies stay bit-identical; the extra launch per layer makes the
+// run unfit for timing.  Unset: no buffer, no launch, no record - the graphs are the ones without the switch.
+constexpr int kGuT = strata::kernels::kVerifyMaxT + 1;        // window tokens T and a launch's tokens t: 0..8
+constexpr int kGuG = strata::kernels::kVerifyMaxT * 10 + 1;   // expert groups G: 0..80 (the last bin: 80 and up)
+constexpr int kGuN = strata::kernels::kVerifyMaxT + 1;        // entries per group n: 0..8 (the last bin: 8 and up)
+constexpr int kGuRec = kGuG + kGuN + 1;                       // [G bins][n bins][PCIe groups]
+const char* gu_hist_path() {
+    static const char* const p = [] {
+        const char* v = std::getenv("STRATA_GU_SHAPE_HIST");
+        return (v != nullptr && v[0] != '\0') ? v : (const char*) nullptr;
+    }();
+    return p;
+}
+size_t gu_hist_words(int64_t n_layers) { return (size_t) n_layers * kGuT * kGuT * kGuRec; }
+struct GuHist {
+    const void* who = nullptr;
+    int device = -1;
+    const cudaStream_t* stream = nullptr;   // the verifier's cs_ (its windows' stream)
+    uint32_t* d = nullptr;                  // device counters, cumulative
+    std::vector<uint32_t> last;             // the counters at the last record
+    int64_t lb = 0, le = 0, n_layers = 0;
+};
+// never destroyed: a verifier that outlives this file's statics still finds them
+std::mutex& g_gu_mu = *new std::mutex;
+std::vector<GuHist>& g_gu = *new std::vector<GuHist>;
+uint64_t g_gu_seq = 0;
+// one verifier's counters since its last record, appended to the file (g_gu_mu held).  A verifier whose stream
+// still runs is left for the next record: the copy waits on the stream, and a window may spin on the host.
+void gu_hist_record(GuHist& h, uint64_t seq, const char* why) {
+    const OnDevice on_device(h.device);
+    const cudaStream_t s = h.stream != nullptr ? *h.stream : nullptr;
+    if (s == nullptr || h.d == nullptr) return;
+    if (cudaStreamQuery(s) != cudaSuccess) { (void) cudaGetLastError(); return; }
+    const size_t n = gu_hist_words(h.n_layers);
+    std::vector<uint32_t> c(n);
+    if (cudaMemcpyAsync(c.data(), h.d, n * sizeof(uint32_t), cudaMemcpyDeviceToHost, s) != cudaSuccess ||
+        cudaStreamSynchronize(s) != cudaSuccess) {
+        (void) cudaGetLastError();
+        std::fprintf(stderr, "strata verify: STRATA_GU_SHAPE_HIST: the counters' copy failed (device %d)\n", h.device);
+        return;
+    }
+    if (h.last.size() != n) h.last.assign(n, 0u);
+    bool any = false;
+    for (size_t i = 0; i < n && !any; ++i) any = c[i] != h.last[i];
+    if (!any) return;
+    std::FILE* f = std::fopen(gu_hist_path(), "ab");
+    if (f == nullptr) {   // the counters stay where they are: the next record carries them
+        std::fprintf(stderr, "strata verify: STRATA_GU_SHAPE_HIST: cannot open %s\n", gu_hist_path());
+        return;
+    }
+    const long long unix_s = (long long) std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch()).count();
+    std::fprintf(f, "# gu-shape-hist v1 seq %llu why %s unix %lld device %d layers %lld %lld verifier %p\n",
+                 (unsigned long long) seq, why, unix_s, h.device, (long long) h.lb, (long long) h.le, h.who);
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    for (int64_t l = h.lb; l < h.le; ++l) {
+        if (lay.native && (size_t) l < lay.fmt.size())
+            std::fprintf(f, "F %lld %d %d\n", (long long) l, lay.fmt[(size_t) l].gu_type, lay.fmt[(size_t) l].d_type);
+        for (int T = 0; T < kGuT; ++T)
+            for (int t = 0; t < kGuT; ++t) {
+                const size_t b = (((size_t) l * kGuT + T) * kGuT + t) * kGuRec;
+                for (int k = 0; k < kGuRec; ++k) {
+                    const uint32_t dv = c[b + k] - h.last[b + k];   // cumulative counters: the difference wraps right
+                    if (dv == 0) continue;
+                    if (k < kGuG) std::fprintf(f, "G %lld %d %d %d %u\n", (long long) l, T, t, k, dv);
+                    else if (k < kGuG + kGuN) std::fprintf(f, "N %lld %d %d %d %u\n", (long long) l, T, t, k - kGuG, dv);
+                    else std::fprintf(f, "P %lld %d %d %u\n", (long long) l, T, t, dv);
+                }
+            }
+    }
+    std::fclose(f);
+    h.last.swap(c);
+}
+void gu_hist_record_all(const char* why) {
+    const std::lock_guard<std::mutex> lock(g_gu_mu);
+    const uint64_t seq = ++g_gu_seq;
+    for (GuHist& h : g_gu) gu_hist_record(h, seq, why);
+}
+bool gu_hist_register(const void* who, int device, const cudaStream_t* stream, int64_t lb, int64_t le, int64_t n_layers) {
+    const std::lock_guard<std::mutex> lock(g_gu_mu);
+    for (const GuHist& h : g_gu)
+        if (h.who == who) return true;
+    GuHist h;
+    h.who = who; h.device = device; h.stream = stream; h.lb = lb; h.le = le; h.n_layers = n_layers;
+    const size_t bytes = gu_hist_words(n_layers) * sizeof(uint32_t);
+    if (cudaMalloc((void**) &h.d, bytes) != cudaSuccess || cudaMemset(h.d, 0, bytes) != cudaSuccess) {
+        (void) cudaGetLastError();
+        if (h.d != nullptr) cudaFree(h.d);
+        return false;
+    }
+    std::fprintf(stderr, "strata verify: STRATA_GU_SHAPE_HIST: layers [%lld, %lld) on device %d count their gate/up "
+                         "launch shapes into %s (read-only; not a timing run)\n",
+                 (long long) lb, (long long) le, device, gu_hist_path());
+    g_gu.push_back(std::move(h));
+    return true;
+}
+uint32_t* gu_hist_dev(const void* who) {
+    const std::lock_guard<std::mutex> lock(g_gu_mu);
+    for (const GuHist& h : g_gu)
+        if (h.who == who) return h.d;
+    return nullptr;
+}
+void gu_hist_drop(const void* who) {   // the verifier's last record, then its counters go
+    const std::lock_guard<std::mutex> lock(g_gu_mu);
+    for (size_t i = 0; i < g_gu.size(); ++i) {
+        if (g_gu[i].who != who) continue;
+        gu_hist_record(g_gu[i], ++g_gu_seq, "exit");
+        {
+            const OnDevice on_device(g_gu[i].device);
+            cudaFree(g_gu[i].d);
+        }
+        g_gu.erase(g_gu.begin() + (std::ptrdiff_t) i);
+        return;
+    }
+}
 }  // namespace
 
 bool Verifier::release_gpu_waits(int timeout_ms) {
@@ -375,6 +506,7 @@ Verifier::~Verifier() {
     }
     if (cs_) cudaStreamSynchronize(cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
+    if (gu_hist_path() != nullptr) gu_hist_drop(this);   // P1 G1b: before cs_ goes
     for (auto& row : exec_)
         for (auto& e : row)
         if (e) cudaGraphExecDestroy(e);
@@ -608,6 +740,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     else if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) cs_ = nullptr;
     if (cs_ == nullptr || cudaStreamCreateWithFlags(&sh_cs_, cudaStreamNonBlocking) != cudaSuccess) {
         err = "verify: stream create failed";
+        return false;
+    }
+    if (gu_hist_path() != nullptr &&   // P1 G1b: the counters exist before any graph is captured
+        !gu_hist_register(this, device_, &cs_, lb_, le_ < 0 ? g.n_layers : le_, g.n_layers)) {
+        err = "verify: STRATA_GU_SHAPE_HIST: the counters could not be allocated";
         return false;
     }
     if (cudaEventCreateWithFlags(&commit_done_, cudaEventDisableTiming) != cudaSuccess ||
@@ -1411,6 +1548,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     }();
     const bool fuse_head_gr = fuse_head_gr_env && (le_ == g.n_layers) && (head_ != nullptr && head_->loaded()) &&
                               !cvec().covers(g.n_layers - 1);
+    // P1 G1b (STRATA_GU_SHAPE_HIST): null unless the switch is set; then one counting warp before each VRAM gate/up
+    uint32_t* const gu_hist_d = gu_hist_path() != nullptr ? gu_hist_dev(this) : nullptr;
     auto post = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
         const uint32_t ring = (uint32_t) ((l - lb_) * G + grp + 1);
@@ -1441,7 +1580,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, dst_buf, cs);
             }
         };
+        auto gu_hist = [&]() {   // reads the plan the next launch reads; writes only its counters
+            if (gu_hist_d == nullptr) return;
+            const int Ti = std::min(T, kGuT - 1), ti = std::min(n, kGuT - 1);
+            gu_shape_hist(p_counts, p_start, gu_hist_d + (((size_t) l * kGuT + Ti) * kGuT + ti) * kGuRec, kGuG, kGuN, cs);
+        };
         if (ar_on()) {
+            gu_hist();
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, parts_out);
             stamp(l, 20, grp);
@@ -1453,6 +1598,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 wait_flag_ge(m_flagA_, ring, cs);                  // the pool published this group's GPU plan
                 copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
             }
+            gu_hist();
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, hit_out);
             stamp(l, 20, grp);
@@ -2321,7 +2467,13 @@ bool Verifier::wait_commit(std::string& err) {
         const cudaError_t se = cudaEventSynchronize(commit_done_);
         if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
     }
-    return next_ == nullptr || next_->wait_commit(err);
+    if (next_ == nullptr) {
+        // P1 G1b: every stage's verifiers; the prompt read through verify windows (head sampling off, set down the
+        // chain) is labelled apart from the decode
+        if (gu_hist_path() != nullptr) gu_hist_record_all(head_sampling_ ? "commit" : "prompt");
+        return true;
+    }
+    return next_->wait_commit(err);
 }
 
 
