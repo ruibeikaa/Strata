@@ -116,6 +116,15 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_test(NAME conversation_file_test COMMAND conversation_file_test)
 endif()
 
+# ==== BEGIN P1 part B, M2: pl_sched_test ===============================================================================
+# The pipelined decode loop's scheduler (src/program/pl_sched.*), a host state machine, against a symbolic GPU: the
+# 10-17 trace, random worlds, every small world with every ending, and the old pw-2 loop operation for operation.
+# CPU only (no CUDA); exits 0 when every check passes.
+add_executable(pl_sched_test src/program/pl_sched_test.cpp src/program/pl_sched.cpp)
+target_include_directories(pl_sched_test PRIVATE src/program)
+target_link_libraries(pl_sched_test PRIVATE strata_warnings)
+# ==== END P1 part B, M2: pl_sched_test =================================================================================
+
 if(STRATA_HIP_GFX906)
   if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
     set(CMAKE_HIP_ARCHITECTURES gfx906 CACHE STRING "HIP architectures" FORCE)
