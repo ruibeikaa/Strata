@@ -1459,6 +1459,7 @@ if(STRATA_NATIVE_EXPERTS)
   # ---- P1 part D (K1) begin: the gate/up experts as 4-bit codes in their VRAM slots (STRATA_EXPERT_NIBBLE=1, default
   # off; include/strata/core/expert_nibble.hpp, D_DESIGN.md sections 5-8).  Every file the change adds is listed here.
   # The PH402's CUDA (sm_60) build only: the WS prompt kernels it extends exist only in strata_mmq's CUDA branch.
+  # (gfx906's HIP build compiles moe_ws.cu too, without this file: moe_ws.cu calls gu_nib under !__HIPCC__ only.)
   if(STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906 AND TARGET strata_mmq)
     # M3: the WS gate/up product on 4-bit slots (moe_ws.hpp's dispatch picks it per layer)
     target_sources(strata_mmq PRIVATE src/prefill/moe_ws_gu_nib.cu)

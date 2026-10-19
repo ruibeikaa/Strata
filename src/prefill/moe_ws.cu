@@ -101,8 +101,13 @@ bool gate_up(const Layer& L, void* stream) {
     if (mode() != 1 || !faster(L.gu_type, u)) return false;
     const cudaStream_t s = (cudaStream_t) stream;
     if (L.gu_nib) {   // P1 part D (K1): the 4-bit slots' kernels (moe_ws_gu_nib.cu), the same GU rows
+#if !defined(__HIPCC__)
         detail::gu_nib(L, u, s);
         return true;
+#else   // moe_ws_gu_nib.cu is the CUDA (sm_60) build's only; mode() is 0 under HIP, so this is not reached
+        std::fprintf(stderr, "prefill ws: 4-bit gate/up slots have no HIP kernel\n");
+        std::exit(1);
+#endif
     }
     switch (L.gu_type) {
         case GGML_TYPE_IQ2_XXS: detail::gu_iq2_xxs(L, u, s); break;
