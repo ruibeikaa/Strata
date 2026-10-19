@@ -558,6 +558,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(strata src/program/generate.cpp)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+  # P1 part B, M3: the new pipelined decode loop's scheduler (pl_sched, host code; its test is pl_sched_test above)
+  target_sources(strata PRIVATE src/program/pl_sched.cpp)
 
   # ==== BEGIN P1 part B, M1: mtp_chain_parity ==========================================================================
   # The draft chain at up to 11 outputs (MtpDrafter::kChainMax) checked against the code it replaced:
