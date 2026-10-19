@@ -1456,6 +1456,24 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(ple_fp8_parity src/kernels/ple_fp8_parity.cpp)
     target_link_libraries(ple_fp8_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   endif()
+  # ---- P1 part D (K1) begin: the gate/up experts as 4-bit codes in their VRAM slots (STRATA_EXPERT_NIBBLE=1, default
+  # off; include/strata/core/expert_nibble.hpp, D_DESIGN.md sections 5-8).  Every file the change adds is listed here.
+  # The PH402's CUDA (sm_60) build only: the WS prompt kernels it extends exist only in strata_mmq's CUDA branch.
+  if(STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906 AND TARGET strata_mmq)
+    # M3: the WS gate/up product on 4-bit slots (moe_ws.hpp's dispatch picks it per layer)
+    target_sources(strata_mmq PRIVATE src/prefill/moe_ws_gu_nib.cu)
+    # M4: the decode path on 4-bit slots vs the production kernels, bit for bit (--header: the header's host half)
+    add_executable(iq_nibble_parity src/kernels/iq_nibble_parity.cpp)
+    target_include_directories(iq_nibble_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(iq_nibble_parity PRIVATE strata_kernels strata_kernels_cpu strata_artifact ${_strata_gpu_runtime_target})
+    # M4: the prompt path's gate/up on 4-bit slots vs the production WS kernels and the in-place MMQ, bit for bit
+    add_executable(moe_ws_nib_parity src/prefill/moe_ws_nib_parity.cu)
+    target_link_libraries(moe_ws_nib_parity PRIVATE strata_mmq strata_kernels_cpu ggml-base ${_strata_gpu_runtime_target})
+    if(STRATA_BUILD_TESTS)
+      add_test(NAME iq_nibble_parity_header COMMAND iq_nibble_parity --header)
+    endif()
+  endif()
+  # ---- P1 part D (K1) end
 endif()
 
 if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/hit_cpu_order_parity.cu")
