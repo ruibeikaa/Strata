@@ -44,8 +44,14 @@ struct NativeExpertLayout {
     size_t gu_row = 0, d_row = 0;       // bytes per row
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
     size_t bytes = 0;                   // the whole blob
+    bool gu_nib = false;                // P1 part D: gate/up as 4-bit codes (strata/core/expert_nibble.hpp's slot)
 };
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
+/// P1 part D (STRATA_EXPERT_NIBBLE): a converted VRAM slot - gate/up as 4-bit codes, scales and d
+/// (expert_nibble.hpp's layout: up_off = the up rows' codes, down_off = kGuBytes, bytes = the slot), the GGUF down
+/// rows after them.  IQ2_S / IQ3_XXS / IQ3_S at n_embd 2560, n_ff 640 only (`native_expert_nib_supported`).
+NativeExpertLayout native_expert_layout_nib(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
+bool native_expert_nib_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept;
 /// Whether `native_expert_grouped` has kernels for this gate/up and down type pair at these dimensions, and the
 /// prompt path's dequantizer takes both (checked for every layer at startup, before anything is allocated).
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept;
@@ -62,7 +68,14 @@ size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
-                           int64_t grid_groups = 0);
+                           int64_t grid_groups = 0, int max_group_entries = 0);
+/// `max_group_entries` (P1 part D, read only for an `L.gu_nib` layout): the most entries a group of this call can
+/// have - the call's tokens, since a token routes to an expert once (0 = unknown).  It picks the 4-bit gate/up kernel
+/// per (format, tokens) from expert_nibble.hpp's variant table; every choice gives the production kernel's bits.
+/// The bench / parity only: force the 4-bit gate/up kernel of every format (-1 = the table, the default; 1 or 3 = the
+/// S skeleton, R4S / IQ3_S's R4SV; 2 or 4 = the P skeleton, R4P / IQ3_S's R4PX; 5 = IQ3_S's per-group split, R4SV
+/// for a group of one entry and R4PX for the rest).  Bitwise the same results; set before graph capture.
+void native_expert_nib_set_variant(int v);
 /// true: `native_expert_grouped`'s launches before the group stride (STRATA_GROUPED_V1=1 at startup) - a block row
 /// per possible group, SwiGLU and the q8_1 quantization as two kernels over all cap_entries.  Bitwise the same results
 /// (native_grouped_parity checks it); kept for A/B timing.  Set before graph capture; captured graphs keep theirs.

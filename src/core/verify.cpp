@@ -1,5 +1,6 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/verify.hpp"
+#include "strata/core/expert_nibble.hpp"
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/spec_prob.hpp"
@@ -1568,13 +1569,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         // plan v0.3 P6: the VRAM groups now; the PCIe groups once the copy engine has landed them in staging.
         // `gy`: the native launch's groups side by side (0: cap, one block row per possible group).
-        auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t gy, float* dst_buf) {
+        // `vram`: the groups point into this die's expert slots - a layer STRATA_EXPERT_NIBBLE converted holds its
+        // gate/up there as 4-bit codes (expert_nibble.hpp); the PCIe share's blobs (host arena, staging) never do.
+        auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t gy, float* dst_buf,
+                           bool vram) {
             if (lay.native) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
-                const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                const NativeExpertLayout L = vram && strata::core::nibble::layer(l).on
+                                                 ? native_expert_layout_nib(f.gu_type, f.d_type, f.n_embd, f.n_ff)
+                                                 : native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                // n: this launch's tokens, the most entries a group can have (picks the 4-bit kernel; else unread)
                 native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
-                                      nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, dst_buf, cs, gy);
+                                      nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, dst_buf, cs, gy, n);
             } else {
                 moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
                                hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, dst_buf, cs);
@@ -1588,7 +1595,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (ar_on()) {
             gu_hist();
             stamp(l, 19, grp);
-            grouped(p_ptr, p_start, p_counts, 0, parts_out);
+            grouped(p_ptr, p_start, p_counts, 0, parts_out, true);
             stamp(l, 20, grp);
         } else {
             if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
@@ -1600,7 +1607,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             gu_hist();
             stamp(l, 19, grp);
-            grouped(p_ptr, p_start, p_counts, 0, hit_out);
+            grouped(p_ptr, p_start, p_counts, 0, hit_out, true);
             stamp(l, 20, grp);
             if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
             else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
@@ -1613,7 +1620,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 21, grp);
             // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (always none at
             // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
-            grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out);
+            grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out, false);
             stamp(l, 22, grp);
             if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
                 wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
