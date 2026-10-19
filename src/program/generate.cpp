@@ -7431,6 +7431,33 @@ int main(int argc, char** argv) {
             std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        // THE ARENA ONCE EVERY EXPERT IS IN VRAM (a 4 x 32 GB rig with PROFILE caches and no eviction): nothing reads it
+        // any more - the verifiers run their zero-doorbell graphs, the prompt path reads resident experts in place,
+        // the adaptive tier is off (usage stays empty above) - yet its 47 GiB of large pages stayed committed for the
+        // life of the process, because ArenaExpertSource::release is a no-op without a file mapping to trim.  Freed
+        // here, after everything that could still take an expert out of VRAM has been decided: the prompt path's
+        // loans (any_loan), the elastic K/V (kvg.on), the Foresight swap space, the router look-ahead, peer and remote
+        // experts.  Any of those on, or a miss anywhere in the table: the arena stays, as before.  The accessors fail
+        // safe afterwards (a non-resident expert's blob is nullptr -> the request errors, never a stale address).
+        // STRATA_ARENA_FREE=0 keeps it in RAM.
+        if (srcp == &arena_src && arena_src.mapped() && all_experts_resident) {
+            const char* af = std::getenv("STRATA_ARENA_FREE");
+            const char* keep_why = af != nullptr && af[0] == '0' ? "STRATA_ARENA_FREE=0"
+                : any_loan ? "the prompt path borrows cache slots"
+                : kvg.on ? "the elastic K/V gives up cache slots"
+                : fs_swap ? "the Foresight swap space is on"
+                : drive.d.lookahead != nullptr ? "the router look-ahead is on"
+                : peer.valid() ? "peer experts"
+                : drive.d.remote_count > 0 ? "remote experts" : nullptr;
+            if (keep_why == nullptr) {
+                const uint64_t freed = arena_src.drop_backing();
+                std::fprintf(stderr, "strata serve: expert arena: %.2f GiB of RAM freed - every expert is VRAM-resident "
+                                     "(STRATA_ARENA_FREE=0 keeps it)\n", (double) freed / 1073741824.0);
+            } else {
+                std::fprintf(stderr, "strata serve: expert arena kept in RAM although every expert is VRAM-resident: %s\n",
+                             keep_why);
+            }
+        }
         // #477 --expert-profile-save: what the adaptive tier learned, kept across restarts (opt-in; off: `heat` stays
         // empty and nothing below runs).  It needs the adaptive tier's counts and the residency table.
         std::vector<double> heat;

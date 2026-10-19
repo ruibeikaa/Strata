@@ -835,6 +835,11 @@ public:
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     void prefetch(int64_t layer, int64_t expert) override;
     uint64_t release(int64_t layer, int64_t expert) override;
+    /// Frees the RAM copy early, once every expert it holds is in VRAM and nothing can take one out again: the
+    /// destructor's work (unregister the pinned slices, release the large-page allocation) done now.  The accessors
+    /// fail safe afterwards - blob() nullptr, pinned() false, device_alias() nullptr - and model_inputs() and the
+    /// load statistics stay.  Returns the bytes released (0 for a mapped arena, or one already dropped).
+    uint64_t drop_backing();
 
     /// What backing was obtained and why, for the startup print.  "The engine adapts to the machine it is on" is
     /// only true if the engine says what it got.
