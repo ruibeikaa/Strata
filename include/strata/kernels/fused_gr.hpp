@@ -61,6 +61,30 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
 
 /// The bench only: the AMD latency-hidden kernels on (1) or off (0); -1 = STRATA_GR_FAST.
 void fused_gr_set_fast(int on);
+
+/// The bench only (fused_gr_bench parts mode; never called by the engine): one piece of a read launched by itself, so
+/// the staged read's three kernels can be timed apart, beside reads this card does not take: the single-token read
+/// with the norm folded into its down kernel, and the opt-in v3 read (another summation order) with S = 1 or 2 column
+/// halves, past the #375 gate that keeps sm_60 on the default read.  `scratch` is n_tok * hc * n_embd floats (the
+/// staged read's xn, or v3's partial dots and sums of squares).  Returns false when the launch failed or `which` does
+/// not apply (the single-token pieces need n_tok 1).
+enum FusedGrBenchPiece {
+    kGrBenchStaged = 0,        ///< the staged read: gr_norm_split + gr_down_staged<T,true> + gr_up_multi<T,true>
+    kGrBenchNormSplit,         ///< gr_norm_split_kernel alone
+    kGrBenchDownStaged,        ///< gr_down_staged_kernel<T,true> alone (xn from an earlier read)
+    kGrBenchUpMulti,           ///< gr_up_multi_kernel<T,true> alone (lo, rs from an earlier read)
+    kGrBenchPlain,             ///< the plain read: gr_norm_multi + gr_down_multi<2560> + gr_up_multi
+    kGrBenchSingle,            ///< fused_gr_read: gr_down_kernel (norm folded, 41 blocks) + gr_up_kernel (80 blocks)
+    kGrBenchSingleDown,        ///< gr_down_kernel alone
+    kGrBenchSingleUp,          ///< gr_up_kernel alone
+    kGrBenchV3S2,              ///< gr_down_v3_kernel<2> + gr_up_v3_kernel<2> (generic MAX_T, as fused_gr_read_multi would)
+    kGrBenchV3S2Down,          ///< gr_down_v3_kernel<2> alone
+    kGrBenchV3S2Up,            ///< gr_up_v3_kernel<2> alone (partials from an earlier v3 S=2 read)
+    kGrBenchV3S2Exact,         ///< gr_down_v3_kernel<2,T,true> + gr_up_v3_kernel<2,T,true> (T 1..2)
+    kGrBenchV3S1Exact,         ///< gr_down_v3_kernel<1,T,true> + gr_up_v3_kernel<1,T,true> (T 1..2; 10 KB/token)
+    kGrBenchPieces
+};
+bool fused_gr_bench_piece(int which, const FusedGrArgs* a, int n_tok, float* scratch, void* stream);
 /// The multi read's variants (#315; not main's opt-in STRATA_GR_V3 read, which sums in another order), all computing
 /// every output with the plain read's operations in its order, so bitwise the plain read's and the single-token
 /// read's: plain (0.1.31's default: the norm one block per token, the down projection on 41 blocks), split (the norm

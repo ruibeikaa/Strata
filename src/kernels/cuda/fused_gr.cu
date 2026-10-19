@@ -1987,5 +1987,89 @@ void fused_gr_check() {
                                    "for the earlier ones)" : "");
 }
 
+bool fused_gr_bench_piece(int which, const FusedGrArgs* a, int n_tok, float* scratch, void* stream) {
+    if (n_tok < 1 || n_tok > kFusedGrMaxT || a == nullptr || scratch == nullptr) return false;
+    GrMulti m;
+    bool q8 = a[0].q8_cnt != nullptr;
+    for (int t = 0; t < n_tok; ++t) { m.a[t] = a[t]; q8 = q8 && a[t].q8_mixed != nullptr; }
+    if (!q8)
+        for (int t = 0; t < n_tok; ++t) m.a[t].q8_mixed = nullptr;
+    m.xn = scratch;
+    m.T = n_tok;
+    cudaStream_t st = (cudaStream_t) stream;
+    const int T = n_tok;
+    float* part = scratch;                                   // v3: as fused_gr_read_multi lays it out
+    float* ssg = scratch + (size_t) T * HC * 2 * PR;
+    auto down_staged = [&] {
+        int tv = 2560;
+        (void) down_chunk(true, &tv);                        // the shared-memory opt-in, once per device
+        const size_t smem = (size_t) T * 2 * H_TILE * sizeof(float);
+        if (T == 1) gr_down_staged_kernel<1, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(m);
+        else if (T == 2) gr_down_staged_kernel<2, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(m);
+        else if (T == 3) gr_down_staged_kernel<3, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(m);
+        else if (T == 4) gr_down_staged_kernel<4, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(m);
+        else gr_down_staged_kernel<><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(m);
+    };
+    auto up_multi = [&] {
+        if (T == 1) gr_up_multi_kernel<1, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+        else if (T == 2) gr_up_multi_kernel<2, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+        else if (T == 3) gr_up_multi_kernel<3, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+        else if (T == 4) gr_up_multi_kernel<4, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+        else gr_up_multi_kernel<kFusedGrMaxT, false><<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+    };
+    const size_t sm2 = (size_t) T * (N / 2) * sizeof(float), sm1 = (size_t) T * N * sizeof(float);
+    const dim3 g2(LR / WARPS + 1, HC * 2), g1(LR / WARPS + 1, HC);
+    switch (which) {
+        case kGrBenchStaged: launch_multi(m, kHcStaged, st, nullptr, 0); break;
+        case kGrBenchNormSplit: gr_norm_split_kernel<<<dim3((unsigned) T, HC), THREADS, 0, st>>>(m); break;
+        case kGrBenchDownStaged: down_staged(); break;
+        case kGrBenchUpMulti: up_multi(); break;
+        case kGrBenchPlain: launch_multi(m, kHcPlain, st, nullptr, 0); break;
+        case kGrBenchSingle:
+            if (T != 1) return false;
+            gr_down_kernel<<<DOWN_BLOCKS + 1, THREADS, 0, st>>>(a[0]);
+            gr_up_kernel<<<UP_BLOCKS, THREADS, 0, st>>>(a[0]);
+            break;
+        case kGrBenchSingleDown:
+            if (T != 1) return false;
+            gr_down_kernel<<<DOWN_BLOCKS + 1, THREADS, 0, st>>>(a[0]);
+            break;
+        case kGrBenchSingleUp:
+            if (T != 1) return false;
+            gr_up_kernel<<<UP_BLOCKS, THREADS, 0, st>>>(a[0]);
+            break;
+        case kGrBenchV3S2:
+            gr_down_v3_kernel<2><<<g2, THREADS, sm2, st>>>(m, part, ssg);
+            gr_up_v3_kernel<2><<<UPM_BLOCKS, THREADS, 0, st>>>(m, part, ssg);
+            break;
+        case kGrBenchV3S2Down: gr_down_v3_kernel<2><<<g2, THREADS, sm2, st>>>(m, part, ssg); break;
+        case kGrBenchV3S2Up: gr_up_v3_kernel<2><<<UPM_BLOCKS, THREADS, 0, st>>>(m, part, ssg); break;
+        case kGrBenchV3S2Exact:
+            if (T == 1) {
+                gr_down_v3_kernel<2, 1, true><<<g2, THREADS, sm2, st>>>(m, part, ssg);
+                gr_up_v3_kernel<2, 1, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m, part, ssg);
+            } else if (T == 2) {
+                gr_down_v3_kernel<2, 2, true><<<g2, THREADS, sm2, st>>>(m, part, ssg);
+                gr_up_v3_kernel<2, 2, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m, part, ssg);
+            } else {
+                return false;
+            }
+            break;
+        case kGrBenchV3S1Exact:
+            if (T == 1) {
+                gr_down_v3_kernel<1, 1, true><<<g1, THREADS, sm1, st>>>(m, part, ssg);
+                gr_up_v3_kernel<1, 1, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m, part, ssg);
+            } else if (T == 2) {
+                gr_down_v3_kernel<1, 2, true><<<g1, THREADS, sm1, st>>>(m, part, ssg);
+                gr_up_v3_kernel<1, 2, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m, part, ssg);
+            } else {
+                return false;
+            }
+            break;
+        default: return false;
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
 
 }  // namespace strata::kernels
