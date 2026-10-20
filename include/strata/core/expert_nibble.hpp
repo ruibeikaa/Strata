@@ -5,7 +5,7 @@
 // 732 GB/s, held by each block's serial latency (wait for the weights, sync, decode the codebook, emulated dp4a,
 // 16-lane reduce).  Re-encoding each 32-weight item of IQ2_S / IQ3_XXS / IQ3_S as sixteen bytes of 4-bit codes
 // (one aligned LDG.128) and keeping the integer scale and the fp16 d as they are makes the bytes 1.25-1.68x and the
-// decode 1-4 instructions per four weights instead of two shared-table lookups.  Measured on 8111's pack (gates D,
+// decode 1-4 instructions per four weights instead of two shared-table lookups.  Measured on the SwiftAbl pack (gates D,
 // G1a, G2, analysis/2026-10-19-p1-stack): decode gate/up x1.45-1.58 by average T and expert sharing, every row bit
 // for bit the production kernel's; the prompt path's IQ2_S gate/up 2.6-16% FASTER at every u.
 //
@@ -101,7 +101,7 @@ STRATA_NIB_HD constexpr uint64_t slot_bytes_for(uint64_t down_bytes) {
 
 // ------------------------------------------------------------------------------------------------ the formats
 
-inline constexpr int kIQ2_XXS = 16;   ///< phase 2 (8110's stage 0): same code as IQ2_S; not built yet
+inline constexpr int kIQ2_XXS = 16;   ///< phase 2 (the Swift pack's stage 0): same code as IQ2_S; not built yet
 inline constexpr int kIQ2_XS = 17;    ///< phase 2: same code as IQ2_S; not built yet
 inline constexpr int kIQ3_XXS = 18;
 inline constexpr int kIQ3_S = 21;

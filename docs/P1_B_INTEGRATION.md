@@ -19,10 +19,10 @@
 | `mtp_chain_parity` 复跑（板 B） | die 4 种子 1 × 300 轮 **PASS**；die 5 种子 7 × 400 轮 **PASS**；七项检查都是 0 个不一致 |
 | (a) 旧 pw-2 循环 | daeed844 第 10482–11113 行（632 行，41,376 字节）在新文件里**逐字节出现 1 次**；没有任何 diff 操作落在这段里面 |
 | (b) 不设开关时 | 参数、显存账、启动日志、每请求路径、timing 三行都和今天相同，见第 2 节逐条核对 |
-| (c) 真机冒烟 | 单颗 die 装不下模型，按要求不做；8190 的命令写在第 4 节，由调用方跑 |
+| (c) 真机冒烟 | 单颗 die 装不下模型，按要求不做；测试端口的命令写在第 4 节，由调用方跑 |
 | 联调查出的问题 | 2 处，都在 M4 工具里，已修，见第 3 节：(1) 第四行统计的正则对不上 M3a 实际打印的格式，`restage` 判据会一直不打勾；(2) trace 里 `# mode=B0` 这一行被当成新请求的开头 |
 
-- **能不能上 8190 跑 G2**：可以。第 4 节的两条命令就是 G2。
+- **能不能在测试端口跑 G2**：可以。第 4 节的两条命令就是 G2。
 - **G3 现在不能跑**：M3a 的 `--pipeline-windows 3` 仍按 B0 跑，X 臂量到的是 B0。要等 M3b。
 
 ## 1. 复跑的测试
@@ -102,7 +102,7 @@
 - **草稿器（M1）对默认路径的两处影响**，都已证明不改结果，或只在边界上改草稿：
   - 暂存行的布局和设备 arena 的偏移后移了。对拍第 1、7 项（新旧代码 n_out ≤ 7、串行 `draft()`）逐位相同。
   - `n_out` 按 `max_cells` 钳位：只在上下文最末尾触发。那里旧代码会把草稿 KV 写越界，所以只影响草稿，不影响回复。
-- **一处要知道的**：`CHECK_STATE` 读状态失败时会打 `ERR` 并 `return 1`，也就是结束引擎。这只在 DEBUG 开关下出现，生产路径不会走到；8190 的 A/B 里如果引擎中途退出，先看这一条。
+- **一处要知道的**：`CHECK_STATE` 读状态失败时会打 `ERR` 并 `return 1`，也就是结束引擎。这只在 DEBUG 开关下出现，生产路径不会走到；测试端口的 A/B 里如果引擎中途退出，先看这一条。
 
 ## 3. 联调查出并修掉的问题（都在 M4 工具里，引擎没改）
 
@@ -118,14 +118,14 @@
   - 修改前的 d3lib 留了一份 `B-INT-work\d3lib.py.orig`。
 - **新增** `B-test\compare_timing.py`：把一次 `ab_d3.py` 运行里两个臂的 timing 第 1、2 行逐请求对比。比的是窗口数、猜测数、猜中数、回滚数、门槛挡下数、新/猜测窗口数、强制链不一致数、链晚数，再加 ms 的偏差。N2 等价性检查用它。
 
-## 4. 给调用方的 8190 命令
+## 4. 给调用方的测试端口命令
 
 前提：
 - 被测 exe 是 `builds\strata-p1b-build\strata.exe`（sha256 前 16 位 `93857b6ae1972fc7`）。`ab_d3.py` 开跑时会把它复制进 OUTDIR，之后再编译不影响这次运行。
-- `ab_d3.py` 占用 PH402 的四颗 die（`-Devices 2,3,4,5`，也就是 8111 那四颗），端口 8190。
-  - 它不启停 8110/8111：每 60 秒查一次 die 是否空闲，最多等 60 分钟，等不到就报 "GPU not available" 退出。
-  - 8111 要不要先停，由用户决定。
-- 每个臂各启动一次，用临时复制的 SwiftAbl 启动脚本。状态目录是 `OUTDIR\state`，不写 8111 的 runtime-state。
+- `ab_d3.py` 占用 PH402 的四颗 die（`-Devices 2,3,4,5`，也就是生产路由那四颗），测试端口。
+  - 它不启停生产路由：每 60 秒查一次 die 是否空闲，最多等 60 分钟，等不到就报 "GPU not available" 退出。
+  - 生产路由要不要先停，由用户决定。
+- 每个臂各启动一次，用临时复制的 SwiftAbl 启动脚本。状态目录是 `OUTDIR\state`，不写生产路由的 runtime-state。
 - 每个臂都开 `STRATA_DECODE_TIMING=1`、`STRATA_PIPELINE_DEBUG=1`、`STRATA_PIPELINE_TRACE`、`STRATA_PIPELINE_CHECK_STATE=1`。
 - 在 `F:\AI-Speed-Optimization\analysis\2026-10-19-p1-stack\B-test` 下运行（PowerShell）。
 
@@ -265,7 +265,7 @@ python -I F:\AI-Speed-Optimization\analysis\2026-10-19-p1-stack\B-test\ab_d3.py 
 | 状态比较工具 | `B-FIX-work\check_state_tools.py`（新）：从 `generate.cpp` 的格式串重建状态行；`end`/`loop` 解析、摘要不含 `loop`、`~`/`!`/`=` 三种结果；合成的 G2 运行（S 在 7/11 个请求上 `end` 不同）不再误报、状态判据打勾；同 end 改一个 GDN 哈希就报 "different: code_en: B0 vs P"、判据不打勾；`stress_d3` 合成矩阵不同 end 不算失败。14 项全 PASS | `B-FIX-work\check_state_tools_out.txt` |
 | 回归 | `trace_d3.py` 跑 10-17 trace（带 `--log`），输出和 `B-test\trace_d3_1017_out.txt` 逐字相同 | `B-FIX-work\trace_d3_1017_recheck.txt` |
 
-- 真机冒烟：仍然没有。单颗 die 装不下模型；两条退回路径（池子 shrink、按深度选模式）只能在 8190 上看（第 7.4 节的 `B0F` 臂）。
+- 真机冒烟：仍然没有。单颗 die 装不下模型；两条退回路径（池子 shrink、按深度选模式）只能在测试端口上看（第 7.4 节的 `B0F` 臂）。
 
 ### 7.4 对第 4 节命令的影响
 

@@ -202,7 +202,7 @@ void go(F kernel, const Layer& L, cudaStream_t s) {
 }  // namespace
 
 // tokens per pass by u (rows per routed expert), the crossovers measured on the 4-bit kernels (one 512-expert layer of
-// 8111's pack per format, lognormal counts sigma 0.5 and 1.0, M3-work): IQ2_S 8 below 6, 16 below 25 (four chains and
+// the SwiftAbl pack per format, lognormal counts sigma 0.5 and 1.0, M3-work): IQ2_S 8 below 6, 16 below 25 (four chains and
 // I2F: faster here than the two kMagicI chains), then 32 in 4-token groups; IQ3_XXS 8 below 4, 16 below 18 (one chain),
 // then 32 (one chain, 4-token groups); IQ3_S 8 below 4, 16 below 18, then 32 (two chains)
 void gu_nib(const Layer& L, double u, cudaStream_t s) {
