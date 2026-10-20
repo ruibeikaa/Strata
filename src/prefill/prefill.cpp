@@ -4765,7 +4765,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     m.xoff_host[j] = (int64_t) (m.cache->device_slot(s) - ip_base);
                                     at |= (uint64_t) m.xoff_host[j];
                                 }
-                                ws_layer = all && ((uint64_t) (uintptr_t) ip_base | at | lay.fmt[(size_t) l].down_off) % ws::kAlign == 0;
+                                // STRATA_EXPERT_NIBBLE: a layer whose gate/up experts are 4-bit codes in their slots
+                                // takes the 4-bit WS gate/up (ws::Layer::gu_nib), its down rows at the slot's kDownOff;
+                                // a converted layer that is not taken here keeps the GGUF rebuild (gather_gguf) below
+                                const uint64_t ws_down_off = nib_l.on ? nib_l.down_off : lay.fmt[(size_t) l].down_off;
+                                ws_layer = all && ((uint64_t) (uintptr_t) ip_base | at | ws_down_off) % ws::kAlign == 0;
                                 if (ws_layer) {
                                     if (static bool said_ws = false; !said_ws) {
                                         said_ws = true;
@@ -4794,7 +4798,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                         return false;
                                     }
                                     wl.gu_type = mmq_gt; wl.d_type = mmq_dt; wl.w = ip_base; wl.xoff = m.xoff_dev;
-                                    wl.down_off = (int64_t) lay.fmt[(size_t) l].down_off; wl.chunks = m.ws_chunks;
+                                    wl.down_off = (int64_t) ws_down_off; wl.chunks = m.ws_chunks; wl.gu_nib = nib_l.on;
                                     wl.rows = T * K; wl.n = (int) n; wl.xq = m.Xq; wl.gu = m.GU; wl.hq = m.Hq; wl.dm = m.Dm;
                                 }
                             }
