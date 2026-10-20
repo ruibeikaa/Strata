@@ -1,9 +1,10 @@
 // src/prefill/moe_ws.cu - see include/strata/prefill/moe_ws.hpp: which layers and products take the weight-stationary
-// kernels (moe_ws_gu_iq2.cu, moe_ws_gu_iq3.cu, moe_ws_down.cu), their work tables and launches.
+// kernels (moe_ws_gu_iq2.cu, moe_ws_gu_iq3.cu, moe_ws_gu_nib.cu, moe_ws_down.cu), their work tables and launches.
 #include "common.cuh"
 #include "mmq.cuh"
 
 #include "moe_ws.cuh"
+#include "strata/core/expert_nibble.hpp"   // STRATA_EXPERT_NIBBLE_BUILT: moe_ws_gu_nib.cu is in the build
 
 #include <algorithm>
 #include <cmath>
@@ -99,6 +100,15 @@ bool gate_up(const Layer& L, void* stream) {
     const double u = (double) L.rows / L.n;
     if (mode() != 1 || !faster(L.gu_type, u)) return false;
     const cudaStream_t s = (cudaStream_t) stream;
+    if (L.gu_nib) {   // STRATA_EXPERT_NIBBLE: the 4-bit slots' kernels (moe_ws_gu_nib.cu), the same GU rows
+#if STRATA_EXPERT_NIBBLE_BUILT
+        detail::gu_nib(L, u, s);
+        return true;
+#else   // no 4-bit slots without the kernels (the switch is refused at start), so this is not reached
+        std::fprintf(stderr, "prefill ws: 4-bit gate/up slots have no kernel in this build\n");
+        std::exit(1);
+#endif
+    }
     switch (L.gu_type) {
         case GGML_TYPE_IQ2_XXS: detail::gu_iq2_xxs(L, u, s); break;
         case GGML_TYPE_IQ2_XS: detail::gu_iq2_xs(L, u, s); break;
