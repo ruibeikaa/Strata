@@ -156,3 +156,5 @@ namespace strata::kernels { void qsa_block_topk_long(float const* p0, int const*
 namespace strata::kernels { void qsa_block_scores_long(float const* p0, float const* p1, float const* p2, int const* p3, long long p4, long long p5, strata::kernels::QsaShapes const& p6, float* p7, void* p8, long long p9) { strata::metal_engine::missing("strata::kernels::qsa_block_scores_long"); } }
 // only reached with pf_wmma (off on Metal)
 namespace strata::prefill { void swiglu_split_f16(float const* p0, unsigned short* p1, long long p2, int p3, bool p4, void* p5) { } }
+// STRATA_PREFILL_COMBINE_WRITE (prefill.cpp, opt-in): not launched on Metal, the caller runs the two kernels
+namespace strata::prefill { bool moe_combine_write_norm_rs(float const* p0, int const* p1, float const* p2, float const* p3, float const* p4, float* p5, float const* p6, long long p7, float const* p8, float p9, float* p10, unsigned short* p11, long long p12, void* p13, unsigned short* p14, long long p15, bool p16) { return false; } }
