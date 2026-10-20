@@ -10758,6 +10758,38 @@ int main(int argc, char** argv) {
         }
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        // STRATA_ARENA_FREE=1 (opt-in): THE ARENA ONCE EVERY EXPERT IS IN VRAM (e.g. four 32 GB dies with PROFILE caches
+        // and no eviction).  Nothing reads it any more - the verifiers run on resident experts, the prompt path reads
+        // them from the expert cache, the adaptive tier is off (usage stays empty above) - yet its pages stay
+        // committed for the life of the process (release() has nothing to trim without a file mapping).  Freed here,
+        // after everything that could still take an expert out of VRAM, or read the arena, has been decided: the
+        // prompt path's loans (any_loan), the elastic K/V (kvg.on), --vram-elastic's shrinks, the Foresight swap
+        // space, the router look-ahead, peer and remote experts (and the helper source over them), the async
+        // adaptive tier, STRATA_RAM_ADAPT, a shared arena file.  Any of those on, or a miss anywhere in the table:
+        // the arena stays.  The accessors fail safe afterwards (a non-resident expert's blob is nullptr -> the
+        // request errors, never a stale address).  Unset: nothing here runs.
+        if (const char* af = std::getenv("STRATA_ARENA_FREE");
+            af != nullptr && af[0] == '1' && srcp == &arena_src && arena_src.mapped() && all_experts_resident) {
+            const char* ram_adapt = std::getenv("STRATA_RAM_ADAPT");
+            const char* keep_why = any_loan ? "the prompt path borrows cache slots"
+                : kvg.on ? "the elastic K/V gives up cache slots"
+                : xcache.segmented() ? "--vram-elastic can give up cache slots"
+                : fs_swap ? "the Foresight swap space is on"
+                : drive.d.lookahead != nullptr ? "the router look-ahead is on"
+                : peer.valid() ? "peer experts"
+                : drive.d.remote_count > 0 ? "remote experts"
+                : prefill_helper_src ? "the prompt path's helper source"
+                : o.adapt_async ? "--adapt-async"
+                : ram_adapt != nullptr && std::atoi(ram_adapt) > 0 ? "STRATA_RAM_ADAPT"
+                : !o.shared_expert_arena.empty() ? "--shared-expert-arena (other processes map it)" : nullptr;
+            const uint64_t freed = keep_why == nullptr ? arena_src.drop_backing() : 0;
+            if (freed > 0)
+                std::fprintf(stderr, "strata serve: expert arena: %.2f GiB of RAM freed - every expert is VRAM-resident "
+                                     "(STRATA_ARENA_FREE=1)\n", (double) freed / 1073741824.0);
+            else
+                std::fprintf(stderr, "strata serve: STRATA_ARENA_FREE: the expert arena is kept in RAM although every expert "
+                                     "is VRAM-resident: %s\n", keep_why != nullptr ? keep_why : "nothing to free (a mapped arena file)");
+        }
         PcieAuto pcie_auto;
         if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && o.peer_device < 0 && (n_stages == 1 || pcie_auto_split_ok())) {
             const auto& pl = strata::kernels::cpu::expert_layout();

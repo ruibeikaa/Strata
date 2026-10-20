@@ -1271,6 +1271,12 @@ public:
     bool pcie_layer(int64_t layer) const override;
     void prefetch(int64_t layer, int64_t expert) override;
     uint64_t release(int64_t layer, int64_t expert) override;
+    /// STRATA_ARENA_FREE=1: frees the RAM copy early, once every expert it holds is in VRAM and nothing can take one
+    /// out again - the destructor's work (unregister the pinned slices, release the allocation) done now.  The
+    /// accessors fail safe afterwards - blob() / blob_at() nullptr, pinned() false, device_alias() nullptr,
+    /// pcie_layer() false - and model_inputs() and the load statistics stay.  Returns the bytes released (0 for a
+    /// mapped arena file, STRATA_ARENA_MMAP, which it leaves alone, or for one already dropped).
+    uint64_t drop_backing();
 
     /// Pin by need (STRATA_PIN_BY_NEED=1): BEFORE open(), the (layer, expert) pairs worth pinning, by decreasing
     /// priority - the profile's ranked pairs the GPU cache will NOT hold, then the unranked ones.  open() merges
