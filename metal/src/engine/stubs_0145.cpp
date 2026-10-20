@@ -163,3 +163,5 @@ namespace strata::kernels { void ple_iq4nl_dequant(const uint8_t* p0, int64_t p1
 // STRATA_DEQUANT_SIDE (opt-in, CUDA only): off on Metal; the prompt path takes no second scratch and set_dequant_side(nullptr) keeps the serial form.
 namespace strata::prefill { bool gemm_dequant_side() { return false; } }
 auto strata::prefill::Gemm::set_dequant_side(uint16_t* p0, std::string& p1) -> bool { if (p0 == nullptr) return true; strata::metal_engine::missing("strata::prefill::Gemm::set_dequant_side"); return false; }
+// STRATA_PREFILL_COMBINE_WRITE (prefill.cpp, opt-in): not launched on Metal, the caller runs the two kernels
+namespace strata::prefill { bool moe_combine_write_norm_rs(float const* p0, int const* p1, float const* p2, float const* p3, float const* p4, float* p5, float const* p6, long long p7, float const* p8, float p9, float* p10, unsigned short* p11, long long p12, void* p13, unsigned short* p14, long long p15, bool p16) { return false; } }

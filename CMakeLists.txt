@@ -1264,6 +1264,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(gemm_dequant_side_parity PRIVATE strata_prefill )
     add_test(NAME gemm_dequant_side_parity COMMAND gemm_dequant_side_parity)
     set_tests_properties(gemm_dequant_side_parity PROPERTIES SKIP_RETURN_CODE 77)
+    if(STRATA_ENABLE_CUDA AND STRATA_EXPERIMENTAL_SM60)
+      # STRATA_PREFILL_COMBINE_WRITE: the MoE combine fused with the hyper-connection write (moe_combine_write_norm_rs)
+      # against the two kernels, bit for bit (GPU, synthetic, no model)
+      add_executable(prefill_combine_write_test tests/cuda/prefill_combine_write_test.cpp)
+      target_include_directories(prefill_combine_write_test PRIVATE ${_strata_gpu_include_directories})
+      target_link_libraries(prefill_combine_write_test PRIVATE strata_prefill ${_strata_gpu_runtime_target})
+      add_test(NAME prefill_combine_write_test COMMAND prefill_combine_write_test)
+      set_tests_properties(prefill_combine_write_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    endif()
     # Pascal, opt-in STRATA_DENSE_F32=1: the dense projections' FP16 GEMMs as cublasSgemm on FP32 copies, bitwise vs
     # the cuBLAS FP16 call over a sweep of chunk sizes (GPU, synthetic, no model; --full sweeps every size, --bench
     # adds timings).  Not a ctest: whether the two agree is a property of the cuBLAS build, which this checks.

@@ -112,6 +112,12 @@ void moe_shared_init(const float* shared, const float* sg, float* acc, int64_t T
 /// Dm[u_rows[j], :].  The sum runs in the group's row order, not moe_combine's k order (FP32 rounding only).
 void moe_scatter_add(const float* Dm, const int32_t* u_tok, const int32_t* u_off, const int32_t* u_rows,
                      const float* u_w, int64_t n_u, float* acc, void* stream);
+/// moe_combine (no row_sd), then gr_write_norm_rs with its bo, in one kernel that never stores bo: the same R, rs,
+/// xn16 and xn16_lo.  False (nothing launched) where moe_combine would not take its vectorized kernel, under HIP and
+/// outside the STRATA_EXPERIMENTAL_SM60 build; the caller then runs the two.
+bool moe_combine_write_norm_rs(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                               float* R, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps, float* rs,
+                               uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo, int64_t ldx, bool f16img);
 /// --peer-device's prompt share as sums: bo[t, :] = (sum over the k with slot[t, k] < rows_local of w[t, k] *
 /// D[slot[t, k], :], in k order) + peer[t, :] + shared[t, :] * sigmoid(sg[t]).  `peer` (the peer's per-token sums)
 /// may be mapped host memory.

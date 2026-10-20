@@ -178,6 +178,25 @@ constexpr int STAGE = 8;           // host->device expert staging ring (chunks b
 // the group that read it was gathered (the walk stages at most STAGE_GRP - MMQ_GROUP - 1 entries ahead)
 constexpr int STAGE_GRP = 32;
 constexpr int kSplitHelpRing = 48;  // layer split help: the helper stage's ring slots it streams through (at most)
+// STRATA_PREFILL_SWIGLU_QUANT=1 (opt-in): an MMQ group's swiglu and H's q8_1 rows in one kernel (mmq::swiglu_quant,
+// the same bytes) where the down type reads D4 rows; off under STRATA_DBG_NAN, which reads H
+inline bool swiglu_quant_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PREFILL_SWIGLU_QUANT");
+        return v != nullptr && v[0] == '1' && std::getenv("STRATA_DBG_NAN") == nullptr;
+    }();
+    return on;
+}
+// STRATA_PREFILL_COMBINE_WRITE=1 (opt-in): the MoE combine and the hyper-connection write after it in one kernel
+// (moe_combine_write_norm_rs, the same bits) where that write is gr_write_norm_rs; off under STRATA_DBG_NAN, which
+// reads bo
+inline bool combine_write_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PREFILL_COMBINE_WRITE");
+        return v != nullptr && v[0] == '1' && std::getenv("STRATA_DBG_NAN") == nullptr;
+    }();
+    return on;
+}
 // STRATA_PREFILL_STREAM_AHEAD=0 keeps the previous routed-only upload schedule (A/B).
 inline bool stream_ahead_enabled() {
     static const bool on = [] {
@@ -3739,6 +3758,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (gr_unfused()) gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs, m.xn16_lo, xf16);
                 else if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.grs, m.xn16, T, m.cs, m.xn16_lo, ldx, xf16);
                 normed = false;
+                bool moe_wrote = false;   // the MoE half's combine also did the write below (moe_combine_write_norm_rs)
                 bool hcd = false;
                 bool hdown = false;
                 if (wd->q8_scale == nullptr && ldx != D && !pf_hcdown()) {   // not with STRATA_HC_REQ8's int8 rows   // STRATA_HCD_EXACT: the exact-order down kernel when hipBLASLt would take 1176 / 1177
@@ -5342,15 +5362,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 gu.y_scale = mmq::fp4_activations(mmq_gt) ? m.Xscale : nullptr;
                                 if (direct) gu.tab = &tgu;
                                 m.mmq_ctx->run(gu, m.cs);
+                                // STRATA_PREFILL_SWIGLU_QUANT: swiglu and H's q8_1 rows in one pass where the down
+                                // type reads D4 rows and nothing else touches H in between (no NVFP4 scales, no
+                                // Hadamard rotation)
+                                const bool sq = swiglu_quant_on() && !(lay.native && lay.fmt[(size_t) l].tail_off) &&
+                                                !had_d && mmq::swiglu_quant_ok(mmq_dt);
                                 if (lay.native && lay.fmt[(size_t) l].tail_off)   // gate/up scales applied as read
                                     mmq::swiglu_scaled(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, m.bounds_dev + j0, ngx,
                                                        m.grp_tail, r0, m.cs);
+                                else if (sq)
+                                    mmq::swiglu_quant(m.GU + r0 * 1280, m.Hq, nr, !lay.native, m.cs);
                                 else
                                     mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs);
                                 if (had_d)
                                     strata::kernels::hadamard_rows(m.H + r0 * 640, m.H + r0 * 640, nr, 640, had_block, had_sh, m.cs);
                                 pt.mark(kPfGemmD, cs);
-                                mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs, m.Hscale);
+                                if (!sq) mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs, m.Hscale);
                                 mmq::Product dn;
                                 dn.w = m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
                                 dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
@@ -5518,9 +5545,23 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         moe_combine_peer16(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.pp->host_sum16, m.pp->back_at, m.bo, T, m.cs);
                     else if (peer_now && m.pp->sums)
                         moe_combine_peer(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.pp->host_sum, m.pp->back_at, m.bo, T, m.cs);
-                    else
-                        moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs,
-                                    use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off ? m.row_sd : nullptr);
+                    else {
+                        const float* row_sd = use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off ? m.row_sd
+                                                                                                                : nullptr;
+                        // STRATA_PREFILL_COMBINE_WRITE: the combine and the write below in one kernel where that write
+                        // is gr_write_norm_rs (the same conditions: not steered, a next layer, not before layer 1's
+                        // PLE block) and no row scales: bo never stored, the same bits
+                        if (combine_write_on() && row_sd == nullptr && half == 1 && !strata::kernels::cvec().covers(l) &&
+                            !gr_unfused() && l + 1 < LE && !(l + 1 == 1 && ple_on)) {
+                            const core::LayerView vn(*m.wt, l + 1);
+                            const core::WeightRef* wnn_c = need(vn, "hc_attn_norm.weight", err);
+                            if (!wnn_c) return false;
+                            moe_wrote = moe_combine_write_norm_rs(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.R, m.inj, HC,
+                                                                  (const float*) wnn_c->data, EPS, m.grs, m.xn16, T,
+                                                                  m.cs, m.xn16_lo, ldx, xf16);
+                        }
+                        if (!moe_wrote) moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs, row_sd);
+                    }
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
                     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
                         cudaStreamSynchronize(m.cs);
@@ -5603,8 +5644,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           T, m.cs, m.xn16_lo, ldx, xf16);
                     normed = true;
                 } else if (wnn) {
-                    gr_write_norm_rs(m.R, m.bo, m.inj, HC, (const float*) wnn->data, EPS, m.grs, m.xn16, T, m.cs,
-                                     m.xn16_lo, ldx, xf16);
+                    if (!moe_wrote)
+                        gr_write_norm_rs(m.R, m.bo, m.inj, HC, (const float*) wnn->data, EPS, m.grs, m.xn16, T, m.cs,
+                                         m.xn16_lo, ldx, xf16);
                     normed = true;
                 } else {
                     gr_write(m.R, m.bo, m.inj, HC, T, m.cs);
