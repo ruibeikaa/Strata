@@ -6066,6 +6066,25 @@ void ArenaExpertSource::close() {
     n_expert_ = 0;
 }
 
+uint64_t ArenaExpertSource::drop_backing() {
+    if (arena_ == nullptr || map_ != nullptr) return 0;
+    PinnedArena* a = (PinnedArena*) arena_;
+    const uint64_t bytes = a->mapping_bytes != 0 ? a->mapping_bytes : a->capacity;
+    // the accessors first, so a reader on another thread meets nullptr and never a released address
+    base_ = nullptr;
+    dev_slice_.clear();
+    pinned_bytes_ = 0;
+    slice_bytes_ = 0;
+    ranges_ = false;
+    pin_start_.clear();
+    pin_end_.clear();
+    pin_dev_.clear();
+    layer_pcie_.clear();
+    arena_ = nullptr;
+    delete a;   // cudaHostUnregister of every registered slice, then the release of the whole range
+    return bytes;
+}
+
 void ArenaExpertSource::prefetch(int64_t layer, int64_t expert) {
 #if defined(_WIN32)
     (void) layer; (void) expert;
