@@ -27,6 +27,15 @@ bool supported(int gu_type, int d_type);
 int fast();
 /// Benches and tests: 0 / 1 overrides fast(), -1 goes back to the environment.
 void set_fast(int v);
+/// STRATA_WS_V2=1 (opt-in, read once): the gate/up on 4-bit slots (IQ2_S, IQ3_XXS, IQ3_S) takes moe_ws_v2.cuh's
+/// 32-token kernels from lower rows per expert than the 32-token tier did - IQ2_S from u 17 (was 25) with each thread
+/// reading its row's item codes from global memory, IQ3_XXS from u 9 (was 18), IQ3_S from u 7 (was 18), its codes read
+/// per thread from u 16, four CTAs an SM - where they beat the 16-token kernels / STRATA_WS_FAST's (WS2.md).  Every
+/// output's operations and their order are unchanged, so GU is the same bits.  Independent of fast() (the down keeps
+/// fast()'s kernel); where both are set the V2 picks run for the 4-bit gate/up.  0 (unset): as before.
+int v2();
+/// Benches and tests: 0 / 1 overrides v2(), -1 goes back to the environment.
+void set_v2(int v);
 /// The weight-stationary product of `ggml_type` beats the per-group MMQ at u rows per routed expert (the measured
 /// ratios, moe_ws.cu; u is clamped to the measured 2.5 .. 160).
 bool faster(int ggml_type, double u);
