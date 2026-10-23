@@ -3555,8 +3555,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // decode kernel, 32 queries at a time (K8V4 runs the tensor kernel's mode 3: INT8 K,
                     // V dequantized from its q4_0 blocks to fp16 at gather)
                     static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
-                    // STRATA_PATTN_SM60=1 (qsa_pattn.hpp, sm_6x, int8 K/V): the decode kernels' output bit for bit, all
-                    // T queries in one fused launch (no partials, no merge kernel), in the same scratch
+                    // STRATA_PATTN_SM60=1 (qsa_pattn.hpp, sm_6x, int8 K/V): the decode kernels' output bit for bit from a
+                    // score kernel and a value kernel that merges as it folds (no partials, no merge kernel), ~100
+                    // queries a batch in the same scratch
                     if (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
                                                                             m.attn, T, m.cs))
                         if (!(strata::kernels::pattn_mode() != 0 &&
