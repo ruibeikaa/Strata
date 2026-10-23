@@ -657,7 +657,12 @@ long long grouped_parity(const Layer& Y, std::mt19937& rng, int plans, const voi
     // mode 0: the CUDA layout
     const Var vars[] = { { -1, -1, false, "default, card" }, { 0, -1, false, "S, card" }, { 1, -1, false, "P, card" },
                          { -1, -1, true, "default, card, V1" }, { -1, 0, false, "default, mode 0" },
-                         { 0, 0, false, "S, mode 0" }, { 1, 0, false, "P, mode 0" }, { -1, 0, true, "default, mode 0, V1" } };
+                         { 0, 0, false, "S, mode 0" }, { 1, 0, false, "P, mode 0" }, { -1, 0, true, "default, mode 0, V1" },
+                         // gu-proto (nib_gu_proto.cuh): the staged-once variants, gate / up compared in mode 0
+                         { 31, -1, false, "gu 31 RB2, card" }, { 31, 0, false, "gu 31 RB2, mode 0" },
+                         { 31, 0, true, "gu 31 RB2, mode 0, V1" }, { 30, 0, false, "gu 30 RB1, mode 0" },
+                         { 32, 0, false, "gu 32 RB4, mode 0" }, { 33, 0, false, "gu 33 RB5, mode 0" },
+                         { 35, 0, false, "gu 35 RB10, mode 0" } };
     constexpr int NV = (int) (sizeof vars / sizeof vars[0]);
     long long rows[NV] = {}, bad[NV][5] = {}, total = 0;
     for (const Case& cs : cases)
