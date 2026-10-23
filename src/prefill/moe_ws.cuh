@@ -130,8 +130,9 @@ void gu_iq2_s(const Layer& L, double u, cudaStream_t s);
 void gu_iq3_xxs(const Layer& L, double u, cudaStream_t s);
 void gu_iq3_s(const Layer& L, double u, cudaStream_t s);
 // STRATA_EXPERT_NIBBLE: a layer whose gate/up experts are 4-bit codes (Layer::gu_nib; IQ2_S, IQ3_XXS, IQ3_S;
-// moe_ws_gu_nib.cu, built where STRATA_EXPERT_NIBBLE_BUILT)
-void gu_nib(const Layer& L, double u, cudaStream_t s);
+// moe_ws_gu_nib.cu, built where STRATA_EXPERT_NIBBLE_BUILT).  `fast`: ws::fast() (STRATA_WS_FAST=1) - the 32-token
+// tier's fast kernel, the same GU rows
+void gu_nib(const Layer& L, double u, cudaStream_t s, bool fast);
 void dn_q2_0(const Layer& L, double u, cudaStream_t s);
 // `fast`: ws::fast() (STRATA_WS_FAST=1) - the 32-token tier's fast kernel, the same Dm rows
 void dn_iq4_nl(const Layer& L, double u, cudaStream_t s, bool fast);

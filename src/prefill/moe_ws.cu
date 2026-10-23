@@ -125,9 +125,18 @@ bool gate_up(const Layer& L, void* stream) {
     const double u = (double) L.rows / L.n;
     if (mode() != 1 || !faster(L.gu_type, u)) return false;
     const cudaStream_t s = (cudaStream_t) stream;
+    const bool f = fast() == 1;
+    if (f) {   // once per process: the switch is on and the WS path runs
+        static const bool said = [] {
+            std::fprintf(stderr, "strata prefill: STRATA_WS_FAST=1: the weight-stationary 32-token tier with 16-byte "
+                                 "staging, switched token groups and transposed dy (the same GU / Dm bits)\n");
+            return true;
+        }();
+        (void) said;
+    }
     if (L.gu_nib) {   // STRATA_EXPERT_NIBBLE: the 4-bit slots' kernels (moe_ws_gu_nib.cu), the same GU rows
 #if STRATA_EXPERT_NIBBLE_BUILT
-        detail::gu_nib(L, u, s);
+        detail::gu_nib(L, u, s, f);
         return true;
 #else   // no 4-bit slots without the kernels (the switch is refused at start), so this is not reached
         std::fprintf(stderr, "prefill ws: 4-bit gate/up slots have no kernel in this build\n");
@@ -153,19 +162,7 @@ void down(const Layer& L, void* stream) {
     const cudaStream_t s = (cudaStream_t) stream;
     switch (L.d_type) {
         case GGML_TYPE_Q2_0: detail::dn_q2_0(L, u, s); break;
-        case GGML_TYPE_IQ4_NL: {
-            const bool f = fast() == 1;
-            if (f) {   // once per process: the switch is on and the WS path runs
-                static const bool said = [] {
-                    std::fprintf(stderr, "strata prefill: STRATA_WS_FAST=1: the weight-stationary IQ4_NL down's 32-token "
-                                         "tier with switched token pairs and transposed dy (the same Dm bits)\n");
-                    return true;
-                }();
-                (void) said;
-            }
-            detail::dn_iq4_nl(L, u, s, f);
-            break;
-        }
+        case GGML_TYPE_IQ4_NL: detail::dn_iq4_nl(L, u, s, fast() == 1); break;
         default:
             std::fprintf(stderr, "prefill ws: down type %d has no kernel\n", L.d_type);
             std::exit(1);
