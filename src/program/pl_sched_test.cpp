@@ -78,6 +78,7 @@ struct World {
     int64_t cancel_at = -1;              // the verdict (0-based) after which the request is cancelled
     int64_t max_context = (int64_t) 1 << 40;
     int lookup_t = 0;                    // > 0: lookups offered where lk is set, the policy takes up to this many rows
+    double lkc_rate = 0.0;               // lookup chaining: the share of positions where lookup_after proposes
 
     int32_t truth(int64_t q) const {
         if (q == eos_pos) return kEos;
@@ -288,7 +289,7 @@ public:
         const int k = std::min(max_k, 15);
         for (int i = 0; i < k; ++i) out.tok[i] = W_.g_lkok(q0 + i) ? W_.truth(q0 + i) : W_.truth(q0 + i) + 1;
         out.k = k;
-        out.match = 8;
+        out.match = W_.lkc_rate > 0.0 ? 3 + (int) (mix64((uint64_t) q0 * 0x77u + W_.salt) % 40) : 8;
         return k;
     }
     bool lookup_choose(int T, int k, int match, int& tt) override {
@@ -297,6 +298,28 @@ public:
         tt = std::min(W_.g_lk_t(emit_end - 1), k + 1);
         return tt >= 2;
     }
+    // lookup chaining: the pending tokens sit at emit_end.. (the oldest window's row 0, at emit_end - 1, is emitted).
+    // Proposed where the world says so (per position and whether the pending text is the serial loop's); right where
+    // the pending text is right and lkok says so, wrong otherwise; a random match length
+    int lookup_after(const int32_t* pend, int n, int max_k, Lookup& out) override {
+        out = Lookup{};
+        if (W_.lkc_rate <= 0.0 || n < 0) return 0;
+        bool right = true;
+        for (int i = 0; i < n; ++i) right = right && pend[i] == W_.truth(emit_end + i);
+        const int64_t q0 = emit_end + n;
+        const uint64_t h = mix64((uint64_t) q0 * 0x51u + W_.salt + (right ? 0u : 977u));
+        if ((double) (h % 1000) >= W_.lkc_rate * 1000.0) return 0;
+        const int k = std::min(max_k, 15);
+        for (int i = 0; i < k; ++i) {
+            const int64_t q = q0 + i;
+            out.tok[i] = right && W_.g_lkok(q) ? W_.truth(q) : W_.truth(q) + 2 + i;
+        }
+        out.k = k;
+        out.match = 3 + (int) ((h >> 12) % 40);
+        ++lkc_calls;
+        return k;
+    }
+    int64_t lkc_calls = 0;
     double now_ms() override { return t; }
     void trace(const char* ev, int seq, int x0, int x1) override {
         if (keep_log) {
@@ -3003,6 +3026,15 @@ struct Tally {
             st.cls_n[i] += s.cls_n[i];
             st.cls_ms[i] += s.cls_ms[i];
         }
+        st.lkc_windows += s.lkc_windows;
+        st.lkc_tokens += s.lkc_tokens;
+        st.lkc_reached += s.lkc_reached;
+        st.lkc_ok += s.lkc_ok;
+        st.lkc_div += s.lkc_div;
+        st.lkc_lkwin += s.lkc_lkwin;
+        st.lkc_fresh += s.lkc_fresh;
+        st.lkc_cut += s.lkc_cut;
+        st.lkc_lookups += s.lkc_lookups;
         st.c_made += s.c_made;
         st.c_launched += s.c_launched;
         st.c_on += s.c_on;
@@ -3408,6 +3440,58 @@ int main(int argc, char** argv) {
             check(tc[m].fails == 0, std::string("(c) exhaustive, mode ") + mode_name(kModes[m]));
         }
         std::printf("  [%.1f s]\n", secs());
+    }
+
+    // ---- (e) lookup chaining (STRATA_LKCHAIN): random worlds with lookup tails of 1..7 tokens on windows of up to 8
+    // rows, the lookups right or wrong, every gate (lkc_m, lkc_div, lkc_fresh) - B0 and B only (N2 refuses it)
+    if (only.empty() || only == "e") {
+        std::printf("(e) lookup chaining: random worlds until %lld verdicts per mode\n", (long long) random_target);
+        Tally te[3];
+        int64_t req = 0;
+        static const int kK[5] = {1, 2, 2, 4, 7}, kM[3] = {3, 8, 16};
+        for (uint64_t k = 0; te[2].verdicts < random_target && k < (uint64_t) random_target; ++k, ++req) {
+            RandomCase rc = make_random(seed * 7000003u + k);
+            Rng r(seed * 31u + k);
+            Config& c0 = rc.c;
+            c0.suffix = true;
+            c0.S = 8;
+            c0.S_sfx = std::min(8, c0.S_mtp + 2);
+            c0.lkc_k = kK[r.i(5)];
+            c0.lkc_m = kM[r.i(3)];
+            c0.lkc_div = r.p(0.5) ? 0 : 16;
+            c0.lkc_fresh = r.p(0.5) ? 0 : 16;
+            rc.w.lkc_rate = r.p(0.2) ? 0.95 : 0.5;
+            if (rc.w.lookup_t <= 0) rc.w.lookup_t = 4;
+            for (size_t i = 0; i < rc.w.lk.size(); ++i) rc.w.lk[i] = rc.w.lk[i] || r.p(0.05);
+            for (int m = 1; m < 3; ++m) {
+                Config c = c0;
+                c.mode = kModes[m];
+                if (kModes[m] == Mode::B && c.n_front < 2) c.n_front = 2;
+                const RunResult rr = run_model(rc.w, c, rc.tm, false, false);
+                te[m].add(rr);
+                if (!rr.ok && te[m].fails <= 3)
+                    std::printf("    lkchain #%llu %s: %s\n", (unsigned long long) k, mode_name(kModes[m]), rr.err.c_str());
+            }
+        }
+        for (int m = 1; m < 3; ++m) {
+            print_tally("lkchain", kModes[m], te[m]);
+            const Stats& s = te[m].st;
+            std::printf("    lookups %lld, tails %lld (%lld tokens), tested %lld (%lld accepted), cut %lld, chain differed %lld "
+                        "(lk windows %lld), fresh against the draft %lld\n", (long long) s.lkc_lookups,
+                        (long long) s.lkc_windows, (long long) s.lkc_tokens, (long long) s.lkc_reached, (long long) s.lkc_ok,
+                        (long long) s.lkc_cut, (long long) s.lkc_div, (long long) s.lkc_lkwin, (long long) s.lkc_fresh);
+            check(te[m].fails == 0, std::string("(e) lookup chaining, mode ") + mode_name(kModes[m]));
+            check(s.lkc_windows > 0 && s.lkc_ok > 0 && s.lkc_div > 0 && s.lkc_lkwin > 0 && s.lkc_fresh > 0,
+                  std::string("(e) lookup chaining, mode ") + mode_name(kModes[m]) + ": a path never taken");
+        }
+        // N2 refuses it (its parity with the old loop has no lookup tails)
+        {
+            Config c = base_config(Mode::N2);
+            c.lkc_k = 2;
+            std::string why;
+            check(!Sched::check(c, why), "(e) N2 accepted lookup chaining");
+        }
+        std::printf("  %lld requests [%.1f s]\n", (long long) req, secs());
     }
 
     // ---- (d) N2 against the old loop (on the worlds of (a), the first 3000 of (b), and part of (c))

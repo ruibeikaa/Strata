@@ -153,6 +153,14 @@ bool Sched::check(const Config& c, std::string& err) {
         err = "pl_sched: chain outputs out of range";
         return false;
     }
+    if ((c.lkc_k > 0 || c.lkc_fresh > 0) && c.mode == Mode::N2) {
+        err = "pl_sched: lookup chaining needs the per-stage undo (B0 or B), not N2";
+        return false;
+    }
+    if (c.lkc_k < 0 || c.lkc_k > kMaxRows - 1 || c.S_sfx < 0 || c.S_sfx > c.S) {
+        err = "pl_sched: lookup chaining's sizes out of range";
+        return false;
+    }
     return true;
 }
 
@@ -336,12 +344,23 @@ void Sched::release() {
 // past the window is the next window (a lookup window gets no chain-made window behind it)
 bool Sched::pick_lookup(PlIo& io, PW& w, const int32_t* chain0) {
     if (!c_.suffix || w.seq == 0) return true;
+    // S_sfx: today's S (lookup chaining raises S to 8 for its own tails; a plain lookup window keeps today's size)
+    const int s_sfx = c_.S_sfx > 0 ? c_.S_sfx : c_.S;
     Lookup L;
-    const int k = io.lookup_propose(2 * c_.S - 1, L);
-    if (k <= 0 || L.tok[0] != chain0[0]) return true;
+    const int k = io.lookup_propose(2 * s_sfx - 1, L);
+    if (k <= 0) return true;
+    // today: only where the drafter's own first guess agrees.  lkc_fresh: a fresh T=1 window (the drafter's first
+    // draft below spec_min_p) may take a long match's continuation even when its first token differs
+    bool against = false;
+    if (L.tok[0] != chain0[0]) {
+        if (!(c_.lkc_fresh > 0 && w.T == 1 && L.match >= c_.lkc_fresh)) return true;
+        against = true;
+    }
     int t = 0;
-    if (!io.lookup_choose(w.T, std::min(k, c_.S - 1), L.match, t)) return true;
-    if (t < 1 || t > c_.S) return fail("pl_sched: the lookup's window size is out of range");
+    if (!io.lookup_choose(w.T, std::min(k, s_sfx - 1), L.match, t)) return true;
+    if (t < 1 || t > s_sfx) return fail("pl_sched: the lookup's window size is out of range");
+    if (against && w.p + t > c_.max_context) return true;   // (never where the MTP's own window would have fitted)
+    if (against) ++st_.lkc_fresh;
     w.T = t;
     for (int i = 1; i < w.T; ++i) {
         w.tok[i] = L.tok[i - 1];
@@ -354,7 +373,7 @@ bool Sched::pick_lookup(PlIo& io, PW& w, const int32_t* chain0) {
         PW b;
         b.seq = w.seq + 1;
         b.p = w.p + w.T;
-        b.T = std::min(c_.S, rest);
+        b.T = std::min(s_sfx, rest);
         for (int i = 0; i < b.T; ++i) b.tok[i] = L.tok[w.T - 1 + i];
         for (int i = 1; i < b.T; ++i) b.prob[i - 1] = 1.0f;
         b.p_on = c_.lookup_pon;
@@ -373,14 +392,124 @@ bool Sched::pick_lookup(PlIo& io, PW& w, const int32_t* chain0) {
     return true;
 }
 
+// ---- lookup chaining (STRATA_LKCHAIN): the lookup's estimate that a chained token is right, by its match length
+// (analysis 2026-10-11-tree-spec accept.md section 5: first-token accuracy 0.46 / 0.62 / 0.82 / 0.92 / 0.95 for matches
+// 3 / 4-7 / 8-15 / 16-31 / >= 32 over 677 real Swift messages)
+float Sched::lkc_q(int match) {
+    return match < 4 ? 0.5f : match < 8 ? 0.65f : match < 16 ? 0.85f : match < 32 ? 0.93f : 0.96f;
+}
+
+// the tokens not yet committed, in order: the oldest window's drafts (its row 0 is committed text already: the
+// verdict that made it emitted it), every later window's rows up to `w` (pushed: w is in win_; else w follows them).
+// -1: too many, or w not found
+int Sched::lkc_pending(const PW& w, bool pushed, int32_t* out, int cap) const {
+    int n = 0;
+    auto add = [&](const PW& x, int from) -> bool {
+        for (int i = from; i < x.T; ++i) {
+            if (n >= cap) return false;
+            out[n++] = x.tok[i];
+        }
+        return true;
+    };
+    for (int j = 0; j < nwin_; ++j) {
+        if (!add(win_[j], j == 0 ? 1 : 0)) return -1;
+        if (pushed && win_[j].uid == w.uid) return n;
+    }
+    if (pushed) return -1;
+    if (!add(w, nwin_ == 0 ? 1 : 0)) return -1;
+    return n;
+}
+
+// w's MTP rows are decided (its drafts are the chain's outputs up to index idx_after - 1): up to lkc_k tokens of the
+// lookup over the context + every pending token follow them, when its match is at least lkc_m.  A chain output that has
+// landed at a tail position and differs from the lookup's token ends the tail there (lkc_div: unless the match is that
+// long).  Verification is untouched: the window only holds more tokens to check.
+void Sched::lkc_extend(PlIo& io, PW& w, bool pushed, const int32_t* oc, int idx_after, int k_landed) {
+    if (c_.lkc_k <= 0 || !c_.suffix || w.seq == 0 || w.sfx || w.lk) return;
+    // never past the context's edge: there the request would end on a window the MTP's own would have fitted
+    const int room = (int) std::min<int64_t>(std::min(c_.lkc_k, c_.S - w.T), c_.max_context - (w.p + w.T));
+    if (room <= 0) return;
+    int32_t pend[64];
+    const int n = lkc_pending(w, pushed, pend, 64);
+    if (n < 1) return;
+    Lookup L;
+    ++st_.lkc_lookups;
+    const int k = io.lookup_after(pend, n, room, L);
+    if (k <= 0 || L.match < c_.lkc_m) return;
+    int take = std::min(k, room);
+    if (!(c_.lkc_div > 0 && L.match >= c_.lkc_div)) {
+        int j = 0;
+        while (j < take && idx_after + j < k_landed && oc[idx_after + j] == L.tok[j]) ++j;
+        if (j < take && idx_after + j < k_landed) {
+            take = j;
+            ++st_.lkc_cut;
+        }
+    }
+    if (take <= 0) return;
+    if (c_.lkc_policy) {
+        double pm = 1.0;
+        for (int i = 0; i + 1 < w.T; ++i) pm *= w.prob[i];
+        take = std::min(take, io.lookup_chain_choose(w.T, pm, take, L.match));
+        if (take <= 0) return;
+    }
+    const float q = lkc_q(L.match);
+    for (int i = 0; i < take; ++i) {
+        w.tok[w.T + i] = L.tok[i];
+        w.prob[w.T - 1 + i] = q;
+    }
+    w.T += take;
+    w.lkc = take;
+    w.lkc_match = L.match;
+    ++st_.lkc_windows;
+    st_.lkc_tokens += take;
+    io.trace("LC", w.seq, take, L.match);
+}
+
+// the chain's outputs past `pred`'s lookup tail followed the chain's own text, not the window's: the window behind
+// pred comes from the lookup's continuation instead (one guess deep, as today's pick_lookup), or none is made.
+// false: an error (err_ set)
+bool Sched::lkc_lk_window(PlIo& io, PW& pred) {
+    if (nwin_ != 1 || &pred != &win_[0] || c_.lookup_pon <= 0.0f) return true;
+    int32_t pend[64];
+    const int n = lkc_pending(pred, true, pend, 64);
+    if (n < 1) return true;
+    Lookup L;
+    const int k = io.lookup_after(pend, n, c_.S, L);
+    if (k < 1 || L.match < c_.lkc_m) return true;
+    float pa = 1.0f;
+    for (int i = 0; i + 1 < pred.T; ++i) pa *= pred.prob[i];
+    const float q = lkc_q(L.match);
+    PW b;
+    b.seq = pred.seq + 1;
+    b.p = pred.p + pred.T;
+    b.T = (int) std::min<int64_t>(std::min(c_.S, k), c_.max_context - (pred.p + pred.T));
+    if (b.T < 1) return true;
+    for (int i = 0; i < b.T; ++i) b.tok[i] = L.tok[i];
+    for (int i = 1; i < b.T; ++i) b.prob[i - 1] = q;
+    b.p_on = pa * q;
+    b.ready = true;
+    b.made = true;
+    b.lk = true;
+    b.lvl = 1;
+    b.uid = next_uid_++;
+    b.ple_in[0] = pred.ple_in[0];
+    b.ple_in[1] = pred.ple_in[1];
+    ple_adv(b.ple_in, pred.tok, pred.T);
+    win_[nwin_++] = b;
+    ++st_.lkc_lkwin;
+    io.trace("CD", pred.seq, 5, (int) (1000.0f * b.p_on));
+    return !c_.per_stage() || try_prestage(io, nwin_ - 1);
+}
+
 // a fresh window's size from the chain's first outputs (today: A once a draft below spec_min_p ends it)
-bool Sched::decide_fresh(PlIo& io, PW& A, const int32_t* oc, const float* op, int avail, bool early) {
+bool Sched::decide_fresh(PlIo& io, PW& A, const int32_t* oc, const float* op, int avail, bool early, int k_landed) {
     A.T = t_rule(op, 0, avail);
     for (int i = 1; i < A.T; ++i) {
         A.tok[i] = oc[i - 1];
         A.prob[i - 1] = op[i - 1];
     }
     if (!pick_lookup(io, A, oc)) return false;
+    if (c_.lkc_k > 0 && !A.sfx) lkc_extend(io, A, true, oc, A.T - 1, k_landed);
     A.ready = true;
     ch_.early_used = true;
     if (early) io.trace("CE", A.seq, A.T, 0);
@@ -408,6 +537,20 @@ bool Sched::decide_next(PlIo& io, int k, bool done) {
             if (op[j] < (float) c_.spec_min_p) { decided = true; break; }
     if (!decided) return false;
     if (done && k < base + c_.S_mtp) ++st_.case_hits[kCase8];   // the chain ended before the window's size said so
+    // lookup chaining: pred's lookup tail sits at chain outputs [base - lkc, base).  Where the chain's own outputs there
+    // differ, its outputs from then on followed its own text, not pred's: nothing behind pred comes from them
+    if (c_.lkc_k > 0 && !ch_.pred_forced && pred->lkc > 0) {
+        bool agree = k >= base;
+        for (int i = 0; agree && i < pred->lkc; ++i) agree = oc[base - pred->lkc + i] == pred->tok[pred->T - pred->lkc + i];
+        if (!agree) {
+            ++st_.lkc_div;
+            io.trace("CD", pred->seq, 4, 0);
+            ch_.targets = 0;
+            ch_.done_first = true;
+            if (!lkc_lk_window(io, *pred)) return false;
+            return true;
+        }
+    }
     float pa = 1.0f;
     if (ch_.pa_ready) {
         pa = ch_.pa;
@@ -417,6 +560,10 @@ bool Sched::decide_next(PlIo& io, int k, bool done) {
         // are unlikely to be accepted whole
         bool agree = true;
         for (int i = 0; i < ch_.n_force; ++i) {
+            if (ch_.force_lk[i]) {   // a lookup tail's token: the drafter's own pick says little about it
+                pa *= ch_.force_prob[i];
+                continue;
+            }
             if (oc[i] != ch_.force[i]) agree = false;
             pa *= c_.agree ? op[i] : ch_.force_prob[i];
         }
@@ -446,6 +593,7 @@ bool Sched::decide_next(PlIo& io, int k, bool done) {
         y.p_on = pa * op[base];
         const int fm = lvl >= 2 ? c_.force_miss_c : c_.force_miss;
         if (fm > 0 && ++(lvl >= 2 ? st_.fm_c : st_.fm) % fm == 0) y.tok[0] = y.tok[0] == 0 ? 1 : 0;
+        if (c_.lkc_k > 0) lkc_extend(io, y, false, oc, base + y.T, k);
         y.ready = true;
         y.made = true;
         y.lvl = (uint8_t) lvl;
@@ -490,6 +638,7 @@ bool Sched::decide_next(PlIo& io, int k, bool done) {
     --ch_.targets;
     ch_.done_first = true;
     if (Y != nullptr) {
+        ch_.pred_forced = false;
         ch_.pred_uid = Y->uid;
         ch_.base = base + Y->T;
         ch_.pa = Y->p_on;
@@ -523,7 +672,7 @@ bool Sched::chain_round(PlIo& io) {
         if (!decided && c_.spec_min_p > 0.0)
             for (int j = 0; j < k; ++j)
                 if (io.chain_prob()[j] < (float) c_.spec_min_p) { decided = true; break; }
-        if (decided && !decide_fresh(io, *A, io.chain_tok(), io.chain_prob(), std::min(k, c_.S_mtp - 1), true))
+        if (decided && !decide_fresh(io, *A, io.chain_tok(), io.chain_prob(), std::min(k, c_.S_mtp - 1), true, k))
             return false;
     }
     const int r = io.chain_poll();
@@ -533,7 +682,8 @@ bool Sched::chain_round(PlIo& io) {
     const int k = r == 1 ? ch_.n : k_ready;
     if (r == 1 && ch_.kind == 2 && !ch_.early_used) {
         if (A == nullptr) return fail("pl_sched: the fresh window of the chain is gone");
-        if (!decide_fresh(io, *A, io.chain_tok(), io.chain_prob(), std::min(ch_.n, c_.S_mtp - 1), false)) return false;
+        if (!decide_fresh(io, *A, io.chain_tok(), io.chain_prob(), std::min(ch_.n, c_.S_mtp - 1), false, ch_.n))
+            return false;
     }
     while (ch_.targets > 0 && (ch_.kind == 1 || ch_.early_used))
         if (!decide_next(io, k, r == 1)) break;
@@ -593,7 +743,10 @@ bool Sched::launch_chain(PlIo& io, const ChainReq& r) {
         if (nwin_ < f + 1 || win_[f].seq != r.src_seq + 1 || !win_[f].launched)
             return fail("pl_sched: a forced chain without the window behind its source");
         const PW& X1 = win_[f];
+        // lookup chaining: the tokens of a lookup tail (or of a window made from the lookup) are not the drafter's
+        auto lk_tok = [&](const PW& x, int i) { return c_.lkc_k > 0 && (x.lk || i >= x.T - x.lkc); };
         for (int i = 1; i < X1.T; ++i) {
+            ch_.force_lk[ch_.n_force] = lk_tok(X1, i);
             ch_.force[ch_.n_force] = X1.tok[i];
             ch_.force_prob[ch_.n_force++] = X1.prob[i - 1];
         }
@@ -612,15 +765,18 @@ bool Sched::launch_chain(PlIo& io, const ChainReq& r) {
                 return true;
             }
             for (int i = 0; i < X2.T; ++i) {
+                ch_.force_lk[ch_.n_force] = lk_tok(X2, i);
                 ch_.force[ch_.n_force] = X2.tok[i];
                 ch_.force_prob[ch_.n_force++] = i == 0 ? 1.0f : X2.prob[i - 1];
             }
         }
         ch_.targets = depth - (nwin_ - f);
         ch_.pred_uid = win_[nwin_ - 1].uid;
+        ch_.pred_forced = true;
         ch_.base = ch_.n_force;
         ch_.pa_ready = false;
-        n_out = std::min(cap, ch_.n_force + c_.S_mtp * std::max(1, ch_.targets));
+        // (lookup chaining: a new window may take lkc_k more outputs, whose agreement decides the one behind it)
+        n_out = std::min(cap, ch_.n_force + (c_.S_mtp + std::max(0, c_.lkc_k)) * std::max(1, ch_.targets));
     }
     for (int i = 0; i < ch_.n_force; ++i) o.force[i] = ch_.force[i];
     o.n_force = ch_.n_force;
@@ -909,6 +1065,10 @@ bool Sched::verdict(PlIo& io) {
         if (W.spec) ++st_.case_hits[kCase6];
     }
     if (W.sfx || (X != nullptr && X->lk)) ++st_.case_hits[kCase9];
+    if (W.lkc > 0 && a >= W.T - W.lkc - 1) {   // every MTP draft accepted: the lookup tail was tested
+        ++st_.lkc_reached;
+        st_.lkc_ok += a - (W.T - W.lkc - 1);
+    }
     if (!last) {
         PlOp o;
         o.op = Op::AdaptVerdict;
