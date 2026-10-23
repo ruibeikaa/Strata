@@ -22,6 +22,8 @@ and Metal keep their guards; Metal gets stubs for the new CUDA-side symbols.
 | 11b4839d | P2 (author sergiywith): swiglu + q8_1, and the MoE combine + hyper-connection write, fused | `STRATA_PREFILL_SWIGLU_QUANT=1`, `STRATA_PREFILL_COMBINE_WRITE=1` |
 | 793207a6, e189b1c2, 6a19d236 | P3-P5: weight-stationary expert kernels for a fully resident layer's prompt pass, one launch per product, 4-bit slots too | `STRATA_MMQ_WS=1` |
 | b85c231f | P6: free the host expert arena once every expert is VRAM-resident | `STRATA_ARENA_FREE=1` |
+| 87a6146e, dc842d8f | (branch pf-batch1) the WS 32-token tier's gate/up on 4-bit slots and IQ4_NL down with fewer instructions per pass, same bits; `moe_ws_prof_bench` | `STRATA_WS_FAST=1` |
+| 84d57f48 | (branch pf-batch1) conversation checkpoints kept evenly spaced over the conversation | `--prompt-cache-uniform` (`--prompt-cache-recent N`), or `STRATA_CKPT_UNIFORM=N` |
 
 Open upstream PRs carrying parts of this stack (each rebased on its own, so its hashes differ from the ones above):
 
