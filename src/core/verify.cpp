@@ -72,6 +72,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <initializer_list>
+#include <stdexcept>
 #include <immintrin.h>
 
 #if defined(STRATA_GPU_METAL)
@@ -164,6 +166,10 @@ inline bool g_qdedup() { static const bool on = [] { const char* v = std::getenv
 // fork F4 (Eddoursul): 2-4 token dense projections read an interleaved copy of the q8_1 activations (bitwise the same
 // outputs); STRATA_MMVQ_IL=0 keeps native_mmvq's multi-column kernels
 inline bool g_mmvq_il() { static const bool on = [] { const char* v = std::getenv("STRATA_MMVQ_IL"); return v == nullptr || v[0] != '0'; }(); return on; }
+// STRATA_DENSE_PROTO=1 (opt-in, PH402): the mixers' Q8_0 projections run q8sm60p (loads first, bitwise native_mmvq's
+// outputs) and the projections that read the same q8_1 input run as one launch (GDN qkv + z, QSA k + v, and q with
+// them when q is not on a branch); STRATA_DENSE_PROTO_GROUP=0 keeps one launch each
+inline bool g_dense_group() { static const bool on = [] { const char* v = std::getenv("STRATA_DENSE_PROTO_GROUP"); return v == nullptr || v[0] != '0'; }(); return on; }
 // STRATA_SELECT_LONG=1 (opt-in): a window graph past select_long_at() cells takes the long-context QSA select
 // (qsa_block_topk_long's multi-CTA top-k through topk_scratch_, qsa_block_scores_long's shuffle-free decode scorer;
 // both compute capability 6.x by default, the same ids and score bits).  Each costs ~6 more kernels a call, which only
@@ -1363,6 +1369,25 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 native_mmvq(w->native_type, w->native_data, xq_, out, n_in, n_out, n, cs);
             }
         };
+        // STRATA_DENSE_PROTO: 1-3 projections of the q8_1 rows in xq_ (their readiness is checked per layer, so a
+        // refusal here is an error, not a fallback)
+        auto mmf = [&](std::initializer_list<const WeightRef*> ws, std::initializer_list<float*> outs,
+                       std::initializer_list<int> n_outs, int n_in, cudaStream_t st) {
+            const void* wd[3] = {};
+            float* yo[3] = {};
+            int no[3] = {};
+            int k = 0;
+            for (const WeightRef* w : ws) wd[k++] = w->native_data;
+            k = 0;
+            for (float* o : outs) yo[k++] = o;
+            k = 0;
+            for (int o : n_outs) no[k++] = o;
+            if (!strata::kernels::native_q8_group(wd, yo, no, k, xq_, n_in, n, st))
+                throw std::runtime_error("STRATA_DENSE_PROTO: a grouped projection was refused");
+        };
+        auto fready = [&](const WeightRef* w, int n_in, int n_out) {
+            return strata::kernels::native_q8_group_ready(w->native_data, n_in, n_out, n);
+        };
         try {
             if (!is_qsa_layer(g, l)) {
                 // ======================= GDN =======================
@@ -1389,6 +1414,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                  (int) HV, n, side_);
                     if (cudaEventRecord(mjoin_, side_) != cudaSuccess) { err = "verify: the GDN gates' branch could not join"; return false; }
                 }
+                // STRATA_DENSE_PROTO: qkv, z and the out projection on q8sm60p (qkv + z as one launch)
+                const bool dpg = strata::kernels::native_dense_proto_on() && !q8_attn && !g_qfuse() && !side_proj &&
+                                 n <= 4 && fready(wqkv, (int) N, (int) C) && fready(wg, (int) N, (int) ZV) &&
+                                 fready(wout, (int) ZV, (int) N);
+                const bool dpg_group = dpg && g_dense_group();   // qkv + z in one launch on cs
                 if (!q8_attn) quant_in(xm, (int) N);
                 if (side_proj) {   // the gate projection (compute-bound for i-quants) beside qkv and the conv
                     // the branch reads F4's interleaved copy too (written on cs before the fork; bitwise native_mmvq's
@@ -1412,10 +1442,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                  (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
                                  (int) HV, n, df_side_[0]);
                     fork(1);
+                    if (dpg_group) {}   // z runs with qkv below; the empty branch still joins
+                    else if (dpg) mmf({wg}, {z_ + (size_t) tb * ZV}, {(int) ZV}, (int) N, df_side_[1]);
+                    else
                     native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n,
                                 df_side_[1]);
                 }
                 const bool fuse_ab = fuse_convab_on() && !br && !batch_rec_ && !prof_on_ && !sidem;   // the side mixer computes the gates on its branch
+                if (dpg_group && (br || !side_proj))
+                    mmf({wqkv, wg}, {qkv + (size_t) tb * C, z_ + (size_t) tb * ZV}, {(int) C, (int) ZV}, (int) N, cs);
+                else if (dpg) mmf({wqkv}, {qkv + (size_t) tb * C}, {(int) C}, (int) N, cs);
+                else
                 if (!side_proj) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
                 stamp(l, 2, grp);
                 if (batch_rec_) {   // contiguous rows may be proposals for the same slot
@@ -1449,6 +1486,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
                              n, cs);
                 stamp(l, 4, grp);
+                if (dpg) { if (!dpg_group) mmf({wg}, {z_ + (size_t) tb * ZV}, {(int) ZV}, (int) N, cs); }   // grouped: done with qkv
+                else
                 if (!side_proj) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
                 stamp(l, 5, grp);
                 if (side_proj && cudaStreamWaitEvent(cs, pjoin_, 0) != cudaSuccess) {
@@ -1496,9 +1535,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 6, grp);
                 // STRATA_QFUSE: done above by gdn_step_norm_multi - but a batch's per-slot recurrence passes it no q8_1
                 // destination (#1139: the out-projection read stale bytes), so that case quantizes here as without it
+                if (dpg) {
+                    quant_in(y_ + (size_t) tb * ZV, (int) ZV);
+                    mmf({wout}, {bo_ + tb * N}, {(int) N}, (int) ZV, cs);
+                } else {
                 if (!g_qfuse() || batch_rec_) quant_in(y_ + (size_t) tb * ZV, (int) ZV);
                 else il_ready = false;
                 mm(wout, bo_ + tb * N, (int) ZV, (int) N);
+                }
             } else {
                 // ======================= QSA =======================
                 const int64_t qi = qsa_idx[(size_t) l];
@@ -1544,12 +1588,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     return e == nullptr || std::atoi(e) != 0;
                 }();
                 const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && (!st.kv_q4 || qb_q4);
+                // STRATA_DENSE_PROTO: q, k, v and the out projection on q8sm60p (k + v, and q with them, as one launch)
+                const bool dpq = strata::kernels::native_dense_proto_on() && !q8_attn && !side_proj && n <= 4 &&
+                                 fready(wq, (int) N, (int) (NH * 2 * HD)) && fready(wk, (int) N, (int) (NKV * HD)) &&
+                                 fready(wv, (int) N, (int) (NKV * HD)) && fready(wo, (int) (NH * HD), (int) N);
                 if (!q8_attn) quant_in(xm, (int) N);
                 // STRATA_DF_BRANCH: the query side (q and its norm/RoPE/rotation on side 0, the indexer query on side 1)
                 // beside the K/V side; the indexer query joins before the block scores, the query before attention
                 const bool qbr = br && qb;
+                const bool dpq_q3 = dpq && g_dense_group() && !qbr;   // q with k and v (q_chain then skips its GEMV)
                 if (qbr) {
                     fork(0);
+                    if (dpq) mmf({wq}, {qfull_ + tb * NH * 2 * HD}, {(int) (NH * 2 * HD)}, (int) N, df_side_[0]);
+                    else
                     native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
                                 (int) (NH * 2 * HD), n, df_side_[0]);
                     copy_rows_strided(qcur_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, (int64_t) n * NH, HD, 2 * HD,
@@ -1636,6 +1687,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const bool q_il = side_proj && g_mmvq_il() &&
                                   strata::kernels::native_mmvq_il_supported(wq->native_type, n, (int) (NH * 2 * HD));
                 auto q_chain = [&](cudaStream_t ns) -> bool {
+                    if (dpq) {
+                        if (!dpq_q3) mmf({wq}, {qfull_ + tb * NH * 2 * HD}, {(int) (NH * 2 * HD)}, (int) N, ns);
+                    } else
                     if (ns == cs) mm(wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));
                     else if (q_il) strata::kernels::native_mmvq_il(wq->native_type, wq->native_data, xq_, xil_,
                                                                    qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD), n, ns);
@@ -1689,8 +1743,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 if (!sidem) idx_key(cs);
                 stamp(l, 7, grp);
+                if (dpq_q3)
+                    mmf({wq, wk, wv}, {qfull_ + tb * NH * 2 * HD, kcur_ + tb * NKV * HD, vcur_ + tb * NKV * HD},
+                        {(int) (NH * 2 * HD), (int) (NKV * HD), (int) (NKV * HD)}, (int) N, cs);
+                else if (dpq && g_dense_group())
+                    mmf({wk, wv}, {kcur_ + tb * NKV * HD, vcur_ + tb * NKV * HD}, {(int) (NKV * HD), (int) (NKV * HD)},
+                        (int) N, cs);
+                else if (dpq) {
+                    mmf({wk}, {kcur_ + tb * NKV * HD}, {(int) (NKV * HD)}, (int) N, cs);
+                    mmf({wv}, {vcur_ + tb * NKV * HD}, {(int) (NKV * HD)}, (int) N, cs);
+                } else {
                 mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
                 mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                }
                 if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
                 else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
                 if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)
@@ -1873,8 +1938,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         qsa_gate_apply_f32(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, s, attn32_ + t * NH * HD, cs);
                 }
                 stamp(l, 14, grp);
+                if (dpq) {
+                    quant_in(attn32_ + tb * NH * HD, (int) (NH * HD));
+                    mmf({wo}, {bo_ + tb * N}, {(int) N}, (int) (NH * HD), cs);
+                } else {
                 quant_in(attn32_ + tb * NH * HD, (int) (NH * HD));
                 mm(wo, bo_ + tb * N, (int) (NH * HD), (int) N);
+                }
             }
         } catch (const std::exception& e) {
             err = "verify layer " + std::to_string(l) + ": " + e.what();

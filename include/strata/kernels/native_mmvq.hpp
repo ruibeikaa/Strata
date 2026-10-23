@@ -120,6 +120,15 @@ bool native_q8_0_sm60_pack_quiet(const void* weights, int n_in, int n_out, const
 /// native_q8_0_sm60_pack makes. Either way native_q8_0_sm60_release must run before the caller frees the matrix.
 bool native_q8_0_sm60_pack_in_place(void* weights, int n_in, int n_out, const char* what);
 void native_q8_0_sm60_release(const void* weights);
+/// STRATA_DENSE_PROTO=1 (opt-in, with STRATA_Q8_SM60=1 on a compute capability 6.0 device): up to three Q8_0 decode
+/// GEMVs that read the same q8_1 activations run as one launch of q8sm60p (q8_sm60_proto.cuh: a lane's 16-byte weight
+/// chunks issued before their first use; per row the same arithmetic as q8sm60, so every output is bitwise
+/// native_mmvq's). native_q8_group_ready: the matrix is packed for q8sm60 and its shape / column count is one the
+/// prototype takes. native_q8_group: false = nothing launched (the caller runs native_mmvq).
+bool native_dense_proto_on();
+bool native_q8_group_ready(const void* weights, int n_in, int n_out, int ncols);
+bool native_q8_group(const void* const* weights, float* const* y, const int* n_out, int nseg, const void* x_q8_1,
+                     int n_in, int ncols, void* stream);
 
 /// STRATA_Q6_PACKED=1 (opt-in): a packed copy of a Q6_K matrix (the output heads) - the same bytes as ql / qh /
 /// scales / d planes - that native_q6_k_mmvq calls on `weights` read instead (bitwise equal outputs). The copy is
