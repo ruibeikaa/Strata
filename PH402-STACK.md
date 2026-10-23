@@ -24,6 +24,9 @@ and Metal keep their guards; Metal gets stubs for the new CUDA-side symbols.
 | b85c231f | P6: free the host expert arena once every expert is VRAM-resident | `STRATA_ARENA_FREE=1` |
 | 87a6146e, dc842d8f | (branch pf-batch1) the WS 32-token tier's gate/up on 4-bit slots and IQ4_NL down with fewer instructions per pass, same bits; `moe_ws_prof_bench` | `STRATA_WS_FAST=1` |
 | 84d57f48 | (branch pf-batch1) conversation checkpoints kept evenly spaced over the conversation | `--prompt-cache-uniform` (`--prompt-cache-recent N`), or `STRATA_CKPT_UNIFORM=N` |
+| 3a36fb00 | (branch dense-proto) decode Q8_0 projections of the mixers loads-first (q8sm60p), the projections reading the same q8_1 input as one launch (GDN qkv + z, QSA q + k + v), same bits | `STRATA_DENSE_PROTO=1` (needs `STRATA_Q8_SM60=1`; `STRATA_DENSE_PROTO_GROUP=0` keeps one launch each) |
+| 26de30af | (branch qsadec-proto) decode-window QSA select (split-tree scorer with the tail and first radix pass fused) and attention (loads-first chunk kernel + merge v2), same bits; `qsadec_bench` (`-DSTRATA_QSADEC_BENCH=ON`) | `STRATA_QSADEC_PROTO=1` (2 select only, 3 attention only; the select part needs `STRATA_SELECT_LONG=1`) |
+| 4a287011 | (branch pf-batch2 9b9d00ad) a layer split's draft layer prompt K/V queued on the drafter's stream behind the next chunk, same K/V | `STRATA_MTP_PF_BATCH=1` (`STRATA_MTP_PF_BATCH_ROWS`, default 2048) |
 
 Open upstream PRs carrying parts of this stack (each rebased on its own, so its hashes differ from the ones above):
 
