@@ -25,6 +25,7 @@
 
 #include "moe_ws.cuh"
 #include "strata/core/expert_nibble.hpp"
+#include "moe_ws_v2.cuh"   // STRATA_WS_V2's two-row kernel
 
 #include <cstdint>
 #include <cstdio>
@@ -474,6 +475,13 @@ void go(F kernel, const Layer& L, cudaStream_t s) {
                                                          (int) L.rows, L.gu);
 }
 
+// STRATA_WS_V2: v2::gu_kernel<32, CH, 4, FMT, V> (v2::gu_pieces<V>() pieces a chunk)
+template <int CH, int FMT, int V>
+void go_v2(const Layer& L, cudaStream_t s) {
+    v2::gu_kernel<32, CH, 4, FMT, V><<<(unsigned) (L.nchunks * v2::gu_pieces<V>()), v2::NT, 0, s>>>(
+        L.chunks, (const char*) L.w, L.xoff, (const block_q8_1_mmq*) L.xq, (int) L.rows, L.gu);
+}
+
 }  // namespace
 
 // tokens per pass by u (rows per routed expert), the crossovers measured on the 4-bit kernels (one 512-expert layer of
@@ -482,9 +490,41 @@ void go(F kernel, const Layer& L, cudaStream_t s) {
 // then 32 (one chain, 4-token groups); IQ3_S 8 below 4, 16 below 18, then 32 (two chains).  `fast` (STRATA_WS_FAST=1):
 // the 32-token tier runs fast::gu_kernel instead - the same GU rows; its 16-byte loads need Xq 16-byte aligned (the
 // prompt path's buffers are 256-byte aligned; anything else keeps gu_kernel)
-void gu_nib(const Layer& L, double u, cudaStream_t s, bool fast_on) {
+//
+// `v2_on` (STRATA_WS_V2=1, WS2.md; measured on a GP100 die, one 512-expert layer per format, lognormal sigma 0.5 / 1.0
+// and flat-32 counts at T 384 .. 4096, every arm memcmp-equal to these kernels): the 32-token kernels of moe_ws_v2.cuh
+// from lower u - the 32-token FAST kernel already beats the 16-token one at u 7.5 (IQ3_S, 3-6%) / 10 (IQ3_XXS) - and
+// for IQ2_S (u >= 17) and IQ3_S (u >= 16) the form whose threads read their row's item codes from global memory one
+// item ahead (no code staging: 8.5 KB of shared memory, four CTAs an SM for IQ3_S).
+void gu_nib(const Layer& L, double u, cudaStream_t s, bool fast_on, bool v2_on) {
     if (L.nchunks <= 0) return;
-    const bool f = fast_on && ((uintptr_t) L.xq & 15) == 0;
+    const bool aligned = ((uintptr_t) L.xq & 15) == 0;
+    const bool f = fast_on && aligned, f2 = v2_on && aligned;
+    if (f2) {
+        switch (L.gu_type) {
+            case nb::kIQ2_S:
+                if (u < 6.0) go(gu_kernel<8, 1, 2, nb::kIQ2_S>, L, s);
+                else if (u < 17.0) go(gu_kernel<16, 0, 2, nb::kIQ2_S>, L, s);
+                else go_v2<1, nb::kIQ2_S, v2::DUFF | v2::CD | v2::LB3>(L, s);
+                break;
+            case nb::kIQ3_XXS:
+                if (u < 4.0) go(gu_kernel<8, 2, 2, nb::kIQ3_XXS>, L, s);
+                else if (u < 9.0) go(gu_kernel<16, 1, 2, nb::kIQ3_XXS>, L, s);
+                else go_v2<1, nb::kIQ3_XXS, v2::TAIL | v2::DYT>(L, s);
+                break;
+            case nb::kIQ3_S:
+                if (u < 4.0) go(gu_kernel<8, 2, 2, nb::kIQ3_S>, L, s);
+                else if (u < 7.0) go(gu_kernel<16, 2, 2, nb::kIQ3_S>, L, s);
+                else if (u < 16.0) go_v2<2, nb::kIQ3_S, v2::TAIL | v2::DUFF | v2::DECF | v2::DYT>(L, s);
+                else go_v2<2, nb::kIQ3_S, v2::TAIL | v2::DUFF | v2::DECF | v2::DYT | v2::CD | v2::LB4>(L, s);
+                break;
+            default:
+                std::fprintf(stderr, "prefill ws: 4-bit gate/up type %d has no kernel\n", L.gu_type);
+                std::exit(1);
+        }
+        ck(cudaGetLastError(), "gate/up 4-bit");
+        return;
+    }
     switch (L.gu_type) {
         case nb::kIQ2_S:
             if (u < 6.0) go(gu_kernel<8, 1, 2, nb::kIQ2_S>, L, s);

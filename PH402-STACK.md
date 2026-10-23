@@ -27,6 +27,7 @@ and Metal keep their guards; Metal gets stubs for the new CUDA-side symbols.
 | 3a36fb00 | (branch dense-proto) decode Q8_0 projections of the mixers loads-first (q8sm60p), the projections reading the same q8_1 input as one launch (GDN qkv + z, QSA q + k + v), same bits | `STRATA_DENSE_PROTO=1` (needs `STRATA_Q8_SM60=1`; `STRATA_DENSE_PROTO_GROUP=0` keeps one launch each) |
 | 26de30af | (branch qsadec-proto) decode-window QSA select (split-tree scorer with the tail and first radix pass fused) and attention (loads-first chunk kernel + merge v2), same bits; `qsadec_bench` (`-DSTRATA_QSADEC_BENCH=ON`) | `STRATA_QSADEC_PROTO=1` (2 select only, 3 attention only; the select part needs `STRATA_SELECT_LONG=1`) |
 | 4a287011 | (branch pf-batch2 9b9d00ad) a layer split's draft layer prompt K/V queued on the drafter's stream behind the next chunk, same K/V | `STRATA_MTP_PF_BATCH=1` (`STRATA_MTP_PF_BATCH_ROWS`, default 2048) |
+| 6dd7ac30 | (branch ws2) the 4-bit gate/up's 32-token WS kernels from lower rows per expert (IQ2_S u 17, IQ3_XXS 9, IQ3_S 7), IQ2_S / IQ3_S reading their item codes per thread; same bits; `moe_ws_prof_bench --arms v2 / v2r2` | `STRATA_WS_V2=1` |
 
 Open upstream PRs carrying parts of this stack (each rebased on its own, so its hashes differ from the ones above):
 

@@ -81,6 +81,22 @@ int fast() {
 
 void set_fast(int v) { g_fast_override.store(v < 0 ? -1 : (v != 0 ? 1 : 0), std::memory_order_relaxed); }
 
+namespace {
+std::atomic<int> g_v2_override{-1};   // set_v2 (benches, tests); -1: the environment
+}  // namespace
+
+int v2() {
+    const int o = g_v2_override.load(std::memory_order_relaxed);
+    if (o >= 0) return o;
+    static const int f = [] {
+        const char* e = std::getenv("STRATA_WS_V2");   // opt-in
+        return e != nullptr && std::atoi(e) == 1 ? 1 : 0;
+    }();
+    return f;
+}
+
+void set_v2(int v) { g_v2_override.store(v < 0 ? -1 : (v != 0 ? 1 : 0), std::memory_order_relaxed); }
+
 bool faster(int t, double u) {
     const Measured* m = measured(t);
     if (m == nullptr) return false;
@@ -126,9 +142,18 @@ bool gate_up(const Layer& L, void* stream) {
         }();
         (void) said;
     }
+    const bool f2 = v2() == 1;
+    if (f2) {   // once per process: the switch is on and the WS path runs
+        static const bool said = [] {
+            std::fprintf(stderr, "strata prefill: STRATA_WS_V2=1: the 4-bit gate/up's 32-token kernels from lower rows per "
+                                 "expert, IQ2_S / IQ3_S with per-thread code loads (the same GU bits)\n");
+            return true;
+        }();
+        (void) said;
+    }
     if (L.gu_nib) {   // STRATA_EXPERT_NIBBLE: the 4-bit slots' kernels (moe_ws_gu_nib.cu), the same GU rows
 #if STRATA_EXPERT_NIBBLE_BUILT
-        detail::gu_nib(L, u, s, f);
+        detail::gu_nib(L, u, s, f, f2);
         return true;
 #else   // no 4-bit slots without the kernels (the switch is refused at start), so this is not reached
         std::fprintf(stderr, "prefill ws: 4-bit gate/up slots have no kernel in this build\n");

@@ -20,6 +20,9 @@
 //               and V_PF (next step's codes / scales / d / act words prefetched into registers before this step's
 //               compute) are the bit-exact candidates, checked by memcmp against production.
 // The chunk table is ws::chunks' (production); the host also counts passes and token slots computed vs used.
+// --arms v2 / v2r2 (branch ws2): instead of the copies, moe_ws_v2.cuh's variants (STRATA_WS_V2's kernels and the
+// prototypes: two rows a thread, per-thread code loads, launch bounds, phase records and ablations), each memcmp'd
+// against production; "PROD ... V2" arms run the production entry points with ws::set_v2(1).
 #include "common.cuh"
 #include "mmq.cuh"
 
@@ -29,6 +32,8 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/moe_ws.hpp"
+#define STRATA_WS_V2_PROF 1   // moe_ws_v2.cuh's PTIME / PNODEC / PNOSTAGE bits
+#include "moe_ws_v2.cuh"   // STRATA_WS_V2's kernels and the prototypes (--arms v2)
 
 #include <cuda_runtime.h>
 
@@ -894,6 +899,39 @@ void dn_attr(int& regs, int& smem, int& ctas) {
     CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ctas, nl4::dn_kernel<NT, TPP, SB, G, CHN, V>, NT, 0));
 }
 
+// ---- STRATA_WS_V2 prototypes (moe_ws_v2.cuh), --arms v2
+namespace v2n = strata::prefill::ws::detail::v2;
+template <int TPP, int CH, int TG, int FMT, int V>
+Launch v2gu_launch() {
+    return [](const Args& a) {
+        v2n::gu_kernel<TPP, CH, TG, FMT, V><<<(unsigned) (a.nchunks * v2n::gu_pieces<V>()), v2n::NT>>>(a.chunks, a.w, a.xoff, a.xq,
+                                                                                                 a.rows, a.gu);
+    };
+}
+template <int TPP, int CH, int TG, int FMT, int V>
+void v2gu_attr(int& regs, int& smem, int& ctas) {
+    cudaFuncAttributes fa{};
+    CK(cudaFuncGetAttributes(&fa, v2n::gu_kernel<TPP, CH, TG, FMT, V>));
+    regs = fa.numRegs;
+    smem = (int) fa.sharedSizeBytes;
+    CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ctas, v2n::gu_kernel<TPP, CH, TG, FMT, V>, v2n::NT, 0));
+}
+template <int TPP, int V>
+Launch v2dn_launch() {
+    return [](const Args& a) {
+        v2n::dn::dn_kernel<TPP, V><<<(unsigned) (a.nchunks * v2n::dn::dn_pieces<V>()), v2n::NT>>>(a.chunks, a.w, a.xoff, a.down_off,
+                                                                                               a.hq, a.rows, a.dm);
+    };
+}
+template <int TPP, int V>
+void v2dn_attr(int& regs, int& smem, int& ctas) {
+    cudaFuncAttributes fa{};
+    CK(cudaFuncGetAttributes(&fa, v2n::dn::dn_kernel<TPP, V>));
+    regs = fa.numRegs;
+    smem = (int) fa.sharedSizeBytes;
+    CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ctas, v2n::dn::dn_kernel<TPP, V>, v2n::NT, 0));
+}
+
 }  // namespace wsprof
 
 namespace {
@@ -1103,7 +1141,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> shards, models = { "ln0.5", "ln1.0", "flat32" };
     std::vector<int> layers = { 2, 0, 17, 21 }, ts = { 1536 };
     int reps = 15;
-    bool prod_only = false;
+    bool prod_only = false, v2_only = false, v2_round2 = false;
     std::string csvdir;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1118,7 +1156,12 @@ int main(int argc, char** argv) {
         else if (a == "--t") { ts.clear(); for (auto& s : split_list(next())) ts.push_back(std::atoi(s.c_str())); }
         else if (a == "--models") models = split_list(next());
         else if (a == "--reps") reps = std::atoi(next());
-        else if (a == "--arms") prod_only = std::string(next()) == "prod";
+        else if (a == "--arms") {
+            const std::string v = next();
+            prod_only = v == "prod";
+            v2_only = v == "v2" || v == "v2r2";
+            v2_round2 = v == "v2r2";
+        }
         else if (a == "--csv") csvdir = next();
         else if (a.size() > 5 && a.substr(a.size() - 5) == ".gguf") shards.push_back(a);
         else {
@@ -1206,6 +1249,88 @@ int main(int argc, char** argv) {
         v.push_back({ "fix G4 LB2", dn_launch<256, 32, 2, 4, 1, V_LB2>(), true }); dn_attr<256, 32, 2, 4, 1, V_LB2>(v.back().regs, v.back().smem, v.back().ctas);
         return v;
     };
+    // STRATA_WS_V2 prototypes (moe_ws_v2.cuh): the 32-token tier, every arm must memcmp equal to production
+    auto v2_gu_arms = [&](int fmt) {
+        std::vector<Arm> v;
+        using namespace v2n;
+#define V2GU(NAME, CH, FMT, VV) \
+        v.push_back({ NAME, v2gu_launch<32, CH, 4, FMT, VV>(), true }); v2gu_attr<32, CH, 4, FMT, VV>(v.back().regs, v.back().smem, v.back().ctas);
+#define V2GUX(NAME, CH, FMT, VV) \
+        v.push_back({ NAME, v2gu_launch<32, CH, 4, FMT, VV>(), ((VV) & PTIME) != 0 }); v2gu_attr<32, CH, 4, FMT, VV>(v.back().regs, v.back().smem, v.back().ctas);
+#define V2GU16(NAME, CH, FMT, VV) \
+        v.push_back({ NAME, v2gu_launch<16, CH, 2, FMT, VV>(), true }); v2gu_attr<16, CH, 2, FMT, VV>(v.back().regs, v.back().smem, v.back().ctas);
+        if (fmt == nib::kIQ2_S) {
+            constexpr int F = DUFF;   // FAST's pick
+            V2GU("v2 R1 staged (=FAST)", 1, nib::kIQ2_S, F)
+            V2GU("v2 R1 CD LB4", 1, nib::kIQ2_S, F | CD | LB4)
+            V2GU("v2 R1 CD LB3", 1, nib::kIQ2_S, F | CD | LB3)
+            V2GU("v2 R2 CD LB3", 1, nib::kIQ2_S, F | R2 | CD | LB3)
+            V2GU("v2 R2 CD LB3 TAIL DYT", 1, nib::kIQ2_S, F | TAIL | DYT | R2 | CD | LB3)
+            V2GU("v2 R2 CD LB2", 1, nib::kIQ2_S, F | R2 | CD | LB2)
+            V2GUX("v2 R2 TIME", 1, nib::kIQ2_S, F | R2 | CD | LB3 | PTIME)
+            V2GU("v2 R2 QG CD LB3", 1, nib::kIQ2_S, F | QG | R2 | CD | LB3)
+            V2GU("v2 R2 QG CD LB3 TAIL DYT", 1, nib::kIQ2_S, F | TAIL | DYT | QG | R2 | CD | LB3)
+            V2GU("v2 R1 QG CD LB4", 1, nib::kIQ2_S, F | QG | CD | LB4)
+            V2GUX("v2 R2 QG TIME", 1, nib::kIQ2_S, F | QG | R2 | CD | LB3 | PTIME)
+            V2GUX("v2 R2 abl NODEC", 1, nib::kIQ2_S, F | R2 | CD | LB3 | PNODEC)
+            V2GUX("v2 R2 abl NOSTAGE", 1, nib::kIQ2_S, F | R2 | CD | LB3 | PNOSTAGE)
+            V2GU16("v2 t16 R2 CD LB3", 1, nib::kIQ2_S, TAIL | DUFF | DYT | R2 | CD | LB3)
+            V2GU16("v2 t16 R2 CD LB4", 1, nib::kIQ2_S, TAIL | DUFF | DYT | R2 | CD | LB4)
+        } else if (fmt == nib::kIQ3_XXS) {
+            constexpr int F = TAIL | DYT;
+            V2GU("v2 R1 staged (=FAST)", 1, nib::kIQ3_XXS, F)
+            V2GU("v2 R1 CD LB4", 1, nib::kIQ3_XXS, F | CD | LB4)
+            V2GU("v2 R1 CD LB3", 1, nib::kIQ3_XXS, F | CD | LB3)
+            V2GU("v2 R2 CD LB3", 1, nib::kIQ3_XXS, F | R2 | CD | LB3)
+            V2GU("v2 R2 CD LB3 DUFF", 1, nib::kIQ3_XXS, F | DUFF | R2 | CD | LB3)
+            V2GU("v2 R2 CD LB2", 1, nib::kIQ3_XXS, F | R2 | CD | LB2)
+            V2GUX("v2 R2 TIME", 1, nib::kIQ3_XXS, F | R2 | CD | LB3 | PTIME)
+            V2GU("v2 R2 QG CD LB3", 1, nib::kIQ3_XXS, F | QG | R2 | CD | LB3)
+            V2GU("v2 R2 QG CD LB3 DUFF", 1, nib::kIQ3_XXS, F | DUFF | QG | R2 | CD | LB3)
+            V2GU("v2 R1 QG CD LB4", 1, nib::kIQ3_XXS, F | QG | CD | LB4)
+            V2GUX("v2 R2 QG TIME", 1, nib::kIQ3_XXS, F | QG | R2 | CD | LB3 | PTIME)
+            V2GUX("v2 R2 abl NODEC", 1, nib::kIQ3_XXS, F | R2 | CD | LB3 | PNODEC)
+            V2GUX("v2 R2 abl NOSTAGE", 1, nib::kIQ3_XXS, F | R2 | CD | LB3 | PNOSTAGE)
+            V2GU16("v2 t16 R2 CD LB3", 1, nib::kIQ3_XXS, TAIL | DUFF | DYT | R2 | CD | LB3)
+            V2GU16("v2 t16 R2 CD LB4", 1, nib::kIQ3_XXS, TAIL | DUFF | DYT | R2 | CD | LB4)
+        } else if (fmt == nib::kIQ3_S) {
+            constexpr int F = TAIL | DUFF | DECF | DYT;
+            V2GU("v2 R1 staged (=FAST)", 2, nib::kIQ3_S, F)
+            V2GU("v2 R1 CD LB4", 2, nib::kIQ3_S, F | CD | LB4)
+            V2GU("v2 R1 CD LB3", 2, nib::kIQ3_S, F | CD | LB3)
+            V2GU("v2 R2 CD LB3 CH1", 1, nib::kIQ3_S, F | R2 | CD | LB3)
+            V2GU("v2 R2 CD LB3 CH2", 2, nib::kIQ3_S, F | R2 | CD | LB3)
+            V2GU("v2 R2 CD LB2 CH1", 1, nib::kIQ3_S, F | R2 | CD | LB2)
+            V2GUX("v2 R2 TIME", 1, nib::kIQ3_S, F | R2 | CD | LB3 | PTIME)
+            V2GU("v2 R2 QG CD LB3", 1, nib::kIQ3_S, F | QG | R2 | CD | LB3)
+            V2GU("v2 R1 QG CD LB4", 1, nib::kIQ3_S, F | QG | CD | LB4)
+            V2GU("v2 R1 QG CD LB3", 1, nib::kIQ3_S, F | QG | CD | LB3)
+            V2GUX("v2 R2 QG TIME", 1, nib::kIQ3_S, F | QG | R2 | CD | LB3 | PTIME)
+            V2GUX("v2 R2 abl NODEC", 1, nib::kIQ3_S, F | R2 | CD | LB3 | PNODEC)
+            V2GUX("v2 R2 abl NOSTAGE", 1, nib::kIQ3_S, F | R2 | CD | LB3 | PNOSTAGE)
+            V2GU16("v2 t16 R2 CD LB3", 1, nib::kIQ3_S, TAIL | DUFF | DECF | DYT | R2 | CD | LB3)
+            V2GU16("v2 t16 R2 CD LB4", 1, nib::kIQ3_S, TAIL | DUFF | DECF | DYT | R2 | CD | LB4)
+        }
+#undef V2GU
+#undef V2GU16
+#undef V2GUX
+        return v;
+    };
+    auto v2_dn_arms = [&]() {
+        std::vector<Arm> v;
+        using namespace v2n;
+#define V2DN(NAME, VV) \
+        v.push_back({ NAME, v2dn_launch<32, VV>(), true }); v2dn_attr<32, VV>(v.back().regs, v.back().smem, v.back().ctas);
+        V2DN("v2 dn R1 staged LB4", LB4)
+        V2DN("v2 dn R1 CD LB4", CD | LB4)
+        V2DN("v2 dn R2 staged LB3", R2 | LB3)
+        V2DN("v2 dn R2 CD LB3", R2 | CD | LB3)
+        V2DN("v2 dn R2 CD LB2", R2 | CD | LB2)
+        v.push_back({ "v2 dn t16 R2 CD LB3", v2dn_launch<16, R2 | CD | LB3>(), true }); v2dn_attr<16, R2 | CD | LB3>(v.back().regs, v.back().smem, v.back().ctas);
+        v.push_back({ "v2 dn t16 R2 CD LB4", v2dn_launch<16, R2 | CD | LB4>(), true }); v2dn_attr<16, R2 | CD | LB4>(v.back().regs, v.back().smem, v.back().ctas);
+#undef V2DN
+        return v;
+    };
 
     cudaEvent_t e0, e1;
     CK(cudaEventCreate(&e0));
@@ -1236,8 +1361,19 @@ int main(int argc, char** argv) {
         int64_t* dxn = nullptr;
         CK(cudaMalloc(&dxp, kNE * 8));
         CK(cudaMalloc(&dxn, kNE * 8));
-        std::vector<Arm> GA = (Y.V.on && !prod_only) ? gu_arms(gt) : std::vector<Arm>{};
-        std::vector<Arm> DA = (dt == GGML_TYPE_IQ4_NL && !prod_only) ? dn_arms() : std::vector<Arm>{};
+        std::vector<Arm> GA = (Y.V.on && !prod_only) ? (v2_only ? v2_gu_arms(gt) : gu_arms(gt)) : std::vector<Arm>{};
+        std::vector<Arm> DA = (dt == GGML_TYPE_IQ4_NL && !prod_only) ? (v2_only ? v2_dn_arms() : dn_arms()) : std::vector<Arm>{};
+        if (v2_round2) {   // round 2: the one-row kernels, the tier crossover, two-row references and phases only
+            const char* keep[] = { "v2 R1 staged (=FAST)", "v2 R1 CD LB4", "v2 R1 CD LB3", "v2 R2 CD LB3", "v2 R2 CD LB3 CH1",
+                                   "v2 R2 QG CD LB3", "v2 R2 TIME", "v2 R2 QG TIME", "v2 R2 abl NODEC", "v2 R2 abl NOSTAGE",
+                                   "v2 t16 R2 CD LB4", "v2 R2 CD LB2", "v2 R2 CD LB2 CH1" };
+            std::vector<Arm> g2;
+            for (auto& a : GA)
+                for (const char* k : keep)
+                    if (a.name == k) g2.push_back(a);
+            GA.swap(g2);
+            DA.clear();
+        }
         for (auto& a : GA)
             std::printf("ATTR  gate/up %-18s regs %3d  smem %5d B  %d CTAs/SM\n", a.name.c_str(), a.regs, a.smem, a.ctas);
         for (auto& a : DA)
@@ -1308,6 +1444,10 @@ int main(int argc, char** argv) {
                 Rec* drec = nullptr;
                 const size_t maxcta = nch * 20;
                 CK(cudaMalloc(&drec, maxcta * sizeof(Rec)));
+                {   // the v2 TIME arm's records (moe_ws_v2.cuh g_v2rec)
+                    void* p = drec;
+                    CK(cudaMemcpyToSymbol(wsprof::v2n::g_v2rec, &p, sizeof p));
+                }
                 ws::Layer Ln, Lg;   // production: 4-bit slots / GGUF blobs
                 Lg.gu_type = gt; Lg.d_type = dt; Lg.w = Y.raw; Lg.xoff = dxp; Lg.down_off = (int64_t) Y.f.down_off;
                 Lg.chunks = dch; Lg.nchunks = (int64_t) nch; Lg.rows = R; Lg.n = n; Lg.xq = xq; Lg.gu = GUg; Lg.hq = HQ; Lg.dm = DMp;
@@ -1374,6 +1514,41 @@ int main(int argc, char** argv) {
                                 same ? "memcmp equal" : "DIFFER");
                     if (!same) ++fails;
                 }
+                // STRATA_WS_V2=1 (ws::set_v2(1)): moe_ws_gu_nib.cu's V2 picks (4-bit gate/up only; the down is fast()'s
+                // either way, here the default), against the default kernels
+                {
+                    const bool t32_gu = gt == nib::kIQ2_S ? u >= 17.0 : gt == nib::kIQ3_XXS ? u >= 9.0 : u >= 7.0, t32_dn = false;
+                    if (Y.V.on && gu_ok_n) {
+                        ws::Layer Lf = Ln;
+                        Lf.gu = GUx;
+                        CK(cudaMemset(GUx, 0xFF, gub));
+                        ws::set_v2(1);
+                        const bool ok = ws::gate_up(Lf, nullptr);
+                        ws::set_v2(0);
+                        CK(cudaDeviceSynchronize());
+                        CK(cudaGetLastError());
+                        CK(cudaMemcpy(tmp.data(), GUx, gub, cudaMemcpyDeviceToHost));
+                        const bool same = ok && std::memcmp(tmp.data(), refgu.data(), gub) == 0;
+                        std::printf("CHECK production gate/up 4-bit V2 (%s) vs default: %s\n",
+                                    t32_gu ? "V2 32-token kernel" : "below the V2 tier: default kernel",
+                                    same ? "memcmp equal" : "DIFFER");
+                        if (!same) ++fails;
+                    }
+                    ws::Layer Ldf = Lg;
+                    Ldf.dm = DMx;
+                    CK(cudaMemset(DMx, 0xFF, dmb));
+                    ws::set_v2(1);
+                    ws::down(Ldf, nullptr);
+                    ws::set_v2(0);
+                    CK(cudaDeviceSynchronize());
+                    CK(cudaGetLastError());
+                    CK(cudaMemcpy(tmp.data(), DMx, dmb, cudaMemcpyDeviceToHost));
+                    const bool same = std::memcmp(tmp.data(), refdm.data(), dmb) == 0;
+                    std::printf("CHECK production down V2 (%s) vs default: %s\n",
+                                t32_dn ? "-" : "V2 leaves the down alone: default kernel",
+                                same ? "memcmp equal" : "DIFFER");
+                    if (!same) ++fails;
+                }
                 Args A{ dch, (const char*) Ln.w, Ln.xoff, Lg.down_off, (const block_q8_1_mmq*) xq, (const block_q8_1_mmq*) HQ, R,
                         GUx, DMx, drec, (int64_t) nch };
                 Args AD = A;
@@ -1416,6 +1591,10 @@ int main(int argc, char** argv) {
                     arms.push_back({ "PROD gate/up 4-bit FAST", [&] { ws::set_fast(1); ws::gate_up(Ln, nullptr); ws::set_fast(0); },
                                      mac_gu, {} });
                 arms.push_back({ "PROD down FAST", [&] { ws::set_fast(1); ws::down(Lg, nullptr); ws::set_fast(0); }, mac_dn, {} });
+                if (Y.V.on)
+                    arms.push_back({ "PROD gate/up 4-bit V2", [&] { ws::set_v2(1); ws::gate_up(Ln, nullptr); ws::set_v2(0); },
+                                     mac_gu, {} });
+                arms.push_back({ "PROD down V2", [&] { ws::set_v2(1); ws::down(Lg, nullptr); ws::set_v2(0); }, mac_dn, {} });
                 for (auto& a : GA) arms.push_back({ "gu " + a.name, [&a, &A] { a.go(A); }, mac_gu, {} });
                 for (auto& a : DA) arms.push_back({ "dn " + a.name, [&a, &AD] { a.go(AD); }, mac_dn, {} });
                 // production again at the end of the round: position / clock drift within a round
@@ -1449,8 +1628,14 @@ int main(int argc, char** argv) {
                 for (int which = 0; which < 2; ++which) {
                     auto& V = which == 0 ? GA : DA;
                     for (auto& a : V) {
-                        if (a.name != "copy TIME") continue;
-                        const size_t ncta = (size_t) nch * (which == 0 ? wsprof::gu::PIECES : 10);
+                        if (a.name != "copy TIME" && a.name != "v2 R2 TIME" && a.name != "v2 R2 QG TIME") continue;
+                        const bool v2t = a.name != "copy TIME";
+                        const size_t ncta = (size_t) nch * (v2t ? 5 : which == 0 ? wsprof::gu::PIECES : 10);
+                        if (v2t) {
+                            static_assert(sizeof(wsprof::v2n::Rec2) == sizeof(Rec), "the same record layout");
+                            void* p = drec;
+                            CK(cudaMemcpyToSymbol(wsprof::v2n::g_v2rec, &p, sizeof p));
+                        }
                         CK(cudaMemset(drec, 0, maxcta * sizeof(Rec)));
                         const double ms = time_once([&] { a.go(which == 0 ? A : AD); });
                         std::vector<Rec> r(ncta);
