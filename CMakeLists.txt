@@ -426,6 +426,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/dequant_bf16.cu
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/qsadec_proto.cu
+                          src/kernels/cuda/qsa_pattn.cu
                           src/kernels/cuda/verify_kernels.cu
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/ngram.cpp
@@ -536,6 +537,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   if(STRATA_QSADEC_BENCH AND STRATA_ENABLE_CUDA)
     add_executable(qsadec_bench src/kernels/qsadec_bench.cu)
     target_link_libraries(qsadec_bench PRIVATE strata_kernels CUDA::cudart)
+  endif()
+  # STRATA_PATTN_SM60: the prompt path's QSA attention on sm_6x (qsa_pattn.cu) against qsa_decode_attn_batch on a
+  # STRATA_QSA_DUMP selection file, one GPU, no model
+  option(STRATA_PATTN_BENCH "build pattn_bench (one GPU, no model)" OFF)
+  if(STRATA_PATTN_BENCH AND STRATA_ENABLE_CUDA)
+    add_executable(pattn_bench src/kernels/pattn_bench.cu)
+    target_link_libraries(pattn_bench PRIVATE strata_kernels CUDA::cudart)
   endif()
   # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/ggml)
   target_include_directories(strata_kernels PRIVATE third_party/ggml)
