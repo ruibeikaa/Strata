@@ -24,6 +24,7 @@ and Metal keep their guards; Metal gets stubs for the new CUDA-side symbols.
 | b85c231f | P6: free the host expert arena once every expert is VRAM-resident | `STRATA_ARENA_FREE=1` |
 | 87a6146e, dc842d8f | (branch pf-batch1) the WS 32-token tier's gate/up on 4-bit slots and IQ4_NL down with fewer instructions per pass, same bits; `moe_ws_prof_bench` | `STRATA_WS_FAST=1` |
 | 84d57f48 | (branch pf-batch1) conversation checkpoints kept evenly spaced over the conversation | `--prompt-cache-uniform` (`--prompt-cache-recent N`), or `STRATA_CKPT_UNIFORM=N` |
+| 6dd7ac30 | (branch ws2) the 4-bit gate/up's 32-token WS kernels from lower rows per expert (IQ2_S u 17, IQ3_XXS 9, IQ3_S 7), IQ2_S / IQ3_S reading their item codes per thread; same bits; `moe_ws_prof_bench --arms v2 / v2r2` | `STRATA_WS_V2=1` |
 
 Open upstream PRs carrying parts of this stack (each rebased on its own, so its hashes differ from the ones above):
 

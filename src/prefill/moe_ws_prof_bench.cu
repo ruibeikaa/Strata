@@ -20,6 +20,9 @@
 //               and V_PF (next step's codes / scales / d / act words prefetched into registers before this step's
 //               compute) are the bit-exact candidates, checked by memcmp against production.
 // The chunk table is ws::chunks' (production); the host also counts passes and token slots computed vs used.
+// --arms v2 / v2r2 (branch ws2): instead of the copies, moe_ws_v2.cuh's variants (STRATA_WS_V2's kernels and the
+// prototypes: two rows a thread, per-thread code loads, launch bounds, phase records and ablations), each memcmp'd
+// against production; "PROD ... V2" arms run the production entry points with ws::set_v2(1).
 #include "common.cuh"
 #include "mmq.cuh"
 
