@@ -1915,6 +1915,14 @@ if(STRATA_NATIVE_EXPERTS)
     if(STRATA_EXPERIMENTAL_SM60 AND NOT STRATA_HIP_GFX906)
       # the weight-stationary experts (moe_ws.hpp) are in strata_mmq: the prompt path may take them (STRATA_MMQ_WS=1)
       target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_WS=1)
+      # bench only (not built by default): the WS expert kernels at production shapes on one GP100 die - per-kernel time,
+      # per-CTA timeline, phase ablations, the bit-exact candidates and STRATA_WS_FAST's kernels against the default
+      # ones by memcmp (needs a model shard and STRATA_MMQ_WS=1)
+      add_executable(moe_ws_prof_bench EXCLUDE_FROM_ALL src/prefill/moe_ws_prof_bench.cu)
+      target_include_directories(moe_ws_prof_bench PRIVATE ${_strata_gg}/include ${_strata_gg}/src ${_strata_mmq})
+      target_compile_options(moe_ws_prof_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math -Xptxas=-v>)
+      target_link_libraries(moe_ws_prof_bench PRIVATE strata_mmq strata_kernels strata_kernels_cpu strata_artifact ggml-base
+                            ${_strata_gpu_runtime_target})
     endif()
     if(STRATA_BUILD_TESTS)
       # #136: the fused int8 experts against a double-precision reference and the MMQ path (exit 77 below sm_80)
