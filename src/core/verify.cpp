@@ -50,6 +50,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
+#include "strata/kernels/qsadec_proto.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
@@ -850,6 +851,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         scores_ = b.take<float>(T * (uint64_t) max_blocks_); sel_ = b.take<int32_t>(T * (uint64_t) cap_);
         if (select_long_on() && strata::kernels::qsa_topk_multi_scratch_ints(T) > 0)   // STRATA_SELECT_LONG only
             topk_scratch_ = b.take<int32_t>((uint64_t) strata::kernels::qsa_topk_multi_scratch_ints(T));
+        // STRATA_QSADEC_PROTO=1 or 2 (opt-in, with STRATA_SELECT_LONG=1): the proto long select's exchange, its own so a
+        // production fallback (a window of more than 4 rows) never leaves its pass-0 rows in the proto's histogram row
+        if (select_long_on() && (strata::kernels::qsadec_proto_mode() == 1 || strata::kernels::qsadec_proto_mode() == 2) &&
+            strata::kernels::qsadec_select_scratch_ints(T) > 0)
+            qsadec_scratch_ = b.take<int32_t>((uint64_t) strata::kernels::qsadec_select_scratch_ints(T));
         attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
         attn_scratch_ = b.take<float>(T * (uint64_t) attn_scratch_floats_);
         tail_snap_ = b.take<float>(nQ * TS);
@@ -1670,6 +1676,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 };
                 auto idx_select = [&](cudaStream_t ns) {
                     if (sel_long_) {   // STRATA_SELECT_LONG: the long-context window graphs (the same ids)
+                        // STRATA_QSADEC_PROTO=1/2: the one-pass scorer with the tail and the first radix pass fused
+                        // (6 kernels instead of 8; the same score bits and ids); false: not applicable, the code below
+                        if (qsadec_scratch_ != nullptr &&
+                            strata::kernels::qsadec_select(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID,
+                                                           step_ + tb * kStepCount, n, max_blocks_, cap_, s,
+                                                           scores_ + (size_t) tb * max_blocks_, sel_ + (size_t) tb * cap_,
+                                                           qsadec_scratch_, ns, 0))
+                            return;
                         qsa_block_scores_long(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n,
                                               max_blocks_, s, scores_ + (size_t) tb * max_blocks_, ns, -1);
                         qsa_block_topk_long(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_,
@@ -1922,6 +1936,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                           step_ + tb * kStepCount, cap_, s,
                                                           attn_scratch_ + (size_t) tb * attn_scratch_floats_,
                                                           (uint64_t) n * (uint64_t) attn_scratch_floats_, attn_ + tb * NH * HD, n, cs)))
+                // STRATA_QSADEC_PROTO=1/3: the chunk kernel with its loads ahead of the barriers + merge v2 (the same
+                // bits; int8 K/V only, false otherwise)
+                if (!((strata::kernels::qsadec_proto_mode() == 1 || strata::kernels::qsadec_proto_mode() == 3) &&
+                      strata::kernels::qsadec_attn(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_,
+                                                   step_ + tb * kStepCount, cap_, s,
+                                                   attn_scratch_ + (size_t) tb * attn_scratch_floats_,
+                                                   attn_ + tb * NH * HD, n, cs, 0)))
                 qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
                                       s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
                 }
