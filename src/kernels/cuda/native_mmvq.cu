@@ -1944,6 +1944,7 @@ bool q8_sm60_on() {
 }
 #if !defined(__HIPCC__)
 #include "q8_sm60.cuh"
+#include "q8_sm60_proto.cuh"
 #endif
 
 // ============================ STRATA_Q8_PACKED=1: the packed Q8_0 decode layout (opt-in) ============================
@@ -2240,6 +2241,115 @@ bool native_q8_0_packed_enabled() {
 bool native_q8_0_packed_eligible(int n_in, int n_out) {
     if (q8_sm60_on()) return n_in >= 128 && n_in % 32 == 0 && n_out > 0;   // the Pascal kernel takes any of them
     return q8_packed_shape(n_in, n_out);
+}
+
+// ---- STRATA_DENSE_PROTO=1 (opt-in): q8sm60p (q8_sm60_proto.cuh) - loads-first decode GEMVs, 1-3 matrices a launch ----
+bool native_dense_proto_on() {
+#if defined(__HIPCC__)
+    return false;
+#else
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_DENSE_PROTO");
+        if (!(v && v[0] == '1' && v[1] == '\0')) return false;
+        int dev = 0;
+        cudaDeviceProp p{};
+        const bool cc60 = cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+                          p.major == 6 && p.minor == 0;
+        cudaGetLastError();
+        const bool yes = cc60 && q8_sm60_on();
+        std::fprintf(stderr, "strata dense proto: %s (STRATA_DENSE_PROTO=1)\n",
+                     yes ? "the mixers' Q8_0 projections run loads-first, grouped by input" : "needs STRATA_Q8_SM60=1 on a cc 6.0 device; off");
+        return yes;
+    }();
+    return on;
+#endif
+}
+
+#if !defined(__HIPCC__)
+namespace {
+using DpFn = void (*)(const q8sm60p::Segs, const void*);
+struct DpPick {
+    DpFn fn = nullptr;
+    int thr = 0;
+    int tpr = 0;
+    bool x16 = false;
+};
+// the configuration measured best per (columns, input width) - campaign\DENSE-PROTO.md
+template<int NC, int TPR, int CPL>
+DpPick dp_pick_shape() {
+    DpPick r;
+    r.tpr = TPR;
+    r.thr = 256;
+    r.fn = q8sm60p::kernel<NC, TPR, CPL, 256, false, false, false, 0>;   // q8_1 in: the fused quantize measured slower
+    return r;
+}
+template<int NC>
+DpPick dp_pick_nc(int n_in) {
+    if (n_in == 2560) return dp_pick_shape<NC, 32, 5>();
+    if (n_in == 6144) return dp_pick_shape<NC, 32, 12>();
+    if (n_in == 640) return dp_pick_shape<NC, 8, 5>();
+    return {};
+}
+DpPick dp_pick(int ncols, int n_in) {
+    switch (ncols) {
+        case 1: return dp_pick_nc<1>(n_in);
+        case 2: return dp_pick_nc<2>(n_in);
+        case 3: return dp_pick_nc<3>(n_in);
+        case 4: return dp_pick_nc<4>(n_in);
+    }
+    return {};
+}
+} // namespace
+#endif
+
+bool native_q8_group_ready(const void* weights, int n_in, int n_out, int ncols) {
+#if defined(__HIPCC__)
+    (void) weights; (void) n_in; (void) n_out; (void) ncols;
+    return false;
+#else
+    if (!native_dense_proto_on() || !weights) return false;
+    const DpPick pk = dp_pick(ncols, n_in);
+    if (!pk.fn || q8sm60p::smem_bytes(ncols, n_in, pk.x16) > q8sm60::MAX_SMEM) return false;
+    const auto& registry = q8_packed_registry();
+    const auto found = registry.find(weights);
+    return found != registry.end() && found->second.n_in == n_in && found->second.n_out == n_out;
+#endif
+}
+
+bool native_q8_group(const void* const* weights, float* const* y, const int* n_out, int nseg, const void* x_q8_1,
+                     int n_in, int ncols, void* stream) {
+#if defined(__HIPCC__)
+    (void) weights; (void) y; (void) n_out; (void) nseg; (void) x_q8_1; (void) n_in; (void) ncols; (void) stream;
+    return false;
+#else
+    if (nseg < 1 || nseg > q8sm60p::MAXSEG || !x_q8_1) return false;
+    for (int i = 0; i < nseg; ++i)
+        if (!y[i] || !native_q8_group_ready(weights[i], n_in, n_out[i], ncols)) return false;
+    const DpPick pk = dp_pick(ncols, n_in);
+    const auto& registry = q8_packed_registry();
+    q8sm60p::Segs S{};
+    S.n = nseg;
+    for (int i = 0; i < nseg; ++i) {
+        const Q8Packed& w = registry.find(weights[i])->second;
+        S.s[i] = q8sm60p::Seg{w.qs, w.d, y[i], n_out[i], 0};
+    }
+    q8sm60p::finish_segs(S, pk.thr / pk.tpr);
+    const std::size_t smem = q8sm60p::smem_bytes(ncols, n_in, pk.x16);
+    int occ = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, pk.fn, pk.thr, smem) != cudaSuccess || occ < 1) {
+        cudaGetLastError();
+        occ = 4;
+    }
+    const int grid = (std::max)(1, (std::min)(S.groups, q8sm60::sm_count() * occ));
+    const void* xp = x_q8_1;
+    void* args[] = {&S, &xp};
+    if (cudaLaunchKernel(reinterpret_cast<const void*>(pk.fn), dim3(unsigned(grid)), dim3(unsigned(pk.thr)), args, smem,
+                         static_cast<cudaStream_t>(stream)) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+#endif
 }
 
 namespace {
