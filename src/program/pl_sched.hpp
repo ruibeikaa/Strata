@@ -56,6 +56,19 @@ struct Config {
     bool suffix = false;           // o.suffix_draft > 0 (lookup windows)
     float lookup_pon = 0.75f;      // STRATA_PIPELINE_LOOKUP_PON
     int spec_depth = 1 << 20;      // STRATA_PIPELINE_SPEC_DEPTH (debug)
+    // Lookup chaining (STRATA_LKCHAIN, opt-in; B0/B only): after the MTP's drafts for a window end (a draft below
+    // spec_min_p, or S_mtp rows), up to lkc_k tokens of the prompt lookup over the context + every pending draft, when
+    // its match is at least lkc_m tokens; the window grows to at most S rows.  The window behind it comes from the
+    // chain as long as the chain's own outputs at those positions agree with the lookup's tokens (the chain then went
+    // through the same text); where they differ, from the lookup's continuation (one guess deep) or not at all.
+    int lkc_k = 0;                 // tokens chained at most (0: off)
+    int lkc_m = 8;                 // the shortest match (drafts included)
+    int lkc_div = 0;               // a landed chain output that differs from the lookup's token ends the tail there,
+                                   // unless the match is at least this long (0: always ends it)
+    int lkc_fresh = 0;             // a fresh T=1 window takes a lookup window whose first token differs from the
+                                   // MTP's draft when the match is at least this long (0: never; today's rule)
+    bool lkc_policy = false;       // the chained tokens are gated by DraftPolicy::chain (else every token up to lkc_k)
+    int S_sfx = 0;                 // a plain lookup window's rows at most (0: S) - today's S before lookup chaining
 
     int depth() const { return mode == Mode::B ? 3 : 2; }
     int ns() const { return mode == Mode::N2 ? 2 : slots > 0 ? slots : mode == Mode::B0 ? 3 : 4; }
@@ -79,6 +92,8 @@ struct PW {
     bool made = false;             // made from a chain (or a lookup) as a guess
     bool sfx = false;              // a lookup window (the suffix drafter's drafts)
     int sfx_match = 0;
+    int lkc = 0;                   // lookup chaining: the window's last lkc tokens are the lookup's (0: none)
+    int lkc_match = 0;
     // the slot pool and depth 3
     int slot = -1;                 // -1: none yet
     int32_t ple_in[2] = {-1, -1};  // ss.ple_prev when it launches on stage 0 (= its undo value)
@@ -169,6 +184,13 @@ public:
     virtual void ple_prev(int32_t out[2]) = 0;   // ss.ple_prev now
     virtual int lookup_propose(int max_k, Lookup& out) = 0;   // sfx.propose (k), sfx.last_match
     virtual bool lookup_choose(int T, int k, int match, int& t) = 0;   // policy.choose: true = take the lookup (t rows)
+    // Lookup chaining: sfx.propose_after(pend, n) - the lookup over the committed text followed by `n` pending tokens
+    // (the drafts of the windows not verified, the oldest one's row 0 excluded: it is committed text already)
+    virtual int lookup_after(const int32_t* pend, int n, int max_k, Lookup& out) {
+        (void) pend; (void) n; (void) max_k; out = Lookup{}; return 0;
+    }
+    // policy.chain: how many of k lookup tokens to chain after a t_mtp-token MTP window whose drafts all hold with p
+    virtual int lookup_chain_choose(int t_mtp, double p_mtp, int k, int match) { (void) t_mtp; (void) p_mtp; (void) match; return k; }
     virtual bool exec(const PlOp& op) = 0;   // false: an error (the engine has said why)
     // emit the window's picks outp[0..a] (up to max_new, EOS); `last` = EOS, max_new or a cancel
     virtual bool verdict(const PW& w, int a, const int32_t* outp, bool& last) = 0;
@@ -192,6 +214,12 @@ struct Stats {
     int64_t chain_late = 0, chain_steps = 0, chain_launches = 0, chain_cancel = 0;
     int64_t chain_skip = 0;          // depth 3: chains not launched for want of room for D (a guard; never expected)
     int64_t case_hits[16] = {};     // the verdict cases (see PlCase)
+    // lookup chaining: windows that got a lookup tail, its tokens, the windows whose MTP drafts were all accepted (the
+    // tail was tested), the tail tokens accepted; next-window decisions where the chain differed from the tail (lk
+    // windows made from the lookup instead); fresh T=1 lookup windows taken against the MTP's draft; tails ended early
+    // by a landed chain output that differed
+    int64_t lkc_windows = 0, lkc_tokens = 0, lkc_reached = 0, lkc_ok = 0, lkc_div = 0, lkc_lkwin = 0, lkc_fresh = 0;
+    int64_t lkc_cut = 0, lkc_lookups = 0;
 };
 
 // The verdict cases as counted (a verdict can count under two: 5/6 also count their 1x/2/3)
@@ -267,6 +295,8 @@ private:
         float force_prob[16] = {}; // the forced windows' own probabilities (STRATA_PIPELINE_AGREE=0)
         bool cancelled = false;
         bool open = false;         // chain_stop: steps may still be queued
+        bool pred_forced = false;  // the window the next new one follows was forced through the chain (kind 1)
+        bool force_lk[16] = {};    // a forced token is a lookup tail's (its agreement is not asked for)
         int asked = 0;             // chain_stop: outputs asked for (chain_extend)
         int queued = 0;            // outputs queued
     };
@@ -286,9 +316,14 @@ private:
     bool undo_round(PlIo& io);
     void release();
     bool chain_round(PlIo& io);
-    bool decide_fresh(PlIo& io, PW& A, const int32_t* oc, const float* op, int avail, bool early);
+    bool decide_fresh(PlIo& io, PW& A, const int32_t* oc, const float* op, int avail, bool early, int k_landed);
     bool decide_next(PlIo& io, int k, bool done);
     bool pick_lookup(PlIo& io, PW& w, const int32_t* chain0);
+    // lookup chaining: w (the window being made, not yet in win_ when `pushed` is false) gets its lookup tail
+    void lkc_extend(PlIo& io, PW& w, bool pushed, const int32_t* oc, int idx_after, int k_landed);
+    int lkc_pending(const PW& w, bool pushed, int32_t* out, int cap) const;
+    bool lkc_lk_window(PlIo& io, PW& pred);
+    static float lkc_q(int match);
     bool launch_chain(PlIo& io, const ChainReq& r);
     bool request_round(PlIo& io);
     bool try_prestage(PlIo& io, int k);

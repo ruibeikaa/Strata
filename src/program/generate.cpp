@@ -349,6 +349,33 @@ static const char* pipe_dbg_env(const char* name) {
     static const bool on = [] { const char* v = std::getenv("STRATA_PIPELINE_DEBUG"); return v != nullptr && v[0] != 0 && v[0] != '0'; }();
     return on ? std::getenv(name) : nullptr;
 }
+// STRATA_LKCHAIN="K[,M[,DIV[,FRESH[,POL]]]]" (opt-in; the new pipelined loop's B0/B modes): lookup chaining.  After the
+// MTP's drafts for a window end, up to K tokens of the prompt lookup over the context + every pending draft follow them
+// when its match is at least M tokens (default 8); DIV: a landed chain output that differs from the lookup ends the tail
+// there unless the match is at least DIV (0, the default: always); FRESH: a fresh T=1 window may take a lookup window
+// whose first token differs from the MTP's draft when the match is at least FRESH (0: today's rule); POL=1: the chained
+// tokens are gated by DraftPolicy::chain instead of a fixed K.  Set at all (even "0"), it raises the verify window to
+// kVerifyMaxT (8) rows for the tails; plain lookup windows keep today's size.  STRATA_LKCHAIN_FILE=<file>: the same five
+// numbers re-read at every request (an A/B on one server).  Only drafts change: the verified text is the serial loop's.
+struct LkcSettings { bool set = false; int k = 0, m = 8, div = 0, fresh = 0, pol = 0; };
+static bool lkc_parse(const char* v, LkcSettings& o) {
+    if (v == nullptr) return false;
+    int x[5] = {0, 8, 0, 0, 0};
+    const int n = std::sscanf(v, "%d,%d,%d,%d,%d", &x[0], &x[1], &x[2], &x[3], &x[4]);
+    if (n < 1) return false;
+    o.set = true;
+    o.k = std::clamp(x[0], 0, 7);
+    o.m = std::max(3, x[1]);
+    o.div = std::max(0, x[2]);
+    o.fresh = std::max(0, x[3]);
+    o.pol = x[4] != 0 ? 1 : 0;
+    return true;
+}
+static const LkcSettings& lkc_env() {
+    static const LkcSettings s = [] { LkcSettings o; lkc_parse(std::getenv("STRATA_LKCHAIN"), o); return o; }();
+    return s;
+}
+static int g_lkc_s_sfx = 0;   // the verify window before STRATA_LKCHAIN raised it (a plain lookup window's rows)
 // STRATA_PIPELINE_POOL_FAIL=init|snap|capture|chain (testing, with STRATA_PIPELINE_DEBUG=1): the slot pool's (or depth
 // 3's chain) allocation or capture at that point behaves as if it failed, so its fallback can be run on purpose
 static bool pipe_pool_fail(const char* what) {
@@ -1429,6 +1456,8 @@ struct PlIoFns final : strata::pl::PlIo {
     std::function<void(int32_t*)> f_ple_prev;
     std::function<int(int, strata::pl::Lookup&)> f_lookup_propose;
     std::function<bool(int, int, int, int&)> f_lookup_choose;
+    std::function<int(const int32_t*, int, int, strata::pl::Lookup&)> f_lookup_after;
+    std::function<int(int, double, int, int)> f_lookup_chain_choose;
     std::function<bool(const strata::pl::PlOp&)> f_exec;
     std::function<bool(const strata::pl::PW&, int, const int32_t*, bool&)> f_verdict;
     std::function<void(const strata::pl::PW&, int, double)> f_observe;
@@ -1446,6 +1475,13 @@ struct PlIoFns final : strata::pl::PlIo {
     void ple_prev(int32_t out[2]) override { f_ple_prev(out); }
     int lookup_propose(int max_k, strata::pl::Lookup& out) override { return f_lookup_propose(max_k, out); }
     bool lookup_choose(int T, int k, int match, int& t) override { return f_lookup_choose(T, k, match, t); }
+    int lookup_after(const int32_t* pend, int n, int max_k, strata::pl::Lookup& out) override {
+        if (!f_lookup_after) { out = strata::pl::Lookup{}; return 0; }
+        return f_lookup_after(pend, n, max_k, out);
+    }
+    int lookup_chain_choose(int t_mtp, double p_mtp, int k, int match) override {
+        return f_lookup_chain_choose ? f_lookup_chain_choose(t_mtp, p_mtp, k, match) : k;
+    }
     bool exec(const strata::pl::PlOp& op) override { return f_exec(op); }
     bool verdict(const strata::pl::PW& w, int a, const int32_t* outp, bool& last) override { return f_verdict(w, a, outp, last); }
     void observe(const strata::pl::PW& w, int a, double ms) override { f_observe(w, a, ms); }
@@ -3560,6 +3596,16 @@ int main(int argc, char** argv) {
         if (o.mtp_max_t == 0) o.mtp_max_t = o.spec;
         const int chain_base = o.spec;
         o.spec = std::max(chain_base, std::min(std::max(chain_base, o.mtp_max_t) + o.lookup_chain, 8));  // kVerifyMaxT
+    }
+    // STRATA_LKCHAIN (the pipelined loop's lookup chaining): windows of up to 8 rows for the tails; the MTP keeps its own
+    // window and a plain lookup window today's size (g_lkc_s_sfx)
+    if (lkc_env().set && o.spec >= 2 && o.suffix_draft > 0 && o.spec < 8) {
+        if (o.mtp_max_t == 0) o.mtp_max_t = o.spec;
+        g_lkc_s_sfx = o.spec;
+        o.spec = 8;   // kVerifyMaxT
+        std::fprintf(stderr, "strata generate: STRATA_LKCHAIN=%d,%d,%d,%d,%d: verify windows up to 8 rows (the MTP's %d, a "
+                             "plain lookup window's %d)\n", lkc_env().k, lkc_env().m, lkc_env().div, lkc_env().fresh,
+                     lkc_env().pol, o.mtp_max_t, g_lkc_s_sfx);
     }
     strata::core::layer_set_shared_early(!o.shared_late);
     if (!o.native_preset.empty()) {
@@ -15852,6 +15898,28 @@ int main(int argc, char** argv) {
                 cfg.suffix = o.suffix_draft > 0;
                 cfg.lookup_pon = [] { const char* v = pipe_dbg_env("STRATA_PIPELINE_LOOKUP_PON"); return v ? (float) std::atof(v) : 0.75f; }();
                 cfg.spec_depth = [] { const char* v = pipe_dbg_env("STRATA_PIPELINE_SPEC_DEPTH"); return v ? std::max(1, std::atoi(v)) : 1 << 20; }();
+                // lookup chaining (STRATA_LKCHAIN; STRATA_LKCHAIN_FILE re-read per request): only with the raised window
+                if (lkc_env().set && g_lkc_s_sfx > 0 && pl_m != strata::pl::Mode::N2) {
+                    LkcSettings lk = lkc_env();
+                    if (const char* lf = std::getenv("STRATA_LKCHAIN_FILE")) {
+                        if (std::FILE* f = std::fopen(lf, "r")) {
+                            char buf[128] = {};
+                            const size_t nr = std::fread(buf, 1, sizeof buf - 1, f);
+                            std::fclose(f);
+                            buf[nr] = 0;
+                            LkcSettings t;
+                            if (lkc_parse(buf, t)) lk = t;
+                        }
+                    }
+                    cfg.lkc_k = lk.k;
+                    cfg.lkc_m = lk.m;
+                    cfg.lkc_div = lk.div;
+                    cfg.lkc_fresh = lk.fresh;
+                    cfg.lkc_policy = lk.pol != 0;
+                    cfg.S_sfx = std::min(g_lkc_s_sfx, S);
+                } else if (g_lkc_s_sfx > 0) {
+                    cfg.S_sfx = std::min(g_lkc_s_sfx, S);   // (N2: today's lookup windows, no tails)
+                }
                 std::string cerr;
                 if (pl_m == strata::pl::Mode::B && mtp.chain_max() < cfg.chain_max) {   // pl_prepare's capture gave up
                     cerr = "depth 3 needs the drafter's chain of " + std::to_string(cfg.chain_max) + " outputs; " +
@@ -16031,6 +16099,15 @@ int main(int argc, char** argv) {
                     t = pk.t;
                     return pk.lookup;
                 };
+                io.f_lookup_after = [&](const int32_t* pend, int n_pend, int max_k, strata::pl::Lookup& L) {
+                    L = strata::pl::Lookup{};
+                    L.k = sfx.propose_after(pend, n_pend, std::min(max_k, (int) (sizeof L.tok / sizeof L.tok[0])), L.tok);
+                    L.match = L.k > 0 ? sfx.last_match() : 0;
+                    return L.k;
+                };
+                io.f_lookup_chain_choose = [&](int t_mtp, double p_mtp, int k_av, int match) {
+                    return policy.chain(t_mtp, p_mtp, k_av, match);
+                };
                 io.f_exec = [&](const strata::pl::PlOp& op) -> bool {
                     using strata::pl::Op;
                     switch (op.op) {
@@ -16169,7 +16246,10 @@ int main(int argc, char** argv) {
                     pcie_auto_step(req_pcie_frac);   // the measured share, as the pw-2 loop takes it after each verdict
                     return true;
                 };
-                io.f_observe = [&](const strata::pl::PW& w, int a, double ms) { policy.observe(w.sfx, w.T, a, w.sfx_match, ms); };
+                io.f_observe = [&](const strata::pl::PW& w, int a, double ms) {
+                    if (w.lkc > 0) policy.observe_chain(w.T - w.lkc, w.lkc, a, w.lkc_match, ms);
+                    else policy.observe(w.sfx, w.T, a, w.sfx_match, ms);
+                };
                 io.f_now = [&]() { return ms_now(); };
                 io.f_trace = [&](const char* ev, int seq, int x0, int x1) { tre(ev, seq, x0, x1); };
                 strata::pl::Sched sched;
@@ -16272,6 +16352,15 @@ int main(int argc, char** argv) {
                     // held1/held2 = the windows held on the path right after a fresh window / after a held
                     // one (rho = held2 / (held1 + held2)), their time from the verdict before; the windows two guesses
                     // deep (C); the per-stage undo; the slot pool; prestage misses; the chain requests
+                    if (cfg.lkc_k > 0 || cfg.lkc_fresh > 0)
+                        std::fprintf(stderr, "strata pipeline lookup chain (K %d M %d div %d fresh %d pol %d): %lld lookups, "
+                                             "%lld tails (%lld tokens), %lld tested (%lld tokens accepted), %lld cut by the "
+                                             "chain, %lld next-window disagreements (%lld lk windows), %lld fresh lookup "
+                                             "windows against the draft\n", cfg.lkc_k, cfg.lkc_m, cfg.lkc_div, cfg.lkc_fresh,
+                                     cfg.lkc_policy ? 1 : 0, (long long) st4.lkc_lookups, (long long) st4.lkc_windows,
+                                     (long long) st4.lkc_tokens, (long long) st4.lkc_reached, (long long) st4.lkc_ok,
+                                     (long long) st4.lkc_cut, (long long) st4.lkc_div, (long long) st4.lkc_lkwin,
+                                     (long long) st4.lkc_fresh);
                     std::fprintf(stderr, "strata pipeline depth3: held1 %lld windows %.2f ms | held2 %lld windows %.2f ms | C made "
                                          "%lld launched %lld on %lld doomed %lld | undo jobs %lld stage-waits %lld (%.1f ms) | slot "
                                          "waits %lld (%.1f ms) | restage %lld (%lld guesses) | chain waits %lld (%.1f ms) late %lld | "
