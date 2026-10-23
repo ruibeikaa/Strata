@@ -14707,7 +14707,7 @@ int main(int argc, char** argv) {
                 struct Win { int T; int64_t q; };
                 std::vector<Win> wins;
                 for (int64_t q = a; q < b;) {
-                    const int T = (int) std::min<int64_t>(S, b - q);
+                    const int T = (int) std::min<int64_t>(g_lkc_s_sfx > 0 ? g_lkc_s_sfx : S, b - q);   // (STRATA_LKCHAIN: today's rows)
                     wins.push_back({T, q});
                     q += T;
                 }
@@ -14798,7 +14798,7 @@ int main(int argc, char** argv) {
                 for (int64_t q = a; q < b;) {
                     if (stop_req.load()) { e = "cancelled"; return false; }
                     pp_exact = false;   // until this window and the drafter's rows are in
-                    const int T = (int) std::min<int64_t>(S, b - q);
+                    const int T = (int) std::min<int64_t>(g_lkc_s_sfx > 0 ? g_lkc_s_sfx : S, b - q);   // (STRATA_LKCHAIN: today's rows)
                     for (int t = 0; t < T; ++t) {
                         win[(size_t) t] = (int32_t) cur[(size_t) (q + t)];
                         nxt[(size_t) t] = (int32_t) cur[(size_t) (q + t + 1)];
