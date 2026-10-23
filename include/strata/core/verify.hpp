@@ -608,6 +608,7 @@ private:
     float* tail_snap_ = nullptr;                              // per QSA layer
     int32_t* sel_ = nullptr;
     int32_t* topk_scratch_ = nullptr;   // qsa_block_topk_long's multi-CTA exchange (STRATA_SELECT_LONG=1 only)
+    int32_t* qsadec_scratch_ = nullptr; // STRATA_QSADEC_PROTO=1/2 with STRATA_SELECT_LONG=1: the proto select's own exchange (zeroed with the arena)
     float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *hit_out_ = nullptr;
     int32_t *ids_ = nullptr, *hit_slot_ = nullptr, *hit_dst_ = nullptr, *hit_count_ = nullptr;
     int32_t* plan_ = nullptr;                                     // device copy of the plan block
