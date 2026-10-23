@@ -140,7 +140,10 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
 }  // namespace
 
 MtpDrafter::~MtpDrafter() {
+    if (pfq_job_.valid()) pfq_job_.wait();   // STRATA_MTP_PF_BATCH: its worker is done queueing
     if (cs_) cudaStreamSynchronize(cs_);
+    if (pfq_rows_) cudaFree(pfq_rows_);
+    if (pfq_copied_) cudaEventDestroy(pfq_copied_);
     for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : prefill_dev_exec_) if (e) cudaGraphExecDestroy(e);
     if (pf_dev_) cudaFree(pf_dev_);
@@ -1564,6 +1567,131 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
     }
     ms_prefill += ms_since(t0);
     return true;
+}
+
+// ---- STRATA_MTP_PF_BATCH=1 (opt-in): the layer split's prompt K/V of this layer queued behind the caller's next chunk.
+// On a layer split the last stage reports each chunk (Prefill::on_chunk) and its next chunk waits for that call; prefill()
+// syncs at its end, so the drafter's groups (~0.077 ms a token on a GP100 die, every chunk within the window) were added to
+// the last stage's beat - 7-8% of a <= 8K read (analysis 2026-10-22-next PREFILL.md section 2.3).  Queued, they run on the
+// drafter's stream while the stage computes its next chunk.  Nothing about them changes: prefill() itself queues them, from
+// the first group it would run, over the same rows (copied first, since the next chunk reuses the caller's buffer).
+static int64_t pfq_rows_env() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("STRATA_MTP_PF_BATCH_ROWS");
+        const long long r = e != nullptr ? std::atoll(e) : 2048;
+        return (int64_t) std::max(0LL, std::min(r, 16384LL));
+    }();
+    return v;
+}
+
+bool MtpDrafter::prefill_enqueued(std::string& err) {
+    if (!pfq_job_.valid()) return true;
+    bool ok = false;
+    try { ok = pfq_job_.get(); } catch (...) { pfq_err_ = "mtp prefill (queued): the worker failed"; }
+    if (!ok) {
+        err = pfq_err_.empty() ? std::string("mtp prefill (queued) failed") : pfq_err_;
+        pfq_err_.clear();
+    }
+    return ok;
+}
+
+bool MtpDrafter::prefill_join(std::string& err) {
+    if (!pfq_pending_ && !pfq_job_.valid()) return true;
+    const OnDevice on_device(device_);
+    bool ok = prefill_enqueued(err);
+    if (cs_ && cudaStreamSynchronize(cs_) != cudaSuccess) {
+        if (ok) err = std::string("mtp prefill (queued): ") + cudaGetErrorString(cudaGetLastError());
+        ok = false;
+    }
+    pfq_pending_ = false;
+    return ok;
+}
+
+bool MtpDrafter::prefill_queue(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err,
+                               bool& queued) {
+    queued = false;
+#if defined(STRATA_GPU_METAL)
+    (void) R_rows; (void) next_tokens; (void) n; (void) cell0; (void) err;
+    return true;
+#else
+    const OnDevice on_device(device_);
+    if (!prefill_enqueued(err)) return false;   // the previous chunk's groups are all queued: no two queue at once
+    // declined: the drafter idle first (prefill() runs next and may grow its records, a free that must not race them)
+    auto decline = [&]() -> bool {
+        if (pfq_pending_) {
+            if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+                err = std::string("mtp prefill (queued): ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            pfq_pending_ = false;
+        }
+        return true;
+    };
+    if (n <= 0 || prefill_per_group_sync() || max_t_ <= 0) return decline();
+    // the first group prefill() runs: groups start at multiples of max_t_ from the chunk's first row, and one is skipped
+    // while it ends at or before first_needed (a test that only grows with the group)
+    const int64_t first_needed = (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0;
+    int64_t c0 = 0;
+    while (c0 < n && cell0 + c0 + std::min<int64_t>(max_t_, n - c0) <= first_needed) c0 += max_t_;
+    if (c0 >= n) {   // no group: prefill() would only stage records, which nothing reads
+        queued = true;
+        return true;
+    }
+    const int64_t rows = n - c0, HCN = g_->hc * g_->n_embd;
+    if (rows > pfq_rows_env()) return decline();
+#if !defined(STRATA_USE_HIP)
+    {   // the rows on this device (the drafter is loaded on the last stage's card, whose rows they are)
+        cudaPointerAttributes pa{};
+        if (cudaPointerGetAttributes(&pa, R_rows) != cudaSuccess || pa.type != cudaMemoryTypeDevice || pa.device != device_) {
+            (void) cudaGetLastError();
+            return decline();
+        }
+    }
+#endif
+    if (pfq_rows_ == nullptr) {   // first use: the staging at its full size, the graphs and records reserved (nothing queued yet)
+        if (!decline()) return false;
+        const int64_t cap = pfq_rows_env();
+        if (cudaMalloc((void**) &pfq_rows_, (size_t) (cap * HCN) * sizeof(float)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            pfq_rows_ = nullptr;
+            std::fprintf(stderr, "strata mtp: STRATA_MTP_PF_BATCH: no room for a %lld-row staging; the prompt K/V runs "
+                                 "in step\n", (long long) cap);
+            return true;   // declined, idle
+        }
+        if (cudaEventCreateWithFlags(&pfq_copied_, cudaEventDisableTiming) != cudaSuccess) {
+            err = "mtp prefill (queued): an event could not be made";
+            return false;
+        }
+        pfq_cap_ = cap;
+        if (!reserve_prefill(cap, err)) return false;
+    }
+    // the rows into the staging, after the previous chunk's groups (its readers) on the same stream
+    if (cudaMemcpyAsync(pfq_rows_, R_rows + (size_t) c0 * HCN, (size_t) (rows * HCN) * sizeof(float), cudaMemcpyDeviceToDevice,
+                        cs_) != cudaSuccess ||
+        cudaEventRecord(pfq_copied_, cs_) != cudaSuccess) {
+        err = std::string("mtp prefill (queued): ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    pfq_pending_ = true;
+    pfq_tok_.assign(next_tokens + c0, next_tokens + n);
+    const int64_t cell_a = cell0 + c0;
+    pfq_job_ = std::async(std::launch::async, [this, rows, cell_a]() -> bool {
+        try {
+            std::string e;
+            if (prefill(pfq_rows_, pfq_tok_.data(), rows, cell_a, e, false)) return true;
+            pfq_err_ = e;
+        } catch (const std::exception& x) {
+            pfq_err_ = std::string("mtp prefill (queued): ") + x.what();
+        }
+        return false;
+    });
+    queued = true;
+    if (cudaEventSynchronize(pfq_copied_) != cudaSuccess) {   // the caller's rows are free from here
+        err = std::string("mtp prefill (queued): ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return true;
+#endif
 }
 
 // STRATA_DRAFT_TIMING=1: where a draft round's time goes, from cudaEvent pairs around each graph launch (GPU time of the round

@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <string>
 #include <vector>
 
@@ -91,6 +92,21 @@ public:
     /// for the drafter's stream (the caller orders on it: `stream()`).
     bool prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err,
                  bool sync = true);
+    /// STRATA_MTP_PF_BATCH=1 (opt-in; a layer split's last stage, whose chunk rows `R_rows` the next chunk overwrites as
+    /// soon as the reporting call returns): prefill() for one prompt chunk, off the caller's critical path.  The rows of
+    /// the groups prefill() would run (those the window can still reach) are copied on the drafter's stream into its own
+    /// staging - this call waits for that copy only (which itself waits for the previous queued chunk's groups, the
+    /// staging's last readers) - and a worker thread queues prefill(sync = false) over the staging, so the groups run on
+    /// the drafter's stream while the caller's next chunk computes.  The same groups from the same first cell, the same
+    /// graphs, records and order as prefill(): the K/V are prefill()'s bits.  `queued` false with `err` empty: declined
+    /// (more rows than the staging holds - STRATA_MTP_PF_BATCH_ROWS, default 2048 - STRATA_MTP_PREFILL_SYNC's loop, or
+    /// rows on another device); the drafter is idle then, and the caller runs prefill().
+    bool prefill_queue(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err,
+                       bool& queued);
+    /// Every chunk prefill_queue queued has been queued and has run: the drafter idle, as after prefill().  A no-op when
+    /// none is pending.  A queued chunk's error comes back here.
+    bool prefill_join(std::string& err);
+    bool prefill_pending() const { return pfq_pending_; }
     /// --pipeline-windows: capture the prefill graphs and size its input records for windows of up to max_t rows now,
     /// so a later prefill(sync = false) of a window neither captures nor allocates (both wait for the device).
     bool prepare_prefill(std::string& err);
@@ -193,11 +209,22 @@ public:
     int64_t cell_floor() const { return cell_floor_; }
     int device() const { return device_; }
     bool idle(std::string& err) {
+        if (!prefill_enqueued(err)) return false;   // (STRATA_MTP_PF_BATCH: a queued chunk's groups are all on the stream)
         if (cs_ && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: its stream failed"; return false; }
+        pfq_pending_ = false;
         return true;
     }
 
 private:
+    /// STRATA_MTP_PF_BATCH: the worker of the last prefill_queue has queued its groups (its error, if it failed)
+    bool prefill_enqueued(std::string& err);
+    float* pfq_rows_ = nullptr;          ///< the staging: up to pfq_cap_ rows of hc*n_embd floats
+    int64_t pfq_cap_ = 0;
+    cudaEvent_t pfq_copied_ = nullptr;   ///< after the copy into the staging
+    std::vector<int32_t> pfq_tok_;       ///< the queued chunk's next tokens (the caller's are gone when it returns)
+    std::future<bool> pfq_job_;          ///< the worker that queues the groups
+    std::string pfq_err_;
+    bool pfq_pending_ = false;           ///< groups may still be queued or running
     bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);
     /// The layer's front for T rows at step rows [row0, +T): the embedding, the fc projections, the attention
     /// hyper-connection read (R_, inj_, mixed_) and the K/V appended.

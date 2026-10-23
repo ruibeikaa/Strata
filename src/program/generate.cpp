@@ -10937,6 +10937,16 @@ int main(int argc, char** argv) {
         // runs there, on the Prefill that ran the chunk, instead of the drafter's own per-8-row pass.  The drafts' K/V
         // come from Q8_1 x Q8_0 MMQ rather than mmvq: drafts may differ, the target's tokens never.
         static const bool split_mtp_batch = strata::program::draft_kv::split_env_on(std::getenv("STRATA_SPLIT_MTP_BATCH"));
+        // STRATA_MTP_PF_BATCH=1 (opt-in, default off): the layer split's drafter prompt pass (MtpDrafter::prefill, the same
+        // groups and graphs, so the same K/V bits) queued on the drafter's stream behind a copy of the chunk's in-window
+        // rows (MtpDrafter::prefill_queue) instead of run to its end before the last stage takes its next chunk; joined
+        // after every prompt read (sp.run).  Not beside STRATA_SPLIT_MTP_BATCH (E-9 writes this K/V from another stream),
+        // the drafter on the first card, or a read on a thread of its own beside decoding slots (STRATA_PIPED_CONCURRENT).
+        static const bool mtp_pf_batch = [] {
+            const char* v = std::getenv("STRATA_MTP_PF_BATCH");
+            return v != nullptr && std::atoi(v) == 1;
+        }();
+        bool mtp_pf_conc = false;   // set while a STRATA_PIPED_CONCURRENT read runs
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
             // KVA: a chunk the late layers did not compute has no real final rows: its draft cells are neither built
             // nor read (the floor rises before the cells are built, so they are skipped)
@@ -10964,10 +10974,30 @@ int main(int argc, char** argv) {
                     }
                 }
             }
-            if (!e.empty() || (use_mtp && !batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
+            if (!e.empty()) return false;
+            bool queued = false;   // STRATA_MTP_PF_BATCH: the drafter's own pass, queued
+            if (use_mtp && !batched && mtp_pf_batch && multi_gpu && !mtp_first && !split_mtp_batch && !mtp_pf_conc) {
+                if (!mtp.prefill_queue(R_rows, nxt.data(), T, p0, e, queued)) return false;
+                static bool said = false;   // once per process
+                if (!said && queued) {
+                    said = true;
+                    std::fprintf(stderr, "strata serve: STRATA_MTP_PF_BATCH=1: the draft layer's prompt K/V queued on CUDA%d's "
+                                         "drafter stream behind the next chunk (its own pass: the same K/V)\n",
+                                 stages.back()->dev);
+                }
+            } else if (use_mtp && !batched && mtp_pf_batch && multi_gpu) {
+                static bool said_off = false;
+                if (!said_off) {
+                    said_off = true;
+                    std::fprintf(stderr, "strata serve: STRATA_MTP_PF_BATCH=1 is off here (%s): the drafter's pass runs in step\n",
+                                 split_mtp_batch ? "STRATA_SPLIT_MTP_BATCH" : mtp_first ? "the drafter on the first card"
+                                                                                       : "a concurrent read");
+                }
+            }
+            if (use_mtp && !batched && !queued && !mtp.prefill(R_rows, nxt.data(), T, p0, e)) return false;
             if (use_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr)
                 std::fprintf(stderr, "strata serve: DRAFT_PREFILL path=%s mode=%d cells=%lld\n",
-                             batched ? "batched" : "token", mtp.kv_state().kv_mode, (long long) T);
+                             batched ? "batched" : queued ? "queued" : "token", mtp.kv_state().kv_mode, (long long) T);
             // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
             const int64_t done = p0 + T;
             pp_reached = done;
@@ -15339,6 +15369,14 @@ int main(int argc, char** argv) {
                 auto run = [&](int64_t q, int64_t r) -> bool {
                     if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);
                     const bool run_ok = sp.run(ids.data() + q, r - q, q, e);
+                    // STRATA_MTP_PF_BATCH: the draft layer's queued prompt K/V has run (a no-op when none was queued)
+                    if (use_mtp) {
+                        std::string je;
+                        if (!mtp.prefill_join(je) && run_ok) {
+                            e = je;
+                            return false;
+                        }
+                    }
                     if (run_ok && q == 0 && sp.kva_floor() > 0) {   // KVA approximated the start of this prompt: remember which tokens
                         kva_floors.note(ids.data(), sp.kva_floor());
                         if (use_mtp && mtp.cell_floor_enabled()) mtp.set_cell_floor(sp.kva_floor());
@@ -15433,6 +15471,11 @@ int main(int argc, char** argv) {
                     return true;
                 }();
                 if (piped && pr_conc && req_imgs.empty()) {   // (with no slot decoding it only watches for a BYIELD)
+                    struct PfConc {   // STRATA_MTP_PF_BATCH stays off for a read beside decoding slots
+                        bool& on;
+                        explicit PfConc(bool& b) : on(b) { on = true; }
+                        ~PfConc() { on = false; }
+                    } pf_conc{mtp_pf_conc};
                     // the drafter's prompt pass captures its graphs and grows its records at first use, and the
                     // prompt path's pinned upload slots grow at their first larger upload: done here, with nothing in
                     // flight (on the reader's thread a capture, an allocation or a free takes the driver's lock and
