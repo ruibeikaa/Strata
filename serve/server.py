@@ -64,6 +64,7 @@ from serve.structured import StructuredOutputError, prepare_format, validated_js
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve.prompt_echo import PromptEcho  # noqa: E402
+from serve import park_keeper  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -836,6 +837,32 @@ class StrataEngine:
     # ones, and all but 2 checkpoints each; see PARKSAVE in generate.cpp).  On a consumer TLC SSD that spends write
     # endurance for as long as it is on, and an idle unload would add a write at every idle period.
     PARK_DIR = os.environ.get("STRATA_PARK_DIR", "").strip()
+    # 2026-10-24, STRATA_PARK_RAMLIKE=1 (Windows; with STRATA_PARK_DIR): the "RAM disk" mode - the engine writes the
+    # parked conversations to named pagefile-backed sections instead of files, and a keeper process
+    # (serve/park_keeper.py) holds them in RAM from the unload to the next start.  Nothing goes to a disk but the
+    # folder's small park-mem.manifest and keeper.json (the pagefile only if memory runs short).  A reboot loses them.
+    PARK_RAMLIKE = os.environ.get("STRATA_PARK_RAMLIKE", "").strip() == "1" and os.name == "nt"
+    # the prompt echo (serve/prompt_echo.py) whose entries go with the parked conversations: set by prompt_echo_setup;
+    # entries loaded before it exists wait in _echo_pending
+    echo = None
+    _echo_pending = None
+    ECHO_FILE = "prompt-echo.json.z"
+
+    def _park_max_age_s(self) -> float:
+        try:
+            return max(0.0, float(os.environ.get("STRATA_PARK_MAX_AGE_H", "48") or 48)) * 3600
+        except ValueError:
+            return 48 * 3600.0
+
+    def echo_import(self, blob) -> None:
+        if not blob:
+            return
+        if self.echo is None:
+            self._echo_pending = blob
+            return
+        n, why = self.echo.import_blob(blob, self._park_max_age_s())
+        print(f"[strata] prompt echo: {n} kept entries back from before the restart"
+              + (f" (none: {why})" if not n else ""), flush=True)
 
     def park_known(self) -> bool:
         """The engine file knows PARKSAVE / PARKLOAD (an engine without them would answer ERR, which the session
@@ -856,22 +883,93 @@ class StrataEngine:
             return
         try:
             r = self.session_file("parksave", self.PARK_DIR)
-            print(f"[strata] parked conversations saved: {r['tokens']} ({r['bytes'] / 1e9:.2f} GB) to {self.PARK_DIR} "
+            where = "RAM (named sections)" if self.PARK_RAMLIKE else self.PARK_DIR
+            print(f"[strata] parked conversations saved: {r['tokens']} ({r['bytes'] / 1e9:.2f} GB) to {where} "
                   f"in {r['ms'] / 1000:.1f} s", flush=True)
         except Exception as e:                          # never let it block the unload
             print(f"[strata] parked conversations not saved: {e}", flush=True)
+            return
+        blob = None
+        if self.echo is not None:
+            try:
+                blob = self.echo.export()
+            except Exception as e:
+                print(f"[strata] prompt echo: entries not exported: {e}", flush=True)
+        if self.PARK_RAMLIKE:
+            self._park_keep(r["tokens"], blob)
+            return
+        path = os.path.join(self.PARK_DIR, self.ECHO_FILE)
+        try:
+            if blob and r["tokens"]:
+                with open(path + ".tmp", "wb") as f:
+                    f.write(blob)
+                os.replace(path + ".tmp", path)
+            elif os.path.exists(path):
+                os.remove(path)
+        except OSError as e:
+            print(f"[strata] prompt echo: entries not saved: {e}", flush=True)
+
+    def _park_keep(self, conversations: int, blob) -> None:
+        """RAM-like: a keeper process takes the sections the engine still holds, before the engine is closed."""
+        if not conversations:
+            park_keeper.release(self.PARK_DIR)          # nothing kept: an older keeper ends too
+            return
+        echo_sec, echo_name = None, ""
+        try:
+            if blob:
+                echo_sec, echo_name = park_keeper.put_echo(blob)
+            t0 = time.monotonic()
+            doc = park_keeper.spawn(self.PARK_DIR, self._park_max_age_s(), echo_name)
+            missing = doc.get("missing") or []
+            print(f"[strata] parked conversations kept in RAM by keeper PID {doc['pid']}: {doc['sections']} sections, "
+                  f"{doc['bytes'] / 1e9:.2f} GB{' + the prompt echo' if doc.get('echo') else ''} "
+                  f"({time.monotonic() - t0:.1f} s; released at the next start or after "
+                  f"{self._park_max_age_s() / 3600:.0f} h){'; MISSING ' + ', '.join(missing) if missing else ''}",
+                  flush=True)
+        except Exception as e:
+            print(f"[strata] parked conversations not kept in RAM: {e}", flush=True)
+        finally:
+            if echo_sec is not None:
+                echo_sec.close()                        # the keeper holds its own handle now (or nobody does)
 
     def park_from_disk(self):
         if not self.PARK_DIR or self.batch or not self.alive() or not self.park_known():
             return
-        if not os.path.exists(os.path.join(self.PARK_DIR, "park.manifest")):
+        keeper = None
+        if self.PARK_RAMLIKE:
+            keeper = park_keeper.status(self.PARK_DIR)
+            if keeper is None:
+                manifest = os.path.join(self.PARK_DIR, park_keeper.MANIFEST)
+                if os.path.exists(manifest):
+                    print("[strata] parked conversations: no keeper holds them any more (a reboot, or aged out); "
+                          "nothing to load", flush=True)
+                    try:
+                        os.remove(manifest)
+                    except OSError:
+                        pass
+                return
+        elif not os.path.exists(os.path.join(self.PARK_DIR, "park.manifest")):
             return
         try:
             r = self.session_file("parkload", self.PARK_DIR)
-            print(f"[strata] parked conversations loaded: {r['tokens']} ({r['bytes'] / 1e9:.2f} GB) from {self.PARK_DIR} "
+            where = f"RAM (keeper PID {keeper['pid']})" if keeper else self.PARK_DIR
+            print(f"[strata] parked conversations loaded: {r['tokens']} ({r['bytes'] / 1e9:.2f} GB) from {where} "
                   f"in {r['ms'] / 1000:.1f} s", flush=True)
         except Exception as e:
             print(f"[strata] parked conversations not loaded: {e}", flush=True)
+            r = None
+        blob = None
+        if keeper is not None:
+            if r and r["tokens"] and keeper.get("echo"):
+                blob = park_keeper.get_echo(keeper["echo"])
+            park_keeper.release(self.PARK_DIR)          # loaded (or not loadable): the keeper and its sections end
+        elif r and r["tokens"]:
+            try:
+                with open(os.path.join(self.PARK_DIR, self.ECHO_FILE), "rb") as f:
+                    blob = f.read()
+            except OSError:
+                pass
+        self.echo_import(blob)
 
     RESTART_RETRY_S = 15.0   # between the tries of restart(): a dying engine's VRAM may take a while to come back
 
@@ -2226,8 +2324,6 @@ def prompt_echo_setup(svc: "Service", cfg: dict, env: str) -> str:
         on = env not in ("0", "false", "off", "no")
     if not on:
         return "not asked for (\"prompt_echo\": true or STRATA_PROMPT_ECHO=1)"
-    if StrataEngine.PARK_DIR:
-        return "STRATA_PARK_DIR is set: parked files bring conversations back after a restart, the kept replies do not"
     if svc.slot_save_path:
         return "slot save/restore is on: a restored conversation would come back without its kept replies"
     if svc.vision is not None:
@@ -2243,6 +2339,12 @@ def prompt_echo_setup(svc: "Service", cfg: dict, env: str) -> str:
             pass
     svc.prompt_echo = PromptEcho(svc.im_end_id, max_entries=max(32, 2 * slots + 2),
                                  log=lambda msg: print(msg, flush=True))
+    # 2026-10-24: with STRATA_PARK_DIR the entries are saved beside the parked conversations and come back with them
+    # (StrataEngine.park_to_disk / park_from_disk); ones the engine loaded before this point are taken now
+    if isinstance(svc.engine, StrataEngine):
+        svc.engine.echo = svc.prompt_echo
+        pending, svc.engine._echo_pending = svc.engine._echo_pending, None
+        svc.engine.echo_import(pending)
     return (f"the next request carries the generated ids of a reply ({svc.prompt_echo.max_entries} conversations "
             "kept, least recently used dropped first)")
 

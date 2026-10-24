@@ -132,6 +132,56 @@ class PromptEcho:
             self.stats["recorded"] += 1
         return True
 
+    # Kept over an engine restart (2026-10-24): parked conversations that come back after a restart (STRATA_PARK_DIR,
+    # PARKSAVE / PARKLOAD) hold the echoed ids, so the entries must come back with them - else the next turn is
+    # tokenized canonically and the engine reads from the first non-canonical turn on.  A stale entry is harmless: its
+    # ids are a tokenization of the very text it matches.
+    EXPORT_VERSION = 1
+
+    def export(self, now: float | None = None) -> bytes:
+        """The entries (least recently used first) as one zlib-compressed JSON blob."""
+        import base64, json, time, zlib
+        with self.lock:
+            entries = [{"text": e.text, "ids": base64.b64encode(e.ids.tobytes()).decode("ascii"), "gen_at": e.gen_at}
+                       for e in self.entries]
+        doc = {"v": self.EXPORT_VERSION, "im_end": self.im_end, "saved_unix": time.time() if now is None else now,
+               "itemsize": array("i").itemsize, "entries": entries}
+        return zlib.compress(json.dumps(doc, ensure_ascii=False).encode("utf-8"), 1)
+
+    def import_blob(self, blob: bytes, max_age_s: float = 0, now: float | None = None) -> tuple[int, str]:
+        """Add the entries of an export() (checked: version, <|im_end|> id, age, every entry's cuts pairing up as
+        record() requires) in front of the ones kept now.  -> (entries added, why none were when 0)."""
+        import base64, json, time, zlib
+        try:
+            doc = json.loads(zlib.decompress(blob).decode("utf-8"))
+        except (ValueError, zlib.error) as e:
+            return 0, f"unreadable ({e})"
+        if not isinstance(doc, dict) or doc.get("v") != self.EXPORT_VERSION or doc.get("im_end") != self.im_end \
+                or doc.get("itemsize") != array("i").itemsize:
+            return 0, "another format or tokenizer"
+        age = (time.time() if now is None else now) - float(doc.get("saved_unix") or 0)
+        if max_age_s and age > max_age_s:
+            return 0, f"saved {age / 3600:.1f} h ago (older than {max_age_s / 3600:.0f} h)"
+        fresh: list[Entry] = []
+        for d in doc.get("entries") or []:
+            try:
+                text, gen_at = d["text"], int(d["gen_at"])
+                ids = array("i")
+                ids.frombytes(base64.b64decode(d["ids"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            c = self._cuts(text, ids)
+            if c is None or not ids or ids[-1] != self.im_end or not text.endswith(IM_END_TEXT) or not 0 <= gen_at <= len(text):
+                continue
+            fresh.append(Entry(text, ids, c[0], c[1], gen_at))
+        if not fresh:
+            return 0, "no usable entries"
+        with self.lock:
+            self.entries = fresh + [e for e in self.entries if all(e.text != f.text for f in fresh)]
+            while len(self.entries) > self.max_entries:
+                self.entries.pop(0)
+        return len(fresh), ""
+
     def summary(self) -> dict:
         with self.lock:
             return {**self.stats, "entries": len(self.entries), "ids": sum(len(e.ids) for e in self.entries),

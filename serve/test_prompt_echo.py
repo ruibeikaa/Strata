@@ -207,10 +207,12 @@ class Setup(unittest.TestCase):
             self.assertIsNotNone(s.prompt_echo)
 
     def test_off_where_kept_replies_could_be_lost(self):
+        # 2026-10-24: parked files keep the echo's entries beside them (park_to_disk / park_from_disk), so the echo
+        # stays on with STRATA_PARK_DIR
         with mock.patch.object(StrataEngine, "PARK_DIR", "C:\\parked"):
             s = self.svc()
-            self.assertIn("STRATA_PARK_DIR", prompt_echo_setup(s, {"prompt_echo": True}, ""))
-            self.assertIsNone(s.prompt_echo)
+            prompt_echo_setup(s, {"prompt_echo": True}, "")
+            self.assertIsNotNone(s.prompt_echo)
         with mock.patch.object(StrataEngine, "PARK_DIR", ""):
             for attrs, word in (({"slot_save_path": "C:\\slots"}, "slot"), ({"vision": object()}, "images")):
                 s = self.svc(**attrs)
