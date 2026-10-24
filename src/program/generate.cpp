@@ -349,19 +349,20 @@ static const char* pipe_dbg_env(const char* name) {
     static const bool on = [] { const char* v = std::getenv("STRATA_PIPELINE_DEBUG"); return v != nullptr && v[0] != 0 && v[0] != '0'; }();
     return on ? std::getenv(name) : nullptr;
 }
-// STRATA_LKCHAIN="K[,M[,DIV[,FRESH[,POL]]]]" (opt-in; the new pipelined loop's B0/B modes): lookup chaining.  After the
+// STRATA_LKCHAIN="K[,M[,DIV[,FRESH[,POL[,ROWS]]]]]" (opt-in; the new pipelined loop's B0/B modes): lookup chaining.  After the
 // MTP's drafts for a window end, up to K tokens of the prompt lookup over the context + every pending draft follow them
 // when its match is at least M tokens (default 8); DIV: a landed chain output that differs from the lookup ends the tail
 // there unless the match is at least DIV (0, the default: always); FRESH: a fresh T=1 window may take a lookup window
 // whose first token differs from the MTP's draft when the match is at least FRESH (0: today's rule); POL=1: the chained
-// tokens are gated by DraftPolicy::chain instead of a fixed K.  Set at all (even "0"), it raises the verify window to
+// tokens are gated by DraftPolicy::chain instead of a fixed K; ROWS: a chained or lookup-made window's rows at most (0: 8;
+// 6 keeps every window as wide as today's, the bit-exact setting on sm_60 - LKCHAIN.md).  Set at all (even "0"), it raises the verify window to
 // kVerifyMaxT (8) rows for the tails; plain lookup windows keep today's size.  STRATA_LKCHAIN_FILE=<file>: the same five
 // numbers re-read at every request (an A/B on one server).  Only drafts change: the verified text is the serial loop's.
-struct LkcSettings { bool set = false; int k = 0, m = 8, div = 0, fresh = 0, pol = 0; };
+struct LkcSettings { bool set = false; int k = 0, m = 8, div = 0, fresh = 0, pol = 0, rows = 0; };
 static bool lkc_parse(const char* v, LkcSettings& o) {
     if (v == nullptr) return false;
-    int x[5] = {0, 8, 0, 0, 0};
-    const int n = std::sscanf(v, "%d,%d,%d,%d,%d", &x[0], &x[1], &x[2], &x[3], &x[4]);
+    int x[6] = {0, 8, 0, 0, 0, 0};
+    const int n = std::sscanf(v, "%d,%d,%d,%d,%d,%d", &x[0], &x[1], &x[2], &x[3], &x[4], &x[5]);
     if (n < 1) return false;
     o.set = true;
     o.k = std::clamp(x[0], 0, 7);
@@ -369,6 +370,7 @@ static bool lkc_parse(const char* v, LkcSettings& o) {
     o.div = std::max(0, x[2]);
     o.fresh = std::max(0, x[3]);
     o.pol = x[4] != 0 ? 1 : 0;
+    o.rows = std::clamp(x[5], 0, 8);
     return true;
 }
 static const LkcSettings& lkc_env() {
@@ -15916,6 +15918,7 @@ int main(int argc, char** argv) {
                     cfg.lkc_div = lk.div;
                     cfg.lkc_fresh = lk.fresh;
                     cfg.lkc_policy = lk.pol != 0;
+                    cfg.lkc_rows = lk.rows;
                     cfg.S_sfx = std::min(g_lkc_s_sfx, S);
                 } else if (g_lkc_s_sfx > 0) {
                     cfg.S_sfx = std::min(g_lkc_s_sfx, S);   // (N2: today's lookup windows, no tails)
@@ -16353,11 +16356,11 @@ int main(int argc, char** argv) {
                     // one (rho = held2 / (held1 + held2)), their time from the verdict before; the windows two guesses
                     // deep (C); the per-stage undo; the slot pool; prestage misses; the chain requests
                     if (cfg.lkc_k > 0 || cfg.lkc_fresh > 0)
-                        std::fprintf(stderr, "strata pipeline lookup chain (K %d M %d div %d fresh %d pol %d): %lld lookups, "
+                        std::fprintf(stderr, "strata pipeline lookup chain (K %d M %d div %d fresh %d pol %d rows %d): %lld lookups, "
                                              "%lld tails (%lld tokens), %lld tested (%lld tokens accepted), %lld cut by the "
                                              "chain, %lld next-window disagreements (%lld lk windows), %lld fresh lookup "
                                              "windows against the draft\n", cfg.lkc_k, cfg.lkc_m, cfg.lkc_div, cfg.lkc_fresh,
-                                     cfg.lkc_policy ? 1 : 0, (long long) st4.lkc_lookups, (long long) st4.lkc_windows,
+                                     cfg.lkc_policy ? 1 : 0, cfg.lkc_rows, (long long) st4.lkc_lookups, (long long) st4.lkc_windows,
                                      (long long) st4.lkc_tokens, (long long) st4.lkc_reached, (long long) st4.lkc_ok,
                                      (long long) st4.lkc_cut, (long long) st4.lkc_div, (long long) st4.lkc_lkwin,
                                      (long long) st4.lkc_fresh);
