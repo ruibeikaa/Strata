@@ -993,6 +993,10 @@ bool argmax_rows_wanted() {
             const char* e = std::getenv("STRATA_ARGMAX_ROWS_SM70");
             return e != nullptr && std::atoi(e) != 0;
         }
+        if (major == 6) {   // STRATA_ARGMAX_ROWS_SM60=1: opt-in on Pascal (campaign MROW, PH402 GP100)
+            const char* e = std::getenv("STRATA_ARGMAX_ROWS_SM60");
+            return e != nullptr && std::atoi(e) != 0;
+        }
         return major == 8;
     }();
     return want && multi_block_head_ops();

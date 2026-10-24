@@ -1126,6 +1126,130 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
     }
 }
 
+// MROW (campaign, opt-in STRATA_HC_MROW=1|2): the staged down projection for 1-8 tokens in ONE launch, WPB rows
+// (warps) a block.  Every (row, token) is summed exactly as gr_down_staged_kernel sums it: lane L takes chunks L + 32 q
+// of every half-stream tile h in ascending (h, q), dot8u's order inside a chunk, then warp_sum; the epilogue is the same.
+// What differs is only where the activations wait: one tile of every token in shared memory (5 KB a token, so 8
+// tokens fit the 48 KB a Pascal block may use - the staged kernel holds two tiles and splits 5+ tokens into a second
+// launch), and the NEXT tile's activations and weights in registers, loaded before the current tile is used (before
+// sm_80 the staged kernel's "cp.async" is a plain load-then-store, so its next tile was fetched with no work to hide
+// behind).  WPB 4 (STRATA_HC_MROW=2) spreads the 324 rows over 81 blocks (all SMs of a die) instead of 41.
+template <int T, int WPB>
+__global__ void __launch_bounds__(WPB * 32) gr_down_mrow_kernel(GrMulti m) {
+    constexpr int THR = WPB * 32;
+    constexpr int TF4 = H_TILE / 4;                       // float4 of one token's tile
+    constexpr int NL = (T * TF4 + THR - 1) / THR;         // float4 a thread stages per tile
+    constexpr int NDB = LR / WPB;                         // down blocks; the inject block follows
+    static_assert(LR % WPB == 0 && WPB >= HC, "the inject rows fit one block");
+    __shared__ __align__(16) float4 hb[T * TF4];          // [T][2 planes][160] float4, as stage_htile lays it out
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const bool inject_block = blockIdx.x == NDB;
+    const int row = inject_block ? warp : blockIdx.x * WPB + warp;
+    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
+    const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
+    const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
+    float acc[T];
+#pragma unroll
+    for (int k = 0; k < T; ++k) acc[k] = 0.0f;
+    uint4 wv[HQ], wn[HQ];
+    float4 xr[NL];
+    auto ld_x = [&](int h) {
+#pragma unroll
+        for (int u = 0; u < NL; ++u) {
+            const int i = t + u * THR;
+            if (i < T * TF4) {
+                const int k = i / TF4, s4 = i - k * TF4;
+                xr[u] = *reinterpret_cast<const float4*>(m.xn + (size_t) k * D + (size_t) h * H_TILE + (size_t) s4 * 4);
+            }
+        }
+    };
+    auto st_x = [&]() {
+#pragma unroll
+        for (int u = 0; u < NL; ++u) {
+            const int i = t + u * THR;
+            if (i < T * TF4) {
+                const int k = i / TF4, s4 = i - k * TF4;
+                hb[(size_t) k * TF4 + (s4 & 1) * (H_TILE / 8) + (s4 >> 1)] = xr[u];
+            }
+        }
+    };
+    if (active) {
+#pragma unroll
+        for (int q = 0; q < HQ; ++q) wv[q] = __ldg(w4 + lane + 32 * q);
+    }
+    ld_x(0);
+    st_x();
+    __syncthreads();
+#pragma unroll 1
+    for (int h = 0; h < N_HTILES; ++h) {
+        if (h + 1 < N_HTILES) {
+            if (active) {
+#pragma unroll
+                for (int q = 0; q < HQ; ++q) wn[q] = __ldg(w4 + (h + 1) * (H_TILE / 8) + lane + 32 * q);
+            }
+            ld_x(h + 1);
+        }
+        if (active) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) {
+                const int j = lane + 32 * q;
+                const Bf16x8 wvq = unpack8(wv[q]);
+#pragma unroll
+                for (int k = 0; k < T; ++k) {
+                    const float4* pk = hb + (size_t) k * TF4;
+                    acc[k] += dot8u(wvq, pk[j], pk[H_TILE / 8 + j]);
+                }
+            }
+        }
+        if (h + 1 < N_HTILES) {
+            __syncthreads();                              // every warp is done with tile h
+            st_x();
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) wv[q] = wn[q];
+            __syncthreads();
+        }
+    }
+    if (!active) return;
+    float s[T];
+#pragma unroll
+    for (int k = 0; k < T; ++k) s[k] = warp_sum(acc[k]);
+#pragma unroll
+    for (int k = 0; k < T; ++k) {
+        if (lane != k) continue;
+        if (inject_block) {
+            m.a[k].inject_out[row] = s[k];
+        } else {
+            const float x = s[k] / (float) HC;
+            m.a[k].lo[row] = x / (1.0f + __expf(-x));
+        }
+    }
+}
+template <int WPB>
+void launch_down_mrow(const GrMulti& m, cudaStream_t st) {
+    const dim3 g(LR / WPB + 1);
+    switch (m.T) {
+        case 1: gr_down_mrow_kernel<1, WPB><<<g, WPB * 32, 0, st>>>(m); break;
+        case 2: gr_down_mrow_kernel<2, WPB><<<g, WPB * 32, 0, st>>>(m); break;
+        case 3: gr_down_mrow_kernel<3, WPB><<<g, WPB * 32, 0, st>>>(m); break;
+        case 4: gr_down_mrow_kernel<4, WPB><<<g, WPB * 32, 0, st>>>(m); break;
+        case 5: gr_down_mrow_kernel<5, WPB><<<g, WPB * 32, 0, st>>>(m); break;
+        case 6: gr_down_mrow_kernel<6, WPB><<<g, WPB * 32, 0, st>>>(m); break;
+        case 7: gr_down_mrow_kernel<7, WPB><<<g, WPB * 32, 0, st>>>(m); break;
+        default: gr_down_mrow_kernel<8, WPB><<<g, WPB * 32, 0, st>>>(m); break;
+    }
+}
+// STRATA_HC_MROW: 0 off (default), 1 = 8 rows a block, 2 = 4 rows a block, 3 = by token count (1: off, 2-4: 4, 5-8: 8); fused_gr_set_mrow (the bench) overrides it
+int g_hc_mrow = -1;
+int hc_mrow() {
+    static const int env = [] { const char* v = std::getenv("STRATA_HC_MROW"); return v ? std::atoi(v) : 0; }();
+    return g_hc_mrow >= 0 ? g_hc_mrow : env;
+}
+// STRATA_GR_UP75_MIN=n: the up75 kernel (sm_60 default via STRATA_GR_UP75) from n tokens instead of 3
+int up75_min() {
+    static const int v = [] { const char* e = std::getenv("STRATA_GR_UP75_MIN"); const int n = e ? std::atoi(e) : 0; return n >= 1 ? n : 3; }();
+    return v;
+}
+
 // the current device is Volta (sm_70): the fast norm/up is its default
 bool cur_dev_volta() {
 #if defined(__HIPCC__)
@@ -1353,7 +1477,10 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
     // STRATA_HC_Q8: the staged down kernel reads bf16 only, so Q8 weights take split's down kernel (the plain one)
     const bool staged = variant >= kHcStaged && m.a[0].s_down == nullptr;
     int tv = 2560;
-    const int chunk_tok = down_chunk(staged, &tv);
+    int chunk_tok = down_chunk(staged, &tv);
+    // MROW: every token in one launch; mode 3 (measured, MROW.md) = the staged kernel at 1 token, 4 rows a block at 2-4, 8 at 5-8
+    const bool mrow_down = staged && hc_mrow() > 0 && !(hc_mrow() == 3 && n_tok == 1);
+    if (mrow_down) chunk_tok = kFusedGrMaxT;
     const size_t per_tok = (staged ? (size_t) 2 * H_TILE : (size_t) tv) * sizeof(float);
     static const bool no_multi_gr = [] {
         const char* no = std::getenv("STRATA_NO_MULTI_GR");
@@ -1375,7 +1502,10 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
         // kFusedGrMaxT - the same tile, block size, accumulation order and plain/split/staged path, so the same bits
         // (decided once per device: this runs per layer when decode is not captured)
         const bool max4 = ct <= 4 && gr_down_max4();
-        if (staged) {
+        if (mrow_down && ct == n_tok) {   // MROW: all tokens, one launch
+            if (hc_mrow() == 2 || (hc_mrow() == 3 && n_tok <= 4)) launch_down_mrow<4>(c, st);
+            else launch_down_mrow<8>(c, st);
+        } else if (staged) {
             // #783 PR-g (stuchapin909): a launch of exactly ct <= 6 tokens is its own instantiation, the loop bounds
             // are compile-time (the same sums in the same order); STRATA_NO_MULTI_GR=1 keeps the generic kernels
             const int tg = down_tg(ct);
@@ -1450,7 +1580,7 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
             case 6: gr_up_multi_kernel<6, true, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
             default: gr_up_multi_kernel<kFusedGrMaxT, false, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
         }
-    } else if (n_tok >= 3 && up75_on()) {   // T 1-2: gr_up_multi_kernel is as fast or faster (fused_gr_bench, cold)
+    } else if (n_tok >= up75_min() && up75_on()) {   // T 1-2: gr_up_multi_kernel is as fast or faster (fused_gr_bench, cold)
         switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
             case 1: gr_up75_kernel<1, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
             case 2: gr_up75_kernel<2, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
@@ -2303,6 +2433,7 @@ static bool gr_fast() {
 int g_gr_fast = -1;
 #endif
 void fused_gr_set_fast(int on) { g_gr_fast = on; }
+void fused_gr_set_mrow(int v) { g_hc_mrow = v; }
 
 // STRATA_GR_V3: the stream-split hyper-connection read (gr_down_v3_kernel / gr_up_v3_kernel).  Another summation order than the default
 // read (~1e-7; a greedy tie can flip, so the answers are not byte-identical to 0.2.6's).  0.2.7: ON by default on a compute capability 12.0

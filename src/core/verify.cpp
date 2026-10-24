@@ -1597,7 +1597,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 // STRATA_DENSE_PROTO: qkv, z and the out projection on q8sm60p (qkv + z as one launch)
                 const bool dpg = strata::kernels::native_dense_proto_on() && !q8_attn && !g_qfuse() && !side_proj &&
-                                 n <= 4 && fready(wqkv, (int) N, (int) C) && fready(wg, (int) N, (int) ZV) &&
+                                 n <= 8 && fready(wqkv, (int) N, (int) C) && fready(wg, (int) N, (int) ZV) &&
                                  fready(wout, (int) ZV, (int) N);
                 const bool dpg_group = dpg && g_dense_group();   // qkv + z in one launch on cs
                 if (!q8_attn) quant_in(xm, (int) N);
@@ -1770,7 +1770,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }();
                 const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && (!st.kv_q4 || qb_q4);
                 // STRATA_DENSE_PROTO: q, k, v and the out projection on q8sm60p (k + v, and q with them, as one launch)
-                const bool dpq = strata::kernels::native_dense_proto_on() && !q8_attn && !side_proj && n <= 4 &&
+                const bool dpq = strata::kernels::native_dense_proto_on() && !q8_attn && !side_proj && n <= 8 &&
                                  fready(wq, (int) N, (int) (NH * 2 * HD)) && fready(wk, (int) N, (int) (NKV * HD)) &&
                                  fready(wv, (int) N, (int) (NKV * HD)) && fready(wo, (int) (NH * HD), (int) N);
                 if (!q8_attn) quant_in(xm, (int) N);
