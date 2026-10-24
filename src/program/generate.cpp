@@ -13553,6 +13553,14 @@ int main(int argc, char** argv) {
             //     kept, nor one parked longer ago than STRATA_PARK_MAX_AGE_H hours (default 48; 0 = no limit);
             //   - only the deepest and the shallowest checkpoint of each go to disk (the next turn's resume point and
             //     the system prompt's root), not the whole chain.
+            // STRATA_PARK_RAMLIKE=1 (Windows; 2026-10-24, "keep them in RAM, not on the SSD"): the images go to named
+            // pagefile-backed sections ("mem:Local\strata-park-<name>-s<stage>", session_file_write's section mode)
+            // instead of .ses files - nothing is written to a disk (the folder gets only the small park-mem.manifest),
+            // and this engine holds the sections until it exits; the serve starts a keeper process (serve/
+            // park_keeper.py) that opens them by name before the engine is closed and keeps them mapped until the next
+            // start has loaded them (or they age out).  Every kept conversation is written again at each save (a RAM
+            // copy, seconds), the default STRATA_PARK_MIN_TOKENS is 50000 and STRATA_PARK_RAMLIKE_FLOOR_MIB (8192) of
+            // commit must stay free beside them.
             // A parked image is one plain single-carve SavedConversation per stage (the park moved the checkpoints'
             // stage parts apart already), so each goes to its own session file (conversation_file.hpp, format v1,
             // bound to the same model/config identity as SAVE).  A manifest, replaced last in one rename, lists them
@@ -13646,14 +13654,20 @@ int main(int argc, char** argv) {
                     const char* v = std::getenv(k);
                     return v != nullptr && *v != '\0' ? (int64_t) std::atoll(v) : def;
                 };
-                const int64_t min_tokens = std::max<int64_t>(0, env_i64("STRATA_PARK_MIN_TOKENS", 16384));
+                const char* ramlike_env = std::getenv("STRATA_PARK_RAMLIKE");
+                const bool ramlike = ramlike_env != nullptr && ramlike_env[0] == '1';
+#ifndef _WIN32
+                if (ramlike) { refuse("STRATA_PARK_RAMLIKE needs Windows (named sections)"); continue; }
+#endif
+                const int64_t min_tokens = std::max<int64_t>(0, env_i64("STRATA_PARK_MIN_TOKENS", ramlike ? 50000 : 16384));
                 const int64_t max_age_s = std::max<int64_t>(0, env_i64("STRATA_PARK_MAX_AGE_H", 48)) * 3600;
                 const int64_t now_unix = (int64_t) std::chrono::duration_cast<std::chrono::seconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
                 auto too_old = [&](int64_t parked) { return max_age_s > 0 && parked > 0 && now_unix - parked > max_age_s; };
                 const size_t n_st = stages.size();
-                const std::string manifest = dir + "/park.manifest";
+                const std::string manifest = dir + (ramlike ? "/park-mem.manifest" : "/park.manifest");
                 auto file_of = [&](const std::string& name, size_t s) {
+                    if (ramlike) return "mem:Local\\strata-park-" + name + "-s" + std::to_string(s);
                     return dir + "/" + name + "-s" + std::to_string(s) + ".ses";
                 };
                 // a stage's running state: the first (index 0) is `ss`; the draft layer's K/V rides with the last
@@ -13680,7 +13694,7 @@ int main(int argc, char** argv) {
                         if ((int64_t) e.live.ids.size() < min_tokens) { ++small; continue; }
                         if (too_old(e.parked_unix)) { ++old; continue; }
                         if (e.stage_images.size() != n_st) { ++odd; continue; }
-                        bool on_disk = !e.disk_name.empty();
+                        bool on_disk = !ramlike && !e.disk_name.empty();   // RAM-like: every save writes them anew
                         for (size_t s = 0; on_disk && s <= n_st; ++s)
                             on_disk = std::filesystem::exists(file_of(e.disk_name, s), ec);
                         if (on_disk) {
@@ -13699,8 +13713,21 @@ int main(int argc, char** argv) {
                         const uint64_t h = strata::core::session_hash64(ids.data(), ids.size() * sizeof(int32_t), 0x5041524bULL);
                         char base[64];
                         std::snprintf(base, sizeof base, "c%016llx-%zu", (unsigned long long) h, ids.size());
+                        if (ramlike) {   // a section name is never reused: this process and this second in it
+#ifdef _WIN32
+                            const unsigned long pid = (unsigned long) GetCurrentProcessId();
+#else
+                            const unsigned long pid = 0;
+#endif
+                            std::snprintf(base + std::strlen(base), sizeof base - std::strlen(base), "-p%lu-t%lld", pid,
+                                          (long long) now_unix);
+                        }
                         std::string name = base;
-                        for (int k = 1; used.count(name) != 0 || std::filesystem::exists(file_of(name, 0), ec); ++k)
+                        auto taken = [&](const std::string& n) {
+                            return ramlike ? strata::core::session_section_exists(file_of(n, 0))
+                                           : std::filesystem::exists(file_of(n, 0), ec);
+                        };
+                        for (int k = 1; used.count(name) != 0 || taken(name); ++k)
                             name = std::string(base) + "-" + std::to_string(k);
                         used.insert(name);
                         p.name = name;
@@ -13750,7 +13777,9 @@ int main(int argc, char** argv) {
                             std::vector<size_t> mine = keep;
                             if (!lined_up) { mine.clear(); for (size_t j = 0; j < img.checkpoints.size(); ++j) mine.push_back(j); }
                             strata::core::SessionWriteOptions wo;
-                            wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+                            wo.min_free_bytes = ramlike ? (uint64_t) std::max<int64_t>(0, env_i64("STRATA_PARK_RAMLIKE_FLOOR_MIB", 8192)) << 20
+                                                        : (uint64_t) o.session_min_free_mib << 20;
+                            wo.durable = !ramlike;
                             wo.progress = moving;
                             wo.phase = blocking;
                             strata::core::SessionStatus st;
@@ -13786,6 +13815,7 @@ int main(int argc, char** argv) {
                             if (!ec) kept_bytes += (size_t) sz;
                         }
                     }
+                    if (ramlike) kept_bytes = bytes_written;   // sections: every kept one was written just now
                     {
                         const std::string tmp = manifest + ".tmp";
                         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
@@ -13795,8 +13825,10 @@ int main(int argc, char** argv) {
                         std::filesystem::rename(tmp, manifest, ec);   // replaces the old manifest in one step
                         if (ec) { refuse("cannot publish " + manifest + ": " + ec.message(), strata::core::SessionError::io); continue; }
                     }
-                    // session files no manifest lists any more (conversations that ran again, aged out, were evicted)
+                    // session files no manifest lists any more (conversations that ran again, aged out, were evicted);
+                    // RAM-like: no files (the sections of an older save go when their keeper ends)
                     size_t removed = 0;
+                    if (!ramlike)
                     for (const auto& de : std::filesystem::directory_iterator(dir, ec)) {
                         const std::string fname = de.path().filename().string();
                         if (fname.size() < 4 || fname.compare(fname.size() - 4, 4, ".ses") != 0) continue;
@@ -13805,9 +13837,10 @@ int main(int argc, char** argv) {
                         std::error_code rc;
                         if (std::filesystem::remove(de.path(), rc)) ++removed;
                     }
-                    std::fprintf(stderr, "strata serve: park save: %zu conversation%s on disk (%zu written now, %zu bytes; "
+                    std::fprintf(stderr, "strata serve: park save%s: %zu conversation%s on disk (%zu written now, %zu bytes; "
                                  "%zu already there), %zu bytes in all; not kept: %zu under %lld tokens, %zu older than "
                                  "%lld h%s; %zu old files removed; %.1f ms (tag %s)\n",
+                                 ramlike ? " (RAM-like: named sections, nothing on disk but the manifest)" : "",
                                  picks.size(), picks.size() == 1 ? "" : "s", written, bytes_written,
                                  picks.size() - written, kept_bytes, small, (long long) min_tokens, old,
                                  (long long) (max_age_s / 3600), odd ? ", some without every stage" : "", removed, ms(),
@@ -13878,7 +13911,8 @@ int main(int argc, char** argv) {
                                 strata::core::SessionReadLimits limits;
                                 limits.progress = moving;
                                 limits.admit = [floor, &o](uint64_t need, std::string& why) {
-                                    const auto avail = strata::core::conversation_available_memory();
+                                    const auto mem = strata::core::sample_host_memory();
+                                    const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
                                     if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
                                     why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
                                           std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed)";
