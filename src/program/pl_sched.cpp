@@ -157,7 +157,7 @@ bool Sched::check(const Config& c, std::string& err) {
         err = "pl_sched: lookup chaining needs the per-stage undo (B0 or B), not N2";
         return false;
     }
-    if (c.lkc_k < 0 || c.lkc_k > kMaxRows - 1 || c.S_sfx < 0 || c.S_sfx > c.S) {
+    if (c.lkc_k < 0 || c.lkc_k > kMaxRows - 1 || c.S_sfx < 0 || c.S_sfx > c.S || c.lkc_rows < 0 || c.lkc_rows > kMaxRows) {
         err = "pl_sched: lookup chaining's sizes out of range";
         return false;
     }
@@ -427,7 +427,8 @@ int Sched::lkc_pending(const PW& w, bool pushed, int32_t* out, int cap) const {
 void Sched::lkc_extend(PlIo& io, PW& w, bool pushed, const int32_t* oc, int idx_after, int k_landed) {
     if (c_.lkc_k <= 0 || !c_.suffix || w.seq == 0 || w.sfx || w.lk) return;
     // never past the context's edge: there the request would end on a window the MTP's own would have fitted
-    const int room = (int) std::min<int64_t>(std::min(c_.lkc_k, c_.S - w.T), c_.max_context - (w.p + w.T));
+    const int rows = c_.lkc_rows > 0 ? std::min(c_.lkc_rows, c_.S) : c_.S;
+    const int room = (int) std::min<int64_t>(std::min(c_.lkc_k, rows - w.T), c_.max_context - (w.p + w.T));
     if (room <= 0) return;
     int32_t pend[64];
     const int n = lkc_pending(w, pushed, pend, 64);
@@ -482,7 +483,8 @@ bool Sched::lkc_lk_window(PlIo& io, PW& pred) {
     PW b;
     b.seq = pred.seq + 1;
     b.p = pred.p + pred.T;
-    b.T = (int) std::min<int64_t>(std::min(c_.S, k), c_.max_context - (pred.p + pred.T));
+    const int rows = c_.lkc_rows > 0 ? std::min(c_.lkc_rows, c_.S) : c_.S;
+    b.T = (int) std::min<int64_t>(std::min(rows, k), c_.max_context - (pred.p + pred.T));
     if (b.T < 1) return true;
     for (int i = 0; i < b.T; ++i) b.tok[i] = L.tok[i];
     for (int i = 1; i < b.T; ++i) b.prob[i - 1] = q;

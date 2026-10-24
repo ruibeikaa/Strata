@@ -68,6 +68,9 @@ struct Config {
     int lkc_fresh = 0;             // a fresh T=1 window takes a lookup window whose first token differs from the
                                    // MTP's draft when the match is at least this long (0: never; today's rule)
     bool lkc_policy = false;       // the chained tokens are gated by DraftPolicy::chain (else every token up to lkc_k)
+    int lkc_rows = 0;              // a window with a lookup tail, or made from the lookup, has at most this many rows
+                                   // (0: S).  6: today's widest window - on sm_60 a 7- or 8-row window does not compute
+                                   // its rows bit for bit as a narrower one (LKCHAIN.md), so the text could change
     int S_sfx = 0;                 // a plain lookup window's rows at most (0: S) - today's S before lookup chaining
 
     int depth() const { return mode == Mode::B ? 3 : 2; }
