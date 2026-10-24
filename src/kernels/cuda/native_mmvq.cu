@@ -1945,6 +1945,11 @@ bool q8_sm60_on() {
 #if !defined(__HIPCC__)
 #include "q8_sm60.cuh"
 #include "q8_sm60_proto.cuh"
+#include "q8_sm60_f.cuh"
+// q8f's rows a pass by column count, and whether the next pass's weights load first (q8f_bench, MROW.md)
+#define Q8F_RB_2560(NC) ((NC) <= 4 ? 4 : 2)
+#define Q8F_RB_6144(NC) 1
+#define Q8F_PF true
 #endif
 
 // ============================ STRATA_Q8_PACKED=1: the packed Q8_0 decode layout (opt-in) ============================
@@ -2051,6 +2056,121 @@ bool q8_packed_shape(int n_in, int n_out) {   // the shapes native_q8_0_packed_k
            n_out >= 2048;
 }
 
+#if !defined(__HIPCC__)
+// ---- STRATA_Q8F=1 (opt-in, campaign MROW): q8f (q8_sm60_f.cuh) for 2..8 columns at n_in 2560 / 6144 ----
+// The same bits as q8sm60::kernel / q8sm60p::kernel (the int8 dots exact in fp32, the fp32 chain and xor tree theirs);
+// STRATA_Q8F_MIN=n: from n columns (default 2), STRATA_Q8F_RB=n: rows a pass (default: the measured table below).
+namespace {
+using QfFn = void (*)(const q8sm60p::Segs, const void*);
+struct QfPick {
+    QfFn fn = nullptr;
+    int rb = 0;
+    int thr = 0;
+};
+template<int NC, int NIN, int RB>
+constexpr bool qf_fits() { return 2 * RB * NC * (NIN / 16) * 4 + NC * (NIN / 32) * 4 <= 46 * 1024; }
+template<int NC, int NIN, int RB>
+QfPick qf_one() {
+    QfPick r;
+    if constexpr (qf_fits<NC, NIN, RB>()) {
+        r.fn = q8f::kernel<NC, NIN, RB, Q8F_PF>;
+        r.rb = RB;
+        r.thr = NIN / 16;
+    }
+    return r;
+}
+template<int NC, int NIN>
+QfPick qf_rb(int rb) {
+    switch (rb) {
+        case 1: return qf_one<NC, NIN, 1>();
+        case 2: return qf_one<NC, NIN, 2>();
+        case 4: return qf_one<NC, NIN, 4>();
+        default: return qf_one<NC, NIN, 8>();
+    }
+}
+int qf_env(const char* name, int dflt) {
+    const char* v = std::getenv(name);
+    const int n = v ? std::atoi(v) : 0;
+    return n > 0 ? n : dflt;
+}
+template<int NC>
+QfPick qf_nc(int n_in) {
+    static const int env_rb = qf_env("STRATA_Q8F_RB", 0);
+    if (n_in == 2560) return qf_rb<NC, 2560>(env_rb ? env_rb : Q8F_RB_2560(NC));
+    if (n_in == 6144) return qf_rb<NC, 6144>(env_rb ? env_rb : Q8F_RB_6144(NC));
+    return {};
+}
+QfPick qf_pick(int ncols, int n_in) {
+    switch (ncols) {
+        case 2: return qf_nc<2>(n_in);
+        case 3: return qf_nc<3>(n_in);
+        case 4: return qf_nc<4>(n_in);
+        case 5: return qf_nc<5>(n_in);
+        case 6: return qf_nc<6>(n_in);
+        case 7: return qf_nc<7>(n_in);
+        case 8: return qf_nc<8>(n_in);
+    }
+    return {};
+}
+bool q8f_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_Q8F");
+        if (!(v && v[0] == '1' && v[1] == '\0')) return false;
+        int dev = 0;
+        cudaDeviceProp p{};
+        const bool cc60 = cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+                          p.major == 6 && p.minor == 0;
+        cudaGetLastError();
+        const bool yes = cc60 && q8_sm60_on();
+        std::fprintf(stderr, "strata q8f: %s (STRATA_Q8F=1)\n",
+                     yes ? "Q8_0 GEMVs: loads-first for the head and 1-8 rows, exact-fp32-FMA dots at 6144 x 7-8" : "needs STRATA_Q8_SM60=1 on a cc 6.0 device; off");
+        return yes;
+    }();
+    return on;
+}
+int q8f_min() {
+    static const int v = qf_env("STRATA_Q8F_MIN", 2);
+    return v;
+}
+// q8f measured faster than the loads-first VMAD kernel only where that one cannot run: n_in 6144 at 7-8 columns
+// (q8sm60's planes need > 48 KB there; production then fell back to the exact GGUF-layout kernel at 8)
+bool q8f_takes(int ncols, int n_in) {
+    return ncols >= 7 && ncols <= 8 && ncols >= q8f_min() && n_in == 6144 && q8f_on() && qf_pick(ncols, n_in).fn != nullptr;
+}
+// one launch over 1..3 packed matrices of one input (q8sm60p::Segs, RB-row groups); false = not launched
+bool q8f_launch(const int8_t* const* qs, const half* const* d, float* const* y, const int* n_out, int nseg,
+                const void* x_q8_1, int n_in, int ncols, cudaStream_t s) {
+    if (nseg < 1 || nseg > q8sm60p::MAXSEG) return false;
+    const QfPick pk = qf_pick(ncols, n_in);
+    if (!pk.fn) return false;
+    q8sm60p::Segs S{};
+    S.n = nseg;
+    for (int i = 0; i < nseg; ++i) S.s[i] = q8sm60p::Seg{qs[i], d[i], y[i], n_out[i], 0};
+    q8sm60p::finish_segs(S, pk.rb);
+    static std::unordered_map<const void*, int> occ_of;   // per kernel, the first query (a capture runs this once)
+    int occ = 0;
+    const auto it = occ_of.find(reinterpret_cast<const void*>(pk.fn));
+    if (it != occ_of.end()) occ = it->second;
+    else {
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, pk.fn, pk.thr, 0) != cudaSuccess || occ < 1) {
+            cudaGetLastError();
+            occ = 1;
+        }
+        occ_of[reinterpret_cast<const void*>(pk.fn)] = occ;
+    }
+    const int grid = (std::max)(1, (std::min)(S.groups, q8sm60::sm_count() * occ));
+    const void* xp = x_q8_1;
+    void* args[] = {&S, &xp};
+    if (cudaLaunchKernel(reinterpret_cast<const void*>(pk.fn), dim3(unsigned(grid)), dim3(unsigned(pk.thr)), args, 0, s) !=
+        cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+} // namespace
+#endif
+
 bool q8_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
     auto& registry = q8_packed_registry();
 #if !defined(__HIPCC__)
@@ -2060,6 +2180,26 @@ bool q8_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in,
             validate_pointer(x_q8_1);
             validate_pointer(y);
             validate_stream(stream);
+            // STRATA_Q8F: the loads-first kernels (bitwise q8sm60::launch) for the head and the 5-8-row windows too
+            if (q8f_on() && native_dense_proto_on() && (n_in == 2560 || n_in == 6144) && !q8f_takes(ncols, n_in)) {
+                const void* wa[1] = {weights};
+                float* ya[1] = {y};
+                const int na[1] = {n_out};
+                if (native_q8_group(wa, ya, na, 1, x_q8_1, n_in, ncols, stream)) {
+                    launch_check();
+                    return true;
+                }
+            }
+            if (q8f_takes(ncols, n_in)) {   // STRATA_Q8F: the same bits as q8sm60::launch
+                const int8_t* qa[1] = {found->second.qs};
+                const half* da[1] = {found->second.d};
+                float* ya[1] = {y};
+                const int na[1] = {n_out};
+                if (q8f_launch(qa, da, ya, na, 1, x_q8_1, n_in, ncols, static_cast<cudaStream_t>(stream))) {
+                    launch_check();
+                    return true;
+                }
+            }
             if (q8sm60::launch(found->second.qs, found->second.d, static_cast<const Q81Block*>(x_q8_1), y, n_in,
                                n_out, ncols, static_cast<cudaStream_t>(stream))) {
                 launch_check();
@@ -2296,6 +2436,11 @@ DpPick dp_pick(int ncols, int n_in) {
         case 2: return dp_pick_nc<2>(n_in);
         case 3: return dp_pick_nc<3>(n_in);
         case 4: return dp_pick_nc<4>(n_in);
+        // STRATA_Q8F (MROW): 5-8 columns too (production runs q8sm60::kernel there: the same bits, loads one at a time)
+        case 5: return q8f_on() ? dp_pick_nc<5>(n_in) : DpPick{};
+        case 6: return q8f_on() ? dp_pick_nc<6>(n_in) : DpPick{};
+        case 7: return q8f_on() ? dp_pick_nc<7>(n_in) : DpPick{};
+        case 8: return q8f_on() ? dp_pick_nc<8>(n_in) : DpPick{};
     }
     return {};
 }
@@ -2308,8 +2453,10 @@ bool native_q8_group_ready(const void* weights, int n_in, int n_out, int ncols) 
     return false;
 #else
     if (!native_dense_proto_on() || !weights) return false;
-    const DpPick pk = dp_pick(ncols, n_in);
-    if (!pk.fn || q8sm60p::smem_bytes(ncols, n_in, pk.x16) > q8sm60::MAX_SMEM) return false;
+    if (!q8f_takes(ncols, n_in)) {   // STRATA_Q8F: 2..8 columns at 2560 / 6144 run q8f
+        const DpPick pk = dp_pick(ncols, n_in);
+        if (!pk.fn || q8sm60p::smem_bytes(ncols, n_in, pk.x16) > q8sm60::MAX_SMEM) return false;
+    }
     const auto& registry = q8_packed_registry();
     const auto found = registry.find(weights);
     return found != registry.end() && found->second.n_in == n_in && found->second.n_out == n_out;
@@ -2325,6 +2472,17 @@ bool native_q8_group(const void* const* weights, float* const* y, const int* n_o
     if (nseg < 1 || nseg > q8sm60p::MAXSEG || !x_q8_1) return false;
     for (int i = 0; i < nseg; ++i)
         if (!y[i] || !native_q8_group_ready(weights[i], n_in, n_out[i], ncols)) return false;
+    if (q8f_takes(ncols, n_in)) {   // STRATA_Q8F
+        const auto& reg = q8_packed_registry();
+        const int8_t* qa[q8sm60p::MAXSEG] = {};
+        const half* da[q8sm60p::MAXSEG] = {};
+        for (int i = 0; i < nseg; ++i) {
+            const Q8Packed& w = reg.find(weights[i])->second;
+            qa[i] = w.qs;
+            da[i] = w.d;
+        }
+        return q8f_launch(qa, da, y, n_out, nseg, x_q8_1, n_in, ncols, static_cast<cudaStream_t>(stream));
+    }
     const DpPick pk = dp_pick(ncols, n_in);
     const auto& registry = q8_packed_registry();
     q8sm60p::Segs S{};

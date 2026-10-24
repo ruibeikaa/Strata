@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace K = strata::kernels;
@@ -54,8 +55,11 @@ static std::vector<uint8_t> q8_0_of_bf16(const std::vector<uint16_t>& w, size_t 
     return out;
 }
 
+static int g_tog = 0;   // BENCH_TOGGLE=mrow1 / mrow2: f toggles the MROW down kernel instead of STRATA_GR_FAST
+static void set_f(int f) { if (g_tog) { K::fused_gr_set_fast(0); K::fused_gr_set_mrow(f ? g_tog : 0); } else K::fused_gr_set_fast(f); }
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
+    if (const char* e = std::getenv("BENCH_TOGGLE")) g_tog = std::string(e) == "mrow1" ? 1 : std::string(e) == "mrow2" ? 2 : 0;
     const int iters = argc > 1 ? std::atoi(argv[1]) : 500;
     const int t_lo = argc > 2 ? std::atoi(argv[2]) : 1, t_hi = argc > 3 ? std::atoi(argv[3]) : 6;
     const int cold_sets = argc > 4 ? std::atoi(argv[4]) : 0;
@@ -114,7 +118,7 @@ int main(int argc, char** argv) {
                     cudaMemset(drs, 0xff, (size_t) TM * HC * 4);
                     cudaMemset(dio, 0xff, (size_t) TM * HC * 4);
                     cudaMemset(dmix, 0xff, (size_t) TM * N * 4);
-                    K::fused_gr_set_fast(f);
+                    set_f(f);
                     K::fused_gr_read_multi(a, T, dxn, s);
                     cudaStreamSynchronize(s);
                     auto& o = out[f];
@@ -130,7 +134,7 @@ int main(int argc, char** argv) {
                 double us[2] = {1e30, 1e30};
                 for (int round = 0; round < 3; ++round)
                     for (int f = 0; f < 2; ++f) {
-                        K::fused_gr_set_fast(f);
+                        set_f(f);
                         for (int i = 0; i < 20; ++i) K::fused_gr_read_multi(a, T, dxn, s);
                         cudaEventRecord(e0, s);
                         for (int i = 0; i < iters; ++i) K::fused_gr_read_multi(a, T, dxn, s);
@@ -228,7 +232,7 @@ int main(int argc, char** argv) {
         std::vector<unsigned long long> hst((size_t) iters * 4);
         std::vector<K::FusedGrArgs> as((size_t) cold_sets * 8);
         for (int T = t_lo; T <= t_hi; ++T) for (int f = 0; f < 3; ++f) {
-            K::fused_gr_set_fast(f == 1);
+            set_f(f == 1);
             for (int c = 0; c < cold_sets; ++c)
                 for (int t = 0; t < T; ++t) {
                     K::FusedGrArgs& a = as[(size_t) c * 8 + t];
