@@ -2728,10 +2728,13 @@ bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, 
         strata::kernels::hc_q8_to_bf16(w->data, w->q8_scale, scratch, (long long) w->elements, stream);
         wb = scratch;
     }
+    // the pack's own resident tensor (not the STRATA_HC_REQ8 scratch, nor STRATA_HC_Q8's per-half bf16 view in a reused
+    // scratch): Pascal may keep its FP32 copy (STRATA_DENSE_F32_RESIDENT, gemm.cu)
+    const bool resident = wb == (const uint16_t*) w->data && w->hc_q8 == nullptr;
     const bool ct = g_cold.begin();
-    gm.bf16(X, wb, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy, 0.0f, ldx, x_f16);
+    gm.bf16(X, wb, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy, 0.0f, ldx, x_f16, resident);
     if (ct) g_cold.end("bf16", name, T, w->ne1, w->ne0);
-    if (X_lo) gm.bf16(X_lo, wb, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy, 1.0f);
+    if (X_lo) gm.bf16(X_lo, wb, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy, 1.0f, 0, false, resident);
     return true;
 }
 
