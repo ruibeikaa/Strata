@@ -37,8 +37,10 @@ public:
     /// STRATA_BF16_TC=1), Pascal widens both to fp32 (cublasSgemm); see gemm.cu.
     /// `x_f16`: X holds, instead of BF16, the FP16 values the Turing tensor-core path would convert it to
     /// (prefill's xn16 with its f16img writers): that path skips the conversion; any other converts back.
+    /// `w_resident`: W is a weight that stays where it is for the life of the process (a pack's resident BF16 tensor),
+    /// so Pascal's FP32 copy of it may be kept (STRATA_DENSE_F32_RESIDENT=1; gemm.cu) instead of made on every call.
     void bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
-              float beta = 0.0f, int64_t ldx = 0, bool x_f16 = false);
+              float beta = 0.0f, int64_t ldx = 0, bool x_f16 = false, bool w_resident = false);
     /// true when bf16() runs its products through FP16 tensor cores here (Turing, STRATA_BF16_TC): where X may be FP16
     bool bf16_converts_x() const;
 
@@ -107,6 +109,11 @@ private:
     void* mmq_ctx_ = nullptr;
     void* mmq_buf_ = nullptr;
     bool mmq_failed_ = false;
+    /// Pascal, STRATA_DENSE_F32_RESIDENT: f16() keeps the FP16 call for this product (a weight whose FP32 copy did not fit)
+    bool no_f32_ = false;
+    /// Pascal: Y = X . W^T as cublasSgemm with W already FP32 (a resident copy) and X widened in the same slices as
+    /// STRATA_DENSE_F32's per-chunk route; false (nothing launched) when the activation buffer cannot be had
+    bool sgemm_f32w(const uint16_t* X, const float* Wf, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy, float beta);
     /// Y = X . W^T with FP16 out, written into Y's own rows and widened there (no buffer): prompt_f16() only.
     void f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy);
 };

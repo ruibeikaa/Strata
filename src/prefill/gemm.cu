@@ -33,6 +33,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
 #include "hipblaslt_tuning.hpp"
@@ -804,11 +806,106 @@ int64_t dense_f32_min_t(int64_t N, int64_t K) {
     if (N == 2560 && (K == 6144 || K == 4096)) return 4096;
     return 0;
 }
+// ---- Pascal, opt-in (STRATA_DENSE_F32_RESIDENT=1): the FP32 copies made once and kept ---------------------------------
+// STRATA_DENSE_F32 dequantizes each dense weight to FP16 and widens it to FP32 on every chunk (the qkv / query / gate
+// projections of a 12-layer stage: ~470 M values, ~12 ms per chunk on a GP100 die), and the BF16 path (on Pascal every
+// BF16 product: the hyper-connection projections, the routers, ...) widens its weight on every call.  With this switch
+// the FP32 copy of such a weight is made on its first use - by the same kernels from the same values, so the same
+// FP32 values - and kept for the life of the process, keyed by the weight's device address (resident weights only:
+// the dense weights' native blocks, a pack's resident BF16 tensors; never a scratch).  The products are the same
+// cublasSgemm calls with the same sizes and slices, so the bits are those of the per-call route.
+//   Room: a copy is made only while the card keeps STRATA_F32_RESIDENT_RESERVE_MIB (default 1024) free after it; a
+//   weight whose copy did not fit is not tried again and keeps its per-call route (a dense weight: the FP16 call, which
+//   is bitwise the same; a BF16 weight: the per-call widening).  STRATA_F32_RESIDENT_BF16=0 leaves the BF16 weights out.
+bool f32_resident_on() {
+    static const bool env = [] {
+        const char* v = std::getenv("STRATA_DENSE_F32_RESIDENT");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (!env) return false;
+    const int cc = current_cc();
+    return cc >= 60 && cc < 70;
+}
+bool f32_resident_bf16() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_F32_RESIDENT_BF16"); return e == nullptr || e[0] != '0'; }();
+    return v && f32_resident_on();
+}
+size_t f32_resident_reserve() {
+    static const size_t v = [] {
+        const char* e = std::getenv("STRATA_F32_RESIDENT_RESERVE_MIB");
+        const long long m = e != nullptr && e[0] != '\0' ? std::atoll(e) : 1024;
+        return (size_t) (m < 0 ? 0 : m) << 20;
+    }();
+    return v;
+}
+std::mutex g_shadow_mu;
+std::unordered_map<const void*, float*> g_shadow;   // weight address -> its FP32 copy (nullptr: did not fit, not retried)
+uint64_t g_shadow_bytes[64] = {};
+int g_shadow_count[64] = {}, g_shadow_refused[64] = {};
+// the FP32 copy of the weight at `key` (`elems` values), made on first use by `make(dst)` on `st`; nullptr: no copy
+template <class Make>
+const float* shadow_get(const void* key, int64_t elems, cudaStream_t st, Make make) {
+    std::lock_guard<std::mutex> lk(g_shadow_mu);
+    if (const auto it = g_shadow.find(key); it != g_shadow.end()) return it->second;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return nullptr; }
+    const size_t bytes = (size_t) elems * 4;
+    size_t free_b = 0, total_b = 0;
+    float* p = nullptr;
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b >= bytes + f32_resident_reserve() &&
+        cudaMalloc((void**) &p, bytes) == cudaSuccess) {
+        make(p);
+        if (cudaStreamSynchronize(st) != cudaSuccess) {   // (the copy is read by later chunks on this stream only)
+            std::fprintf(stderr, "strata prefill: STRATA_DENSE_F32_RESIDENT: making a copy failed on GPU %d\n", dev);
+            std::exit(1);
+        }
+        const uint64_t before = g_shadow_bytes[dev];
+        g_shadow_bytes[dev] += bytes;
+        ++g_shadow_count[dev];
+        if (before == 0 || (before >> 28) != (g_shadow_bytes[dev] >> 28))   // the first, then every 256 MiB
+            std::fprintf(stderr, "strata prefill: STRATA_DENSE_F32_RESIDENT: GPU %d keeps %d FP32 weight copies, %.0f MiB "
+                                 "(%.0f MiB free)\n", dev, g_shadow_count[dev], g_shadow_bytes[dev] / 1048576.0,
+                         (free_b - bytes) / 1048576.0);
+    } else {
+        cudaGetLastError();
+        p = nullptr;
+        if (g_shadow_refused[dev]++ < 4)
+            std::fprintf(stderr, "strata prefill: STRATA_DENSE_F32_RESIDENT: GPU %d: no room for a %.1f MiB FP32 copy (%.0f MiB "
+                                 "free, reserve %.0f MiB; %d copies, %.0f MiB kept): this weight keeps its per-call route\n",
+                         dev, bytes / 1048576.0, free_b / 1048576.0, f32_resident_reserve() / 1048576.0, g_shadow_count[dev],
+                         g_shadow_bytes[dev] / 1048576.0);
+    }
+    g_shadow.emplace(key, p);
+    return p;
+}
 #endif
 }  // namespace
 #endif
 #if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
 void gemm_set_dense_f32(int mode) { g_dense_f32 = mode; }
+// STRATA_DENSE_F32's product with the weight already FP32: the same slices of X, the same cublasSgemm calls
+bool Gemm::sgemm_f32w(const uint16_t* X, const float* wf, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy, float beta) {
+    const int64_t n_sl = (T * K + kXSliceElems - 1) / kXSliceElems;   // even slices of at most 64 MiB as fp32
+    const int64_t x_rows = (T + n_sl - 1) / n_sl;
+    if (tc_x_elems_ < 2 * x_rows * K) cudaStreamSynchronize((cudaStream_t) stream_);   // grow() frees what may be in use
+    if (!grow(tc_x_, tc_x_elems_, 2 * x_rows * K)) { cudaGetLastError(); return false; }
+    static bool said = false;
+    if (!said) {
+        said = true;
+        std::fprintf(stderr, "prefill gemm: the dense projections' FP16 GEMMs run as cublasSgemm on resident FP32 copies "
+                             "(STRATA_DENSE_F32=1 + STRATA_DENSE_F32_RESIDENT=1)\n");
+    }
+    const float alpha = 1.0f;
+    float* const xf = reinterpret_cast<float*>(tc_x_);
+    for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
+        const int64_t n = std::min<int64_t>(x_rows, T - t0);
+        f16_to_f32(X + t0 * K, xf, n * K, (cudaStream_t) stream_);
+        ck(cublasSgemm((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) n, (int) K, &alpha, wf, (int) K,
+                       xf, (int) K, &beta, Y + t0 * ldy, (int) ldy),
+           "cublasSgemm (FP16 operands, STRATA_DENSE_F32_RESIDENT)");
+    }
+    return true;
+}
 #else
 void gemm_set_dense_f32(int) {}
 #endif
@@ -942,7 +1039,7 @@ __global__ void f16_to_bf16_kernel(const __half* __restrict__ in, uint16_t* __re
     if (i < n) out[i] = (uint16_t) (__float_as_uint(__half2float(in[i])) >> 16);   // exact: the value was a BF16
 }
 void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
-                float beta, int64_t ldx, bool x_f16) {
+                float beta, int64_t ldx, bool x_f16, bool w_resident) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
     if (ldx <= K) ldx = 0;
@@ -1017,9 +1114,15 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
                 const int64_t nn = std::min<int64_t>(w_rows, N - n0);
                 if (path == 2) {
 #if defined(STRATA_EXPERIMENTAL_SM60)
-                    float* const wf = reinterpret_cast<float*>(tc_w_);
+                    // STRATA_DENSE_F32_RESIDENT: the whole weight's FP32 copy, made once (the same widening), read at
+                    // this tile's rows; the same tiles and slices, so the same Sgemm calls
+                    const float* const ws = w_resident && f32_resident_bf16()
+                        ? shadow_get(W, N * K, (cudaStream_t) stream_, [&](float* dst) { bf16_to_f32(W, dst, N * K, (cudaStream_t) stream_); })
+                        : nullptr;
                     float* const xf = reinterpret_cast<float*>(tc_x_);
-                    bf16_to_f32(W + n0 * K, wf, nn * K, (cudaStream_t) stream_);
+                    const float* wf = reinterpret_cast<float*>(tc_w_);
+                    if (ws != nullptr) wf = ws + n0 * K;
+                    else bf16_to_f32(W + n0 * K, reinterpret_cast<float*>(tc_w_), nn * K, (cudaStream_t) stream_);
                     for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
                         const int64_t n = std::min<int64_t>(x_rows, T - t0);
                         bf16_to_f32(X + t0 * K, xf, n * K, (cudaStream_t) stream_);
@@ -1097,7 +1200,7 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
 #endif
 #if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
     // Pascal, STRATA_DENSE_F32=1: cublasSgemm on FP32 copies (dense_f32_on above: where it is bitwise the FP16 call)
-    if (const int64_t min_t = beta == 0.0f ? dense_f32_min_t(N, K) : 0; min_t > 0 && T >= min_t && dense_f32_on()) {
+    if (const int64_t min_t = beta == 0.0f && !no_f32_ ? dense_f32_min_t(N, K) : 0; min_t > 0 && T >= min_t && dense_f32_on()) {
         const int64_t n_sl = (T * K + kXSliceElems - 1) / kXSliceElems;   // even slices of at most 64 MiB as fp32
         const int64_t x_rows = (T + n_sl - 1) / n_sl;
         // grow() frees a buffer an earlier GEMM on this stream may still read
@@ -1300,6 +1403,26 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     }
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
     if (beta == 0.0f && (ldx == 0 || ldx == K) && native_mmq(X, ggml_type, W_blocks, Y, T, N, K, ldy)) return;
+#endif
+#if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
+    // STRATA_DENSE_F32=1 + STRATA_DENSE_F32_RESIDENT=1: the shapes f16() would run as cublasSgemm on FP32 copies (the
+    // whole weight in the scratch: as below) read the weight's resident FP32 copy - the same dequantized FP16 values
+    // widened, made once - instead of dequantizing and widening it every chunk.  No copy (no room): the FP16 call.
+    if (beta == 0.0f && N * K <= scratch_elems_ && f32_resident_on()) {
+        if (const int64_t min_t = dense_f32_min_t(N, K); min_t > 0 && T >= min_t && dense_f32_on()) {
+            if (ldy <= 0) ldy = N;
+            const float* wf = shadow_get(W_blocks, N * K, (cudaStream_t) stream_, [&](float* dst) {
+                strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
+                f16_to_f32(scratch_, dst, N * K, (cudaStream_t) stream_);
+            });
+            if (wf != nullptr && sgemm_f32w(X, wf, Y, T, N, K, ldy, beta)) return;
+            strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
+            no_f32_ = true;
+            f16(X, scratch_, Y, T, N, K, ldy, beta);
+            no_f32_ = false;
+            return;
+        }
+    }
 #endif
     if (N * K > scratch_elems_) {
         // Too large for the scratch at once: in row slices.
