@@ -10,6 +10,7 @@
 // Only the loads' placement, the staging and the thread-to-work mapping change.  qsadec_bench memcmps every output.
 #include "strata/kernels/qsadec_proto.hpp"
 #include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/qsa_select.hpp"
 #include "strata/core/geometry.hpp"
 
 #include <cuda_fp16.h>
@@ -19,6 +20,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
+#include <thread>
 
 namespace strata::kernels {
 
@@ -36,6 +39,27 @@ int qsadec_proto_mode() {
         return m;
     }();
     return m;
+}
+
+int qsasel_mode() {
+    static const int m = [] {
+        const char* v = std::getenv("STRATA_QSASEL");
+        if (v == nullptr || *v == '\0') return 0;
+        const int x = std::atoi(v);
+        const int m = x >= 0 && x <= 3 ? x : 0;
+        if (m != 0)
+            std::fprintf(stderr, "strata qsasel: STRATA_QSASEL=%d: the decode window's long select in 2 kernels a QSA layer "
+                                 "(the proto scorer + passes 1-3, count and emit in one kernel%s; the same scores and ids; "
+                                 "with STRATA_QSADEC_PROTO=1/2 and STRATA_SELECT_LONG=1, 1-4 rows)\n", m,
+                         m == 1 ? ", keys in registers" : m == 2 ? "" : ", two barriers");
+        return m;
+    }();
+    return m;
+}
+
+int qsasel_variant() {
+    static const int v[4] = {0, 33, 30, 40};
+    return v[qsasel_mode()];
 }
 
 #if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
@@ -555,6 +579,594 @@ __global__ void __launch_bounds__(MT_T) p_emit_kernel(const float* __restrict__ 
     }
 }
 
+// ---------------------------------------------------------------- QSASEL: passes 1-3, count and emit in ONE kernel
+// The same grid as the five kernels above ((topk_ctas, nq) x MT_T, the same MtQuery split), the same per-CTA code in
+// the same order, with a barrier among the gridDim.x CTAs of a query where a kernel boundary was: the radix digits and
+// the cells above them come from the same integer histograms (an atomic sum has no order), every CTA picks them from
+// those histograms itself (the five kernels read CTA 0's copy of the same values), and the per-warp counts and the emit
+// are p_count / p_emit's.  The barrier counters live in the scratch's 64 spare ints (nothing else writes them): [0]
+// arrivals, [1] exits; the last CTA out of a query zeroes both for the next call.  The grid is at most 32 x 4 CTAs of
+// 256 threads, a fraction of one die, so every CTA of a query is resident while the others wait.
+constexpr int QS_BAR = MT_Q_INTS - 64;
+
+__device__ __forceinline__ void qs_bar(int* cnt, int target) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        atomicAdd(cnt, 1);
+        while (*(volatile int*) cnt < target) {
+        }
+        __threadfence();
+    }
+    __syncthreads();
+}
+
+__global__ void __launch_bounds__(MT_T) qs_topk_kernel(const float* __restrict__ scores, const int32_t* __restrict__ steps,
+                                                       int64_t max_blocks, int64_t cap, int32_t* __restrict__ ids,
+                                                       int32_t* __restrict__ scratch) {
+    __shared__ int h[MT_W][256];
+    __shared__ int s_w[MT_W], s_ex[256], s_i;
+    __shared__ unsigned long long s_w64[MT_W];
+    const MtQuery m = mt_query(steps);
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    int32_t* out = ids + (int64_t) blockIdx.y * cap;
+    int32_t* qs = scratch + (int64_t) blockIdx.y * MT_Q_INTS;
+    if (m.all) {   // query-uniform: no CTA of this query reaches a barrier
+        if (blockIdx.x == 0) qs[t] = 0;   // the scorer's pass-0 row, as p_hist_kernel<2, true> zeroes it
+        for (int64_t j = (int64_t) blockIdx.x * MT_T + t; j < m.n_kv; j += (int64_t) gridDim.x * MT_T) out[j] = (int32_t) j;
+        return;
+    }
+    int* bar = qs + QS_BAR;
+    const int G = (int) gridDim.x;
+    const float* sc = scores + (int64_t) blockIdx.y * max_blocks;
+    uint32_t key[MT_U];
+    uint32_t prefix = 0;
+    int above = 0;
+    // ---- passes 1..3 (p_hist_kernel<PASS, true>)
+#pragma unroll 1
+    for (int pass = 1; pass <= 3; ++pass) {
+        mt_load(m, sc, 0, key);
+        for (int i = t; i < MT_W * 256; i += MT_T) (&h[0][0])[i] = 0;
+        // pass 1: the scorer's pass-0 row (row 0); pass p > 1: pass p - 1's row of MT_ACC (summed by atomics, read past
+        // the barrier from L2)
+        const int v = pass == 1 ? __ldcg(qs + 255 - t) : __ldcg(qs + MT_ACC + (pass - 2) * 256 + 255 - t);
+        mt_choose(v, m.width, 32 - 8 * pass, prefix, above, s_w, s_ex, &s_i);
+        if (pass == 2 && blockIdx.x == 0) qs[t] = 0;   // row 0's only readers (pass 1, every CTA) are past barrier 1
+        __syncthreads();
+        const int shift = 24 - 8 * pass;
+        const uint32_t hmask = 0xffffffffu << (shift + 8);
+#pragma unroll 1
+        for (int j0 = 0; j0 < m.rpw; j0 += MT_U) {
+            if (j0 > 0) mt_load(m, sc, j0, key);
+#pragma unroll
+            for (int u = 0; u < MT_U; ++u) {
+                if (j0 + u >= m.rpw) break;
+                const int64_t b = m.row0 + 32 * (j0 + u) + lane;
+                const int bin = (b < m.hi && (key[u] & hmask) == prefix) ? (int) ((key[u] >> shift) & 255) : -1;
+                const unsigned pend = __ballot_sync(0xffffffffu, bin >= 0);
+                if (pend) {
+                    const int leader = __ffs(pend) - 1;
+                    const int lb = __shfl_sync(0xffffffffu, bin, leader);
+                    const unsigned same = __ballot_sync(0xffffffffu, bin == lb);
+                    if (lane == leader) atomicAdd(&h[warp][lb], __popc(same) * R);
+                    else if (bin >= 0 && bin != lb) atomicAdd(&h[warp][bin], R);
+                }
+                if (bin >= 0 && b == m.n_bid) atomicAdd(&h[warp][bin], m.wtail - R);
+            }
+        }
+        __syncthreads();
+        int sum = 0;
+#pragma unroll
+        for (int w = 0; w < MT_W; ++w) sum += h[w][t];
+        if (sum != 0) atomicAdd(&qs[MT_ACC + (pass - 1) * 256 + t], sum);
+        qs_bar(bar, G * pass);
+    }
+    // ---- count (p_count_kernel)
+    mt_load(m, sc, 0, key);
+    mt_choose(__ldcg(qs + MT_ACC + 2 * 256 + 255 - t), m.width, 0, prefix, above, s_w, s_ex, &s_i);
+    const uint32_t thr = prefix;
+    {
+        int gt = 0, eq = 0;
+#pragma unroll 1
+        for (int j0 = 0; j0 < m.rpw; j0 += MT_U) {
+            if (j0 > 0) mt_load(m, sc, j0, key);
+#pragma unroll
+            for (int u = 0; u < MT_U; ++u) {
+                const int64_t b = m.row0 + 32 * (j0 + u) + lane;
+                if (j0 + u >= m.rpw || b >= m.hi) continue;
+                const int w = b == m.n_bid ? m.wtail : R;
+                if (key[u] > thr) gt += w;
+                else if (key[u] == thr) eq += w;
+            }
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            gt += __shfl_xor_sync(0xffffffffu, gt, o);
+            eq += __shfl_xor_sync(0xffffffffu, eq, o);
+        }
+        if (lane == 0) {
+            qs[MT_CNT + 2 * (blockIdx.x * MT_W + warp)] = gt;
+            qs[MT_CNT + 2 * (blockIdx.x * MT_W + warp) + 1] = eq;
+        }
+    }
+    qs_bar(bar, G * 4);
+    // ---- emit (p_emit_kernel)
+    mt_load(m, sc, 0, key);
+    const int eq_budget = (int) (m.width - above);
+    unsigned long long c = 0;
+    if (t < (int) blockIdx.x * MT_W)
+        c = (unsigned long long) (unsigned) __ldcg(qs + MT_CNT + 2 * t) |
+            ((unsigned long long) (unsigned) __ldcg(qs + MT_CNT + 2 * t + 1) << 32);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o);
+    if (lane == 0) s_w64[warp] = c;
+    __syncthreads();
+    unsigned long long before = 0;
+    for (int w = 0; w < MT_W; ++w) before += s_w64[w];
+    for (int w = 0; w < warp; ++w) {
+        const int i = (int) blockIdx.x * MT_W + w;
+        before += (unsigned long long) (unsigned) __ldcg(qs + MT_CNT + 2 * i) |
+                  ((unsigned long long) (unsigned) __ldcg(qs + MT_CNT + 2 * i + 1) << 32);
+    }
+    const int gt_before = (int) (before & 0xffffffffu), eq_before = (int) (before >> 32);
+    int run_sel = gt_before + (eq_before < eq_budget ? eq_before : eq_budget), run_eq = eq_before;
+#pragma unroll 1
+    for (int j0 = 0; j0 < m.rpw; j0 += MT_U) {
+        if (j0 > 0) mt_load(m, sc, j0, key);
+#pragma unroll
+        for (int u = 0; u < MT_U; ++u) {
+            if (j0 + u >= m.rpw) break;
+            const int64_t b = m.row0 + 32 * (j0 + u) + lane;
+            const int w = b < m.hi ? (b == m.n_bid ? m.wtail : R) : 0;
+            const uint32_t k = key[u];
+            const int my_gt = (w && k > thr) ? w : 0, my_eq = (w && k == thr) ? w : 0;
+            if (__ballot_sync(0xffffffffu, (my_gt | my_eq) != 0) == 0u) continue;
+            int pe = my_eq;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int y = __shfl_up_sync(0xffffffffu, pe, o);
+                if (lane >= o) pe += y;
+            }
+            const int left = eq_budget - (run_eq + pe - my_eq);
+            const int take = left < 0 ? 0 : (left > my_eq ? my_eq : left);
+            const int my_sel = my_gt + take;
+            int ps = my_sel;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int y = __shfl_up_sync(0xffffffffu, ps, o);
+                if (lane >= o) ps += y;
+            }
+            int32_t* dst = out + run_sel + ps - my_sel;
+            for (int cc = 0; cc < my_sel; ++cc) dst[cc] = (int32_t) (b * R + cc);
+            run_eq += __shfl_sync(0xffffffffu, pe, 31);
+            run_sel += __shfl_sync(0xffffffffu, ps, 31);
+        }
+    }
+    // the last CTA out (every CTA is past barrier 4, nobody reads the counters again) zeroes them for the next call
+    if (t == 0 && atomicAdd(bar + 1, 1) == G - 1) {
+        bar[0] = 0;
+        bar[1] = 0;
+    }
+}
+
+// qs_topk_kernel with the first KR rows of every warp read ONCE into registers (row j = block m.row0 + 32 j + lane, 0
+// past m.hi, as mt_load reads them) and kept for passes 2-3, the count and the emit; rows past KR are read again on
+// every pass, as qs_topk_kernel reads them.  Every pass visits the rows in the same order with the same arithmetic.
+// MINB: CTAs per SM the registers are bounded for (the grid must stay resident: a query's CTAs wait for each other).
+#define QR_ROWS(KRN, ...)                                                                                   \
+    {                                                                                                       \
+        _Pragma("unroll") for (int j = 0; j < KRN; ++j) {                                                   \
+            if (j >= m.rpw) break;                                                                          \
+            const int64_t b = m.row0 + 32 * j + lane;                                                       \
+            const uint32_t key = kr[j];                                                                     \
+            __VA_ARGS__                                                                                     \
+        }                                                                                                   \
+        for (int j = KRN; j < m.rpw; ++j) {                                                                 \
+            const int64_t b = m.row0 + 32 * j + lane;                                                       \
+            const uint32_t key = b < m.hi ? order_key(__ldg(sc + b)) : 0u;                                  \
+            __VA_ARGS__                                                                                     \
+        }                                                                                                   \
+    }
+template <int KR, int MINB>
+__global__ void __launch_bounds__(MT_T, MINB) qs_topk_reg_kernel(const float* __restrict__ scores,
+                                                                 const int32_t* __restrict__ steps, int64_t max_blocks,
+                                                                 int64_t cap, int32_t* __restrict__ ids,
+                                                                 int32_t* __restrict__ scratch) {
+    __shared__ int h[MT_W][256];
+    __shared__ int s_w[MT_W], s_ex[256], s_i;
+    __shared__ unsigned long long s_w64[MT_W];
+    const MtQuery m = mt_query(steps);
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    int32_t* out = ids + (int64_t) blockIdx.y * cap;
+    int32_t* qs = scratch + (int64_t) blockIdx.y * MT_Q_INTS;
+    if (m.all) {
+        if (blockIdx.x == 0) qs[t] = 0;
+        for (int64_t j = (int64_t) blockIdx.x * MT_T + t; j < m.n_kv; j += (int64_t) gridDim.x * MT_T) out[j] = (int32_t) j;
+        return;
+    }
+    int* bar = qs + QS_BAR;
+    const int G = (int) gridDim.x;
+    const float* sc = scores + (int64_t) blockIdx.y * max_blocks;
+    uint32_t kr[KR];
+#pragma unroll
+    for (int j = 0; j < KR; ++j) {
+        const int64_t b = m.row0 + 32 * j + lane;
+        kr[j] = (j < m.rpw && b < m.hi) ? order_key(__ldg(sc + b)) : 0u;
+    }
+    uint32_t prefix = 0;
+    int above = 0;
+#pragma unroll 1
+    for (int pass = 1; pass <= 3; ++pass) {
+        for (int i = t; i < MT_W * 256; i += MT_T) (&h[0][0])[i] = 0;
+        const int v = pass == 1 ? __ldcg(qs + 255 - t) : __ldcg(qs + MT_ACC + (pass - 2) * 256 + 255 - t);
+        mt_choose(v, m.width, 32 - 8 * pass, prefix, above, s_w, s_ex, &s_i);
+        if (pass == 2 && blockIdx.x == 0) qs[t] = 0;
+        __syncthreads();
+        const int shift = 24 - 8 * pass;
+        const uint32_t hmask = 0xffffffffu << (shift + 8);
+        QR_ROWS(KR, {
+            const int bin = (b < m.hi && (key & hmask) == prefix) ? (int) ((key >> shift) & 255) : -1;
+            const unsigned pend = __ballot_sync(0xffffffffu, bin >= 0);
+            if (pend) {
+                const int leader = __ffs(pend) - 1;
+                const int lb = __shfl_sync(0xffffffffu, bin, leader);
+                const unsigned same = __ballot_sync(0xffffffffu, bin == lb);
+                if (lane == leader) atomicAdd(&h[warp][lb], __popc(same) * R);
+                else if (bin >= 0 && bin != lb) atomicAdd(&h[warp][bin], R);
+            }
+            if (bin >= 0 && b == m.n_bid) atomicAdd(&h[warp][bin], m.wtail - R);
+        })
+        __syncthreads();
+        int sum = 0;
+#pragma unroll
+        for (int w = 0; w < MT_W; ++w) sum += h[w][t];
+        if (sum != 0) atomicAdd(&qs[MT_ACC + (pass - 1) * 256 + t], sum);
+        qs_bar(bar, G * pass);
+    }
+    mt_choose(__ldcg(qs + MT_ACC + 2 * 256 + 255 - t), m.width, 0, prefix, above, s_w, s_ex, &s_i);
+    const uint32_t thr = prefix;
+    {
+        int gt = 0, eq = 0;
+        QR_ROWS(KR, {
+            if (b < m.hi) {
+                const int w = b == m.n_bid ? m.wtail : R;
+                if (key > thr) gt += w;
+                else if (key == thr) eq += w;
+            }
+        })
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            gt += __shfl_xor_sync(0xffffffffu, gt, o);
+            eq += __shfl_xor_sync(0xffffffffu, eq, o);
+        }
+        if (lane == 0) {
+            qs[MT_CNT + 2 * (blockIdx.x * MT_W + warp)] = gt;
+            qs[MT_CNT + 2 * (blockIdx.x * MT_W + warp) + 1] = eq;
+        }
+    }
+    qs_bar(bar, G * 4);
+    const int eq_budget = (int) (m.width - above);
+    unsigned long long c = 0;
+    if (t < (int) blockIdx.x * MT_W)
+        c = (unsigned long long) (unsigned) __ldcg(qs + MT_CNT + 2 * t) |
+            ((unsigned long long) (unsigned) __ldcg(qs + MT_CNT + 2 * t + 1) << 32);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o);
+    if (lane == 0) s_w64[warp] = c;
+    __syncthreads();
+    unsigned long long before = 0;
+    for (int w = 0; w < MT_W; ++w) before += s_w64[w];
+    for (int w = 0; w < warp; ++w) {
+        const int i = (int) blockIdx.x * MT_W + w;
+        before += (unsigned long long) (unsigned) __ldcg(qs + MT_CNT + 2 * i) |
+                  ((unsigned long long) (unsigned) __ldcg(qs + MT_CNT + 2 * i + 1) << 32);
+    }
+    const int gt_before = (int) (before & 0xffffffffu), eq_before = (int) (before >> 32);
+    int run_sel = gt_before + (eq_before < eq_budget ? eq_before : eq_budget), run_eq = eq_before;
+    QR_ROWS(KR, {
+        const int w = b < m.hi ? (b == m.n_bid ? m.wtail : R) : 0;
+        const uint32_t k = key;
+        const int my_gt = (w && k > thr) ? w : 0, my_eq = (w && k == thr) ? w : 0;
+        if (__ballot_sync(0xffffffffu, (my_gt | my_eq) != 0) != 0u) {
+            int pe = my_eq;
+            _Pragma("unroll")
+            for (int o = 1; o < 32; o <<= 1) {
+                const int y = __shfl_up_sync(0xffffffffu, pe, o);
+                if (lane >= o) pe += y;
+            }
+            const int left = eq_budget - (run_eq + pe - my_eq);
+            const int take = left < 0 ? 0 : (left > my_eq ? my_eq : left);
+            const int my_sel = my_gt + take;
+            int ps = my_sel;
+            _Pragma("unroll")
+            for (int o = 1; o < 32; o <<= 1) {
+                const int y = __shfl_up_sync(0xffffffffu, ps, o);
+                if (lane >= o) ps += y;
+            }
+            int32_t* dst = out + run_sel + ps - my_sel;
+            for (int cc = 0; cc < my_sel; ++cc) dst[cc] = (int32_t) (b * R + cc);
+            run_eq += __shfl_sync(0xffffffffu, pe, 31);
+            run_sel += __shfl_sync(0xffffffffu, ps, 31);
+        }
+    })
+    if (t == 0 && atomicAdd(bar + 1, 1) == G - 1) {
+        bar[0] = 0;
+        bar[1] = 0;
+    }
+}
+#undef QR_ROWS
+
+
+// ---------------------------------------------------------------- QSASEL v2: the top-k with two barriers
+// The ids are a function of the scores alone: thr = the key of the width-th cell from the top (cells weighted R, the
+// tail block wtail), above = the cells with a key > thr, every cell above thr plus the first width - above cells AT thr
+// in ascending order, emitted ascending.  Any exact way to find thr and the per-warp counts gives the same ids; this
+// kernel finds them with fewer barriers than the 8-bit radix passes:
+//   P1  every CTA picks the top digit (8 bits) from the scorer's pass-0 row (mt_choose, as pass 1), histograms the next
+//       12 bits (bits 23..12) of its cells in that bin (shared, 16-bit pairs) and adds them to the query's 4096-bin row
+//       in scratch; barrier S1.
+//   P2  every CTA picks the 12-bit digit from that row (the same rule: the first bin from the top where the count
+//       reaches width - above), so the top 20 bits of thr are known; it counts per warp the cells whose top 20 bits are
+//       above them (all of them are above thr) and appends its cells WITH those 20 bits (the candidates: key, block) to
+//       the query's list; barrier S2.
+//   P3  every CTA reads the candidate list (at most QC_MAX) and finds thr among them with two 6-bit passes in shared
+//       memory, then the per-warp cells above / at thr of every warp of the query (the 20-bit counts + the candidates'),
+//       and emits as p_emit_kernel does.  No third barrier.
+//   More candidates than QC_MAX (heavy ties): the remaining 12 bits by an 8-bit and a 4-bit radix pass over the CTA's
+//   cells (MT_ACC rows 0-1, zeroed by the scorer), p_count's per-warp counts and the emit - three more barriers.
+// Scratch per query: [0, 256) the scorer's pass-0 row (CTA 0 zeroes it past S1); [256, 4352) the 4096-bin row;
+// [4352, 4352 + 2 QC_MAX) the candidates; MT_ACC rows 0-1 (fallback); MT_STATE + 0 the candidate count; MT_CNT the
+// per-warp counts; QS_BAR the barrier.  The last CTA out zeroes the 4096-bin row and the count for the next call.
+constexpr int QC_H = 256, QC_LIST = QC_H + 4096, QC_MAX = 1024, QC_KR = 8;
+static_assert(QC_LIST + 2 * QC_MAX <= MT_ACC, "QSASEL v2 scratch layout");
+
+// the 4096-bin choice: bins descending over the CTA's 256 threads (thread t: bins 4095 - 16 t down to 4080 - 16 t);
+// the first bin from the top where the count reaches need = width - above (as mt_choose); `row` in L2
+__device__ __forceinline__ void qc_choose4096(const int* __restrict__ row, int64_t width, int& digit, int& above,
+                                              int* s_w, int* s_res) {
+    const int t = threadIdx.x;
+    int loc[16], s = 0;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        loc[i] = __ldcg(row + 4095 - 16 * t - i);
+        s += loc[i];
+    }
+    if (t == 0) { s_res[0] = 0; s_res[1] = 0; s_res[2] = 0; }
+    const int incl = mt_incl_scan(s, s_w);   // syncs inside
+    const int64_t need = width - above;
+    if (incl >= need && incl - s < need) {
+        int cum = incl - s, d = 0, add = 0;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            if (cum + loc[i] >= need) { d = 4095 - 16 * t - i; add = cum; break; }
+            cum += loc[i];
+        }
+        s_res[0] = 1; s_res[1] = d; s_res[2] = add;
+    }
+    if (t == MT_T - 1) s_res[3] = incl - loc[15];   // not reached anywhere: bin 0, every other bin above
+    __syncthreads();
+    if (s_res[0]) { digit = s_res[1]; above += s_res[2]; }
+    else { digit = 0; above += s_res[3]; }
+    __syncthreads();
+}
+
+__global__ void __launch_bounds__(MT_T, 4) qs_topk2_kernel(const float* __restrict__ scores, const int32_t* __restrict__ steps,
+                                                        int64_t max_blocks, int64_t cap, int32_t* __restrict__ ids,
+                                                        int32_t* __restrict__ scratch) {
+    __shared__ __align__(16) int u[2 * QC_MAX];   // P1: 4096 16-bit pairs (2048 ints); P3: candidates (key, block)
+    __shared__ int c_gt[MT_NMAX * MT_W], c_eq[MT_NMAX * MT_W];
+    __shared__ int h64[64];
+    __shared__ int s_w[MT_W], s_ex[256], s_i, s_res[4];
+    __shared__ unsigned long long s_w64[MT_W];
+    const MtQuery m = mt_query(steps);
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int G = (int) gridDim.x, gw0 = (int) blockIdx.x * MT_W;
+    int32_t* out = ids + (int64_t) blockIdx.y * cap;
+    int32_t* qs = scratch + (int64_t) blockIdx.y * MT_Q_INTS;
+    if (m.all) {
+        if (blockIdx.x == 0) qs[t] = 0;
+        for (int64_t j = (int64_t) blockIdx.x * MT_T + t; j < m.n_kv; j += (int64_t) gridDim.x * MT_T) out[j] = (int32_t) j;
+        return;
+    }
+    int* bar = qs + QS_BAR;
+    const float* sc = scores + (int64_t) blockIdx.y * max_blocks;
+    uint32_t kr[QC_KR];
+#pragma unroll
+    for (int j = 0; j < QC_KR; ++j) {
+        const int64_t b = m.row0 + 32 * j + lane;
+        kr[j] = (j < m.rpw && b < m.hi) ? order_key(__ldg(sc + b)) : 0u;
+    }
+    // every row of the warp in order: rows < QC_KR from registers, the rest read again (0 past m.hi, as mt_load)
+#define QC_ROWS(...)                                                                                        \
+    {                                                                                                       \
+        _Pragma("unroll") for (int j = 0; j < QC_KR; ++j) {                                                 \
+            if (j >= m.rpw) break;                                                                          \
+            const int64_t b = m.row0 + 32 * j + lane;                                                       \
+            const uint32_t key = kr[j];                                                                     \
+            __VA_ARGS__                                                                                     \
+        }                                                                                                   \
+        for (int j = QC_KR; j < m.rpw; ++j) {                                                               \
+            const int64_t b = m.row0 + 32 * j + lane;                                                       \
+            const uint32_t key = b < m.hi ? order_key(__ldg(sc + b)) : 0u;                                  \
+            __VA_ARGS__                                                                                     \
+        }                                                                                                   \
+    }
+    // ---- P1: the top digit, then bits 23..12 of the cells in its bin
+    for (int i = t; i < 2048; i += MT_T) u[i] = 0;
+    uint32_t prefix = 0;
+    int above = 0;
+    mt_choose(__ldcg(qs + 255 - t), m.width, 24, prefix, above, s_w, s_ex, &s_i);   // syncs inside
+    QC_ROWS({
+        if (b < m.hi && (key >> 24) == (prefix >> 24)) {
+            const int bin = (int) ((key >> 12) & 4095), w = b == m.n_bid ? m.wtail : R;
+            if (w) atomicAdd(&u[bin >> 1], w << (16 * (bin & 1)));
+        }
+    })
+    __syncthreads();
+    for (int i = t; i < 2048; i += MT_T) {
+        const int v = u[i], lo = v & 0xffff, hi = (int) ((unsigned) v >> 16);
+        if (lo) atomicAdd(qs + QC_H + 2 * i, lo);
+        if (hi) atomicAdd(qs + QC_H + 2 * i + 1, hi);
+    }
+    qs_bar(bar, G);
+    if (blockIdx.x == 0) qs[t] = 0;   // the pass-0 row: every CTA read it before S1
+    // ---- P2: the 12-bit digit; cells above the 20-bit prefix per warp; the candidates
+    int d12 = 0;
+    qc_choose4096(qs + QC_H, m.width, d12, above, s_w, s_res);
+    prefix |= (uint32_t) d12 << 12;
+    const uint32_t p20 = prefix >> 12;
+    {
+        int gt = 0;
+        QC_ROWS({
+            const bool in = b < m.hi;
+            const int w = in ? (b == m.n_bid ? m.wtail : R) : 0;
+            if (in && (key >> 12) > p20) gt += w;
+            const bool cand = in && w && (key >> 12) == p20;
+            const unsigned bal = __ballot_sync(0xffffffffu, cand);
+            if (bal) {
+                int base = 0;
+                if (lane == __ffs(bal) - 1) base = atomicAdd(qs + MT_STATE, __popc(bal));
+                base = __shfl_sync(0xffffffffu, base, __ffs(bal) - 1);
+                const int pos = base + __popc(bal & ((1u << lane) - 1u));
+                if (cand && pos < QC_MAX) {
+                    qs[QC_LIST + 2 * pos] = (int) key;
+                    qs[QC_LIST + 2 * pos + 1] = (int) b;
+                }
+            }
+        })
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) gt += __shfl_xor_sync(0xffffffffu, gt, o);
+        if (lane == 0) qs[MT_CNT + 2 * (gw0 + warp)] = gt;
+    }
+    qs_bar(bar, 2 * G);
+    const int n_c = __ldcg(qs + MT_STATE);
+    uint32_t thr;
+    int nbar = 2;
+    if (n_c <= QC_MAX) {
+        // ---- P3: thr among the candidates (two 6-bit passes), the per-warp counts of the whole query
+        for (int i = t; i < 2 * n_c; i += MT_T) u[i] = __ldcg(qs + QC_LIST + i);
+        for (int i = t; i < G * MT_W; i += MT_T) { c_gt[i] = __ldcg(qs + MT_CNT + 2 * i); c_eq[i] = 0; }
+#pragma unroll 1
+        for (int sh6 = 6; sh6 >= 0; sh6 -= 6) {
+            if (t < 64) h64[t] = 0;
+            __syncthreads();
+            const uint32_t pm = 0xffffffffu << (sh6 + 6);
+            for (int i = t; i < n_c; i += MT_T) {
+                const uint32_t k = (uint32_t) u[2 * i];
+                const int64_t b = u[2 * i + 1];
+                if ((k & pm) == (prefix & pm)) atomicAdd(&h64[(k >> sh6) & 63], b == m.n_bid ? m.wtail : R);
+            }
+            __syncthreads();
+            // mt_choose over 64 bins: bin 63 - t for t < 64, nothing above
+            // mt_choose picks thread i (bin 63 - i) and returns 255 - i: the 64-bin digit is (255 - i) - 192
+            uint32_t d8 = 0;
+            mt_choose(t < 64 ? h64[63 - t] : 0, m.width, 0, d8, above, s_w, s_ex, &s_i);
+            prefix |= (d8 >= 192u ? d8 - 192u : 0u) << sh6;
+        }
+        thr = prefix;
+        __syncthreads();
+        for (int i = t; i < n_c; i += MT_T) {
+            const uint32_t k = (uint32_t) u[2 * i];
+            const int64_t b = u[2 * i + 1];
+            if (k < thr) continue;
+            const int64_t per = (m.n_bid + (m.wtail > 0 ? 1 : 0) + G - 1) / G;
+            const int x = (int) (b / per);
+            const int64_t lo = (int64_t) x * per;
+            const int64_t nbe = m.n_bid + (m.wtail > 0 ? 1 : 0);
+            const int64_t hi = lo + per < nbe ? lo + per : nbe;
+            const int rpw = (int) (((hi - lo + 31) / 32 + MT_W - 1) / MT_W);
+            const int gw = x * MT_W + (int) ((b - lo) / (32 * (int64_t) rpw));
+            const int w = b == m.n_bid ? m.wtail : R;
+            if (k > thr) atomicAdd(&c_gt[gw], w);
+            else atomicAdd(&c_eq[gw], w);
+        }
+        __syncthreads();
+    } else {
+        // ---- fallback: bits 11..4 then 3..0 by radix passes over the CTA's cells, p_count's counts
+#pragma unroll 1
+        for (int pass = 0; pass < 2; ++pass) {
+            const int shift = pass == 0 ? 4 : 0, nb = pass == 0 ? 256 : 16;
+            const uint32_t pm = 0xffffffffu << (shift + (pass == 0 ? 8 : 4));
+            for (int i = t; i < 2048; i += MT_T) u[i] = 0;
+            __syncthreads();
+            QC_ROWS({
+                if (b < m.hi && (key & pm) == (prefix & pm)) {
+                    const int w = b == m.n_bid ? m.wtail : R;
+                    if (w) atomicAdd(&u[(key >> shift) & (nb - 1)], w);
+                }
+            })
+            __syncthreads();
+            if (t < nb && u[t]) atomicAdd(qs + MT_ACC + pass * 256 + t, u[t]);
+            qs_bar(bar, (++nbar) * G);
+            const int v = __ldcg(qs + MT_ACC + pass * 256 + 255 - t);   // bins >= nb are 0 (zeroed by the scorer)
+            mt_choose(v, m.width, shift, prefix, above, s_w, s_ex, &s_i);
+        }
+        thr = prefix;
+        int gt = 0, eq = 0;
+        QC_ROWS({
+            if (b < m.hi) {
+                const int w = b == m.n_bid ? m.wtail : R;
+                if (key > thr) gt += w;
+                else if (key == thr) eq += w;
+            }
+        })
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            gt += __shfl_xor_sync(0xffffffffu, gt, o);
+            eq += __shfl_xor_sync(0xffffffffu, eq, o);
+        }
+        if (lane == 0) {
+            qs[MT_CNT + 2 * (gw0 + warp)] = gt;
+            qs[MT_CNT + 2 * (gw0 + warp) + 1] = eq;
+        }
+        qs_bar(bar, (++nbar) * G);
+        for (int i = t; i < G * MT_W; i += MT_T) { c_gt[i] = __ldcg(qs + MT_CNT + 2 * i); c_eq[i] = __ldcg(qs + MT_CNT + 2 * i + 1); }
+        __syncthreads();
+    }
+    // ---- emit (p_emit_kernel, the counts from c_gt / c_eq)
+    const int eq_budget = (int) (m.width - above);
+    int gt_before = 0, eq_before = 0;
+    for (int i = 0; i < gw0 + warp; ++i) { gt_before += c_gt[i]; eq_before += c_eq[i]; }
+    int run_sel = gt_before + (eq_before < eq_budget ? eq_before : eq_budget), run_eq = eq_before;
+    QC_ROWS({
+        const int w = b < m.hi ? (b == m.n_bid ? m.wtail : R) : 0;
+        const uint32_t k = key;
+        const int my_gt = (w && k > thr) ? w : 0, my_eq = (w && k == thr) ? w : 0;
+        if (__ballot_sync(0xffffffffu, (my_gt | my_eq) != 0) != 0u) {
+            int pe = my_eq;
+            _Pragma("unroll")
+            for (int o = 1; o < 32; o <<= 1) {
+                const int y = __shfl_up_sync(0xffffffffu, pe, o);
+                if (lane >= o) pe += y;
+            }
+            const int left = eq_budget - (run_eq + pe - my_eq);
+            const int take = left < 0 ? 0 : (left > my_eq ? my_eq : left);
+            const int my_sel = my_gt + take;
+            int ps = my_sel;
+            _Pragma("unroll")
+            for (int o = 1; o < 32; o <<= 1) {
+                const int y = __shfl_up_sync(0xffffffffu, ps, o);
+                if (lane >= o) ps += y;
+            }
+            int32_t* dst = out + run_sel + ps - my_sel;
+            for (int cc = 0; cc < my_sel; ++cc) dst[cc] = (int32_t) (b * R + cc);
+            run_eq += __shfl_sync(0xffffffffu, pe, 31);
+            run_sel += __shfl_sync(0xffffffffu, ps, 31);
+        }
+    })
+#undef QC_ROWS
+    (void) s_w64;
+    // the last CTA out: every CTA is past its last barrier and its last read of the 4096-bin row and the count
+    __shared__ int s_last;
+    __syncthreads();
+    if (t == 0) s_last = atomicAdd(bar + 1, 1) == G - 1;
+    __syncthreads();
+    if (s_last) {
+        for (int i = t; i < 4096; i += MT_T) qs[QC_H + i] = 0;
+        if (t == 0) { qs[MT_STATE] = 0; bar[0] = 0; bar[1] = 0; }
+    }
+}
+
 int sm_count() {
     static int sms[64] = {};
     int dev = 0;
@@ -672,8 +1284,10 @@ __global__ void __launch_bounds__(DX_T * SPLIT) dxs_kernel(const float* __restri
     if (blockIdx.x > 0 && (int64_t) blockIdx.x * DX_NB >= top) return;   // CTA-uniform; CTA 0 has the fused extras
     for (int i = t; i < NQ * IDX_HEADS * IDX_DIM / 4; i += NT)
         reinterpret_cast<float4*>(Qs)[i] = reinterpret_cast<const float4*>(q_idx)[i];
-    if (FUSE && blockIdx.x == 0)
+    if (FUSE && blockIdx.x == 0) {
         for (int i = t; i < NQ * 3 * 256; i += NT) scratch[(int64_t) (i / 768) * MT_Q_INTS + MT_ACC + i % 768] = 0;
+        if (t < NQ) { scratch[(int64_t) t * MT_Q_INTS + QS_BAR] = 0; scratch[(int64_t) t * MT_Q_INTS + QS_BAR + 1] = 0; }   // QSASEL barrier
+    }
     const float* krow = Ks + lane * DX_KS;
     constexpr int PF = DX_NB * (IDX_DIM / 4) / NT;
     float4 pre[PF];
@@ -794,6 +1408,154 @@ __global__ void __launch_bounds__(DX_T * SPLIT) dxs_kernel(const float* __restri
             if (hi != 0) atomicAdd(row + 1, hi);
         }
     }
+}
+
+// QSASEL scorer (qsc): dxs_kernel<NQ, 4, true> with the warp's query leaves in registers instead of shared memory.
+// Warp w = (head w & 3, octet w >> 2) needs the float4 leaves L = dx_lane(8c + jj), jj 0..7, of its head's query rows:
+// 8 x NQ float4, loaded once per CTA.  Every product, the octet tree, the head sum, the relu sum, the tail and the
+// fused pass-0 histogram are dxs_kernel's (SPLIT 4) code; only where the query operand comes from changes.
+template <int NQ>
+__global__ void __launch_bounds__(DX_T * 4) qsc_kernel(const float* __restrict__ pooled, const float* __restrict__ dead,
+                                                      const float* __restrict__ q_idx, const int32_t* __restrict__ steps,
+                                                      int64_t max_blocks, float* __restrict__ out,
+                                                      int32_t* __restrict__ scratch) {
+    constexpr int SPLIT = 4, NT = DX_T * SPLIT, NW = NT / 32;
+    extern __shared__ __align__(16) float dx_smem[];
+    float* Ks = dx_smem;                                     // [DX_NB][DX_KS]
+    float* Ds = Ks + DX_NB * DX_KS;                          // [NQ][IDX_HEADS][SPLIT][DX_NB]
+    int* sh = reinterpret_cast<int*>(Ds + NQ * IDX_HEADS * SPLIT * DX_NB);   // [NQ][128] 16-bit pairs (dxs)
+    __shared__ int64_t s_nbid[NQ], s_nkv[NQ];
+    const int t = threadIdx.x, lane = t & 31, w = t >> 5, h = w & 3, part = w >> 2;
+    if (t < NQ) {
+        s_nbid[t] = steps[t * kStepCount + kStepNBid];
+        s_nkv[t] = steps[t * kStepCount + kStepNKv];
+    }
+    for (int i = t; i < NQ * 128; i += NT) sh[i] = 0;
+    __syncthreads();
+    int64_t top = 0;
+#pragma unroll
+    for (int q = 0; q < NQ; ++q) top = s_nbid[q] > top ? s_nbid[q] : top;
+    if (top > max_blocks) top = max_blocks;
+    if (blockIdx.x > 0 && (int64_t) blockIdx.x * DX_NB >= top) return;
+    float4 qr[NQ][8];
+#pragma unroll
+    for (int q = 0; q < NQ; ++q)
+#pragma unroll
+        for (int jj = 0; jj < 8; ++jj)
+            qr[q][jj] = __ldg(reinterpret_cast<const float4*>(q_idx + (q * IDX_HEADS + h) * IDX_DIM) + dx_lane(8 * part + jj));
+    if (blockIdx.x == 0) {
+        for (int i = t; i < NQ * 3 * 256; i += NT) scratch[(int64_t) (i / 768) * MT_Q_INTS + MT_ACC + i % 768] = 0;
+        if (t < NQ) { scratch[(int64_t) t * MT_Q_INTS + QS_BAR] = 0; scratch[(int64_t) t * MT_Q_INTS + QS_BAR + 1] = 0; }   // QSASEL barrier
+    }
+    const float* krow = Ks + lane * DX_KS;
+    constexpr int PF = DX_NB * (IDX_DIM / 4) / NT;
+    float4 pre[PF];
+    const int64_t stride = (int64_t) gridDim.x * DX_NB;
+    auto fetch = [&](int64_t tb) {
+#pragma unroll
+        for (int i = 0; i < PF; ++i) {
+            const int idx = t + i * NT, row = idx / (IDX_DIM / 4), c4 = idx % (IDX_DIM / 4);
+            pre[i] = tb + row < top ? __ldg(reinterpret_cast<const float4*>(pooled + (tb + row) * IDX_DIM) + c4)
+                                    : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+    };
+    fetch((int64_t) blockIdx.x * DX_NB);
+    for (int64_t b0 = (int64_t) blockIdx.x * DX_NB; b0 < top; b0 += stride) {
+#pragma unroll
+        for (int i = 0; i < PF; ++i) {
+            const int idx = t + i * NT, row = idx / (IDX_DIM / 4), c4 = idx % (IDX_DIM / 4);
+            *reinterpret_cast<float4*>(Ks + row * DX_KS + c4 * 4) = pre[i];
+        }
+        __syncthreads();
+        if (b0 + stride < top) fetch(b0 + stride);
+        float acc[NQ];
+        {
+            float l0[NQ], l1[NQ], l2[NQ];
+#pragma unroll
+            for (int jj = 0; jj < 8; ++jj) {
+                const int L = dx_lane(8 * part + jj);
+                const float4 k4 = *reinterpret_cast<const float4*>(krow + L * 4);
+#pragma unroll
+                for (int q = 0; q < NQ; ++q) {
+                    const float4 q4 = qr[q][jj];
+                    const float d = k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;
+                    if (jj == 0 || jj == 2 || jj == 4 || jj == 6) l0[q] = d;
+                    else if (jj == 1 || jj == 5) l1[q] = l0[q] + d;
+                    else if (jj == 3) l2[q] = l1[q] + (l0[q] + d);
+                    else acc[q] = l2[q] + (l1[q] + (l0[q] + d));
+                }
+            }
+        }
+#pragma unroll
+        for (int q = 0; q < NQ; ++q) Ds[((q * IDX_HEADS + h) * SPLIT + part) * DX_NB + lane] = acc[q];
+        __syncthreads();
+        for (int q = w; q < NQ; q += NW) {
+            const int64_t b = b0 + lane;
+            const bool valid = b < s_nbid[q];
+            float score = 0.0f;
+#pragma unroll
+            for (int hh = 0; hh < IDX_HEADS; ++hh) {
+                const float* dp = Ds + (q * IDX_HEADS + hh) * SPLIT * DX_NB + lane;
+                const float d = (dp[0] + dp[DX_NB]) + (dp[2 * DX_NB] + dp[3 * DX_NB]);
+                score += d > 0.0f ? d : 0.0f;
+            }
+            if (valid) out[q * max_blocks + b] = score;
+            const int bin = valid ? (int) (order_key(score) >> 24) : -1;
+            const unsigned pend = __ballot_sync(0xffffffffu, bin >= 0);
+            if (pend) {
+                const int leader = __ffs(pend) - 1;
+                const int lb = __shfl_sync(0xffffffffu, bin, leader);
+                const unsigned same = __ballot_sync(0xffffffffu, bin == lb);
+                if (lane == leader) atomicAdd(&sh[q * 128 + (lb >> 1)], (__popc(same) * R) << (16 * (lb & 1)));
+                else if (bin >= 0 && bin != lb) atomicAdd(&sh[q * 128 + (bin >> 1)], R << (16 * (bin & 1)));
+            }
+        }
+    }
+    if (blockIdx.x == 0 && w < NQ) {   // query w's tail: block_scores_tail_kernel's arithmetic (dxs)
+        const int64_t n_kv = s_nkv[w], n_bid = s_nbid[w];
+        const float4 k4 = *reinterpret_cast<const float4*>(dead + lane * 4);
+        const float* qq = q_idx + w * IDX_HEADS * IDX_DIM + lane * 4;
+        float score = 0.0f;
+#pragma unroll
+        for (int hh = 0; hh < IDX_HEADS; ++hh) {
+            const float4 q4 = *reinterpret_cast<const float4*>(qq + hh * IDX_DIM);
+            float d = k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
+            score += d > 0.0f ? d : 0.0f;
+        }
+        if (lane == 0 && n_bid < max_blocks) {
+            if (n_kv % R != 0) score += 1e9f;
+            out[w * max_blocks + n_bid] = score;
+            const int wt = (int) (n_kv - n_bid * R);
+            const int bin = (int) (order_key(score) >> 24);
+            if (wt > 0) atomicAdd(&sh[w * 128 + (bin >> 1)], wt << (16 * (bin & 1)));
+        }
+    }
+    __syncthreads();
+    for (int i = t; i < NQ * 128; i += NT) {
+        const int v = sh[i], lo = v & 0xffff, hi = (int) ((unsigned) v >> 16);
+        int32_t* row = scratch + (int64_t) (i / 128) * MT_Q_INTS + 2 * (i % 128);
+        if (lo != 0) atomicAdd(row, lo);
+        if (hi != 0) atomicAdd(row + 1, hi);
+    }
+}
+
+template <int NQ>
+void qsc_launch(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t max_blocks,
+                float* scores, int32_t* scratch, cudaStream_t st) {
+    const size_t smem = (size_t) (DX_NB * DX_KS + NQ * IDX_HEADS * 4 * DX_NB) * sizeof(float) + (size_t) NQ * 128 * sizeof(int);
+    static int occ[64] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    int& o = occ[dev & 63];
+    if (o == 0 && (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, qsc_kernel<NQ>, DX_T * 4, smem) != cudaSuccess || o < 1)) {
+        cudaGetLastError();
+        o = 1;
+    }
+    const int64_t tiles = (max_blocks + DX_NB - 1) / DX_NB, want = (int64_t) o * sm_count();
+    const int64_t grid = want < tiles ? want : tiles;
+    qsc_kernel<NQ><<<(unsigned) grid, DX_T * 4, smem, st>>>(pooled, dead, q_idx, steps, max_blocks, scores, scratch);
 }
 
 template <int NQ, int SPLIT, bool FUSE>
@@ -1539,6 +2301,166 @@ void merge_launch(int merge, const AttnArgs& a, const int32_t* steps, const QsaS
 
 int64_t qsadec_select_scratch_ints(int64_t nq) { return (nq < MT_MAXQ ? nq : MT_MAXQ) * (int64_t) MT_Q_INTS; }
 
+// ---------------------------------------------------------------- STRATA_QSASEL_CHECK=1 (diagnostic, never in a timed run)
+// Every select call of a QSASEL variant is followed, in the same graph, by the production long path (qsa_block_scores_long
+// + qsa_block_topk_long) into its own buffers and a one-CTA compare of the score rows [0, n_bid] and the ids [0, width)
+// of every query; the counts go to mapped host memory and a host thread prints them (stderr) when they change.
+// STRATA_QSASEL_DUMP=<file prefix>: the first call that differs - or, with STRATA_QSASEL_DUMP_AT=<n_kv>, the first call
+// at that many cells or more - has its production score rows and steps copied out and written to
+// <prefix>-dev<d>.bin (int32 nq, int32 kStepCount, int64 max_blocks, steps, then nq rows of n_bid + 1 floats).
+struct QsChk {
+    float* sc = nullptr;
+    int32_t* ids = nullptr;
+    int32_t* scr = nullptr;
+    unsigned long long* host = nullptr;   // [0] queries compared, [1] score rows differing, [2] id rows differing,
+                                          // [3] first bad n_kv, [4] dump state (0 none, 1 copied, 2 written)
+    unsigned long long* dev = nullptr;    // the device view of host
+    float* dump_sc = nullptr;             // mapped: 4 x max_blocks
+    int32_t* dump_st = nullptr;           // mapped: 4 x kStepCount + 1 (nq)
+    float* dump_sc_dev = nullptr;
+    int32_t* dump_st_dev = nullptr;
+    int64_t max_blocks = 0;
+};
+__global__ void __launch_bounds__(1024) qs_check_kernel(const float* __restrict__ sa, const int32_t* __restrict__ ia,
+                                                        const float* __restrict__ sb, const int32_t* __restrict__ ib,
+                                                        const int32_t* __restrict__ steps, int64_t max_blocks, int64_t cap,
+                                                        int nq, unsigned long long* cnt, float* dump_sc, int32_t* dump_st,
+                                                        long long dump_at) {
+    __shared__ int s_bad[2], s_dump;
+    int any_bad = 0;
+    int64_t top_kv = 0;
+    for (int q = 0; q < nq; ++q) {
+        const int32_t* st = steps + q * kStepCount;
+        const int64_t n_bid = st[kStepNBid], width = st[kStepWidth], n_kv = st[kStepNKv];
+        top_kv = n_kv > top_kv ? n_kv : top_kv;
+        const int64_t rows = n_bid + 1 < max_blocks ? n_bid + 1 : max_blocks;
+        if (threadIdx.x == 0) { s_bad[0] = 0; s_bad[1] = 0; }
+        __syncthreads();
+        int bs = 0, bi = 0;
+        for (int64_t i = threadIdx.x; i < rows; i += blockDim.x)
+            bs |= __float_as_uint(sa[q * max_blocks + i]) != __float_as_uint(sb[q * max_blocks + i]);
+        for (int64_t i = threadIdx.x; i < width; i += blockDim.x) bi |= ia[q * cap + i] != ib[q * cap + i];
+        if (bs) s_bad[0] = 1;
+        if (bi) s_bad[1] = 1;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            volatile unsigned long long* c = cnt;
+            c[0] = c[0] + 1;
+            if (s_bad[0]) c[1] = c[1] + 1;
+            if (s_bad[1]) c[2] = c[2] + 1;
+            if ((s_bad[0] || s_bad[1]) && c[3] == 0) c[3] = (unsigned long long) n_kv;
+            __threadfence_system();
+        }
+        any_bad |= s_bad[0] | s_bad[1];
+        __syncthreads();
+    }
+    if (dump_sc == nullptr) return;
+    if (threadIdx.x == 0) {
+        volatile unsigned long long* c = cnt;
+        s_dump = c[4] == 0 && (any_bad || (dump_at > 0 && top_kv >= dump_at));
+    }
+    __syncthreads();
+    if (!s_dump) return;
+    for (int q = 0; q < nq; ++q) {
+        const int64_t n_bid = steps[q * kStepCount + kStepNBid];
+        const int64_t rows = n_bid + 1 < max_blocks ? n_bid + 1 : max_blocks;
+        for (int64_t i = threadIdx.x; i < rows; i += blockDim.x) dump_sc[q * max_blocks + i] = sb[q * max_blocks + i];
+    }
+    for (int i = threadIdx.x; i < nq * kStepCount; i += blockDim.x) dump_st[1 + i] = steps[i];
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        dump_st[0] = nq;
+        __threadfence_system();
+        ((volatile unsigned long long*) cnt)[4] = 1;
+        __threadfence_system();
+    }
+}
+QsChk* qs_check_buffers(int64_t max_blocks, int64_t cap) {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QSASEL_CHECK"); return v && std::atoi(v) == 1; }();
+    if (!on) return nullptr;
+    static QsChk chk[64];
+    static const char* dump = std::getenv("STRATA_QSASEL_DUMP");
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return nullptr; }
+    QsChk& c = chk[dev];
+    if (c.sc == nullptr) {
+        cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+        cudaThreadExchangeStreamCaptureMode(&mode);   // allocations during a capture
+        const int64_t scr = qsa_topk_multi_scratch_ints(4);
+        c.max_blocks = max_blocks;
+        bool ok = cudaMalloc(&c.sc, (size_t) 4 * max_blocks * 4) == cudaSuccess &&
+                  cudaMalloc(&c.ids, (size_t) 4 * cap * 4) == cudaSuccess &&
+                  cudaMalloc(&c.scr, (size_t) (scr > 0 ? scr : 1) * 4) == cudaSuccess &&
+                  cudaMemset(c.scr, 0, (size_t) (scr > 0 ? scr : 1) * 4) == cudaSuccess &&
+                  cudaHostAlloc(&c.host, 8 * sizeof(unsigned long long), cudaHostAllocMapped) == cudaSuccess &&
+                  cudaHostGetDevicePointer(&c.dev, c.host, 0) == cudaSuccess;
+        if (ok && dump)
+            ok = cudaHostAlloc(&c.dump_sc, (size_t) 4 * max_blocks * 4, cudaHostAllocMapped) == cudaSuccess &&
+                 cudaHostGetDevicePointer(&c.dump_sc_dev, c.dump_sc, 0) == cudaSuccess &&
+                 cudaHostAlloc(&c.dump_st, (size_t) (4 * kStepCount + 1) * 4, cudaHostAllocMapped) == cudaSuccess &&
+                 cudaHostGetDevicePointer(&c.dump_st_dev, c.dump_st, 0) == cudaSuccess;
+        cudaThreadExchangeStreamCaptureMode(&mode);
+        if (!ok) { std::fprintf(stderr, "strata qsasel check: allocation failed on device %d\n", dev); std::exit(1); }
+        std::memset(c.host, 0, 8 * sizeof(unsigned long long));
+        static bool thread_started = false;
+        if (!thread_started) {
+            thread_started = true;
+            std::thread([] {
+                unsigned long long last[64][4] = {};
+                for (;;) {
+                    std::this_thread::sleep_for(std::chrono::seconds(5));
+                    for (int d = 0; d < 64; ++d) {
+                        if (!chk[d].host) continue;
+                        volatile unsigned long long* h = chk[d].host;
+                        unsigned long long v[4];
+                        for (int k = 0; k < 4; ++k) v[k] = h[k];
+                        if (std::memcmp(v, last[d], sizeof v) != 0) {
+                            std::fprintf(stderr, "strata qsasel check: device %d: %llu query selects compared with the production path, "
+                                                 "%llu score rows and %llu id rows differ (first at n_kv %llu)\n",
+                                         d, v[0], v[1], v[2], v[3]);
+                            std::memcpy(last[d], v, sizeof v);
+                        }
+                        if (h[4] == 1 && dump) {
+                            char path[1024];
+                            std::snprintf(path, sizeof path, "%s-dev%d.bin", dump, d);
+                            std::FILE* f = std::fopen(path, "wb");
+                            if (f) {
+                                const int32_t nq = chk[d].dump_st[0], ksc = kStepCount;
+                                const int64_t mb = chk[d].max_blocks;
+                                std::fwrite(&nq, 4, 1, f);
+                                std::fwrite(&ksc, 4, 1, f);
+                                std::fwrite(&mb, 8, 1, f);
+                                std::fwrite(chk[d].dump_st + 1, 4, (size_t) nq * kStepCount, f);
+                                for (int q = 0; q < nq; ++q) {
+                                    const int64_t nb = chk[d].dump_st[1 + q * kStepCount + kStepNBid];
+                                    const int64_t rows = nb + 1 < mb ? nb + 1 : mb;
+                                    std::fwrite(chk[d].dump_sc + q * mb, 4, (size_t) rows, f);
+                                }
+                                std::fclose(f);
+                                std::fprintf(stderr, "strata qsasel check: device %d: dumped %d score rows (n_kv %d) to %s\n", d,
+                                             nq, chk[d].dump_st[1 + kStepNKv], path);
+                            }
+                            h[4] = 2;
+                        }
+                    }
+                }
+            }).detach();
+            std::fprintf(stderr, "strata qsasel check: STRATA_QSASEL_CHECK=1 - every QSASEL select is compared with the "
+                                 "production long path in the graph (diagnostic: slower)\n");
+        }
+    }
+    return &c;
+}
+void qs_check_launch(QsChk* c, const float* pooled, const float* dead, const float* q_idx, const int32_t* steps,
+                     int64_t nq, int64_t max_blocks, int64_t cap, const QsaShapes& s, const float* scores,
+                     const int32_t* ids, cudaStream_t st) {
+    static const long long dump_at = [] { const char* v = std::getenv("STRATA_QSASEL_DUMP_AT"); return v ? std::atoll(v) : 0LL; }();
+    qsa_block_scores_long(pooled, dead, q_idx, steps, nq, max_blocks, s, c->sc, st, -1);
+    qsa_block_topk_long(c->sc, steps, nq, max_blocks, cap, s, c->ids, st, -1, c->scr);
+    qs_check_kernel<<<1, 1024, 0, st>>>(scores, ids, c->sc, c->ids, steps, max_blocks, cap, (int) nq, c->dev,
+                                        c->dump_sc_dev, c->dump_st_dev, dump_at);
+}
+
 // variant: 0 = proto default: dxs fused (the tail and pass 0 inside the scorer; SPLIT 4 for 1-2 queries, SPLIT 2 for
 //              3-4 - die 3 bench, campaign\QSADEC-PROTO.md), then passes 1-3, count, emit
 //          5 = R scorer 4 warps/CTA fused (registers, no staging: slower, kept for the record)
@@ -1561,6 +2483,36 @@ bool qsadec_select(const float* pooled, const float* dead, const float* q_idx, c
             if (nq <= 2) dxs_dispatch<4, true>(nq, pooled, dead, q_idx, steps, max_blocks, scores, scratch, st);
             else dxs_dispatch<2, true>(nq, pooled, dead, q_idx, steps, max_blocks, scores, scratch, st);
             break;
+        case 30: case 31: case 32: case 33: case 34: case 35: case 36: case 37: case 40: {
+            // QSASEL: 30 = variant 0's scorer + passes 1-3, count and emit in one kernel (2 kernels a layer);
+            // 33 = the same with the CTA's keys read once into registers (when the capacity's rows fit);
+            // 34 = 33 with the qsc scorer (query leaves in registers) for 1-2 queries, 35 = qsc for 1-4 queries;
+            // 31 = the scorer alone, 32 = the one-kernel top-k alone, 36 / 37 = 34 / 35's scorer alone (bench only)
+            if (!dxs_counts_fit(max_blocks)) return false;
+            const bool qsc = (variant == 34 || variant == 36) ? nq <= 2 : (variant == 35 || variant == 37);
+            if (variant != 32) {
+                if (qsc) {
+                    switch (nq) {
+                        case 1: qsc_launch<1>(pooled, dead, q_idx, steps, max_blocks, scores, scratch, st); break;
+                        case 2: qsc_launch<2>(pooled, dead, q_idx, steps, max_blocks, scores, scratch, st); break;
+                        case 3: qsc_launch<3>(pooled, dead, q_idx, steps, max_blocks, scores, scratch, st); break;
+                        default: qsc_launch<4>(pooled, dead, q_idx, steps, max_blocks, scores, scratch, st); break;
+                    }
+                } else if (nq <= 2) dxs_dispatch<4, true>(nq, pooled, dead, q_idx, steps, max_blocks, scores, scratch, st);
+                else dxs_dispatch<2, true>(nq, pooled, dead, q_idx, steps, max_blocks, scores, scratch, st);
+            }
+            if (variant == 36 || variant == 37) variant = 31;
+            if (variant == 40) qs_topk2_kernel<<<tg, MT_T, 0, st>>>(scores, steps, max_blocks, cap, ids, scratch);
+            else if (variant == 33 || variant == 34 || variant == 35)   // the first 8 rows of a warp in registers
+                qs_topk_reg_kernel<8, 4><<<tg, MT_T, 0, st>>>(scores, steps, max_blocks, cap, ids, scratch);
+            else if (variant != 31) qs_topk_kernel<<<tg, MT_T, 0, st>>>(scores, steps, max_blocks, cap, ids, scratch);
+            if (variant != 31 && variant != 32)
+                if (QsChk* c = qs_check_buffers(max_blocks, cap))
+                    qs_check_launch(c, pooled, dead, q_idx, steps, nq, max_blocks, cap, s, scores, ids, st);
+            const cudaError_t e = cudaGetLastError();
+            if (e != cudaSuccess) { std::fprintf(stderr, "qsadec_select: %s\n", cudaGetErrorString(e)); std::exit(1); }
+            return true;
+        }
         case 5: r_dispatch<4, true>(nq, pooled, dead, q_idx, steps, max_blocks, scores, scratch, 0, st); break;
         case 1:
             r_dispatch<4, false>(nq, pooled, dead, q_idx, steps, max_blocks, scores, scratch, 0, st);
@@ -1691,6 +2643,49 @@ void qsadec_bench_select_stage(int stage, int abl, const float* pooled, const fl
     if (e != cudaSuccess) { std::fprintf(stderr, "qsadec_bench_select_stage: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
 
+// bench only: the top-k alone on given score rows.  The prep kernel builds what the fused scorer leaves behind (row 0 =
+// the pass-0 histogram of the cells, MT_ACC rows zeroed); variant 0 = the proto's passes 1-3 + count + emit (5 kernels),
+// 30 / 33 / 40 = the QSASEL top-k kernels; prep_only: the prep alone.
+__global__ void __launch_bounds__(1024) qs_prep_kernel(const float* __restrict__ scores, const int32_t* __restrict__ steps,
+                                                       int64_t max_blocks, int32_t* __restrict__ scratch) {
+    __shared__ int h[256];
+    const int q = blockIdx.x, t = threadIdx.x;
+    const int32_t* st = steps + q * kStepCount;
+    const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid];
+    int32_t* qs = scratch + (int64_t) q * MT_Q_INTS;
+    if (t < 256) h[t] = 0;
+    for (int i = t; i < 3 * 256; i += 1024) qs[MT_ACC + i] = 0;
+    __syncthreads();
+    const float* sc = scores + (int64_t) q * max_blocks;
+    for (int64_t b = t; b < n_bid && b < max_blocks; b += 1024) atomicAdd(&h[order_key(sc[b]) >> 24], R);
+    if (t == 0 && n_bid < max_blocks && n_kv - n_bid * R > 0) atomicAdd(&h[order_key(sc[n_bid]) >> 24], (int) (n_kv - n_bid * R));
+    __syncthreads();
+    if (t < 256) qs[t] = h[t];
+}
+void qsadec_bench_topk(int variant, bool prep_only, const float* scores, const int32_t* steps, int64_t nq,
+                       int64_t max_blocks, int64_t cap, int32_t* ids, int32_t* scratch, void* stream) {
+    const cudaStream_t st = (cudaStream_t) stream;
+    const dim3 tg((unsigned) topk_ctas(max_blocks), (unsigned) nq);
+    qs_prep_kernel<<<(unsigned) nq, 1024, 0, st>>>(scores, steps, max_blocks, scratch);
+    if (!prep_only) {
+        switch (variant) {
+            case 0:
+                p_hist_kernel<1, true><<<tg, MT_T, 0, st>>>(scores, steps, max_blocks, scratch);
+                p_hist_kernel<2, true><<<tg, MT_T, 0, st>>>(scores, steps, max_blocks, scratch);
+                p_hist_kernel<3, false><<<tg, MT_T, 0, st>>>(scores, steps, max_blocks, scratch);
+                p_count_kernel<<<tg, MT_T, 0, st>>>(scores, steps, max_blocks, scratch);
+                p_emit_kernel<<<tg, MT_T, 0, st>>>(scores, steps, max_blocks, cap, ids, scratch);
+                break;
+            case 30: qs_topk_kernel<<<tg, MT_T, 0, st>>>(scores, steps, max_blocks, cap, ids, scratch); break;
+            case 33: qs_topk_reg_kernel<8, 4><<<tg, MT_T, 0, st>>>(scores, steps, max_blocks, cap, ids, scratch); break;
+            case 40: qs_topk2_kernel<<<tg, MT_T, 0, st>>>(scores, steps, max_blocks, cap, ids, scratch); break;
+            default: std::fprintf(stderr, "qsadec_bench_topk: no variant %d\n", variant); std::exit(1);
+        }
+    }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "qsadec_bench_topk: %s\n", cudaGetErrorString(e)); std::exit(1); }
+}
+
 void qsadec_bench_attn_abl(int abl, int merge, const float* q, const QsaAttnPools& pools, const int32_t* ids,
                            const int32_t* steps, int64_t cap, const QsaShapes& s, float* scratch, float* attn,
                            int64_t nq, void* stream) {
@@ -1729,6 +2724,14 @@ void qsadec_bench_attrs(char* buf, int len) {
     add("dxs<2,2,F>", (const void*) dxs_kernel<2, 2, true>);
     add("dxs<2,4,F>", (const void*) dxs_kernel<2, 4, true>);
     add("dxs<4,4,F>", (const void*) dxs_kernel<4, 4, true>);
+    add("dxs<1,4,F>", (const void*) dxs_kernel<1, 4, true>);
+    add("dxs<4,2,F>", (const void*) dxs_kernel<4, 2, true>);
+    add("qsc<1>", (const void*) qsc_kernel<1>);
+    add("qsc<2>", (const void*) qsc_kernel<2>);
+    add("qsc<4>", (const void*) qsc_kernel<4>);
+    add("qs_topk", (const void*) qs_topk_kernel);
+    add("qs_topk_reg<8,4>", (const void*) qs_topk_reg_kernel<8, 4>);
+    add("qs_topk2", (const void*) qs_topk2_kernel);
 }
 
 #else  // not the experimental sm_60 CUDA build: nothing applies
@@ -1742,6 +2745,7 @@ void qsadec_bench_select_stage(int, int, const float*, const float*, const float
 void qsadec_bench_attn_abl(int, int, const float*, const QsaAttnPools&, const int32_t*, const int32_t*, int64_t,
                            const QsaShapes&, float*, float*, int64_t, void*) {}
 void qsadec_bench_attrs(char* buf, int len) { if (len > 0) buf[0] = 0; }
+void qsadec_bench_topk(int, bool, const float*, const int32_t*, int64_t, int64_t, int64_t, int32_t*, int32_t*, void*) {}
 #endif
 
 }  // namespace strata::kernels

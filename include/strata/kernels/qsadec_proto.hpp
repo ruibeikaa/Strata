@@ -24,6 +24,15 @@ namespace strata::kernels {
 /// STRATA_QSADEC_PROTO: 0 off (default), 1 the select and the attention, 2 the select only, 3 the attention only.
 int qsadec_proto_mode();
 
+/// STRATA_QSASEL (campaign QSA-SELECT, opt-in, needs STRATA_QSADEC_PROTO=1/2): the proto select's scorer, then the
+/// multi top-k's passes 1-3, count and emit in ONE kernel (a barrier among a query's CTAs where the kernel boundaries
+/// were); the same scores and ids.  1 = variant 33 (a warp's first 8 rows of keys kept in registers: the deploy
+/// setting), 2 = variant 30 (keys read again on every pass), 3 = variant 40 (two barriers; slower).  0 off (default).
+/// STRATA_QSASEL_CHECK=1 (diagnostic): every call is also run on the production long path and compared in the graph.
+int qsasel_mode();
+/// the qsadec_select variant STRATA_QSASEL picks: 0 (off), 1 -> 33, 2 -> 30, 3 -> 40
+int qsasel_variant();
+
 /// Scratch the proto select needs per call of up to `nq` queries (int32); 0 when it is not built.  It must be zero
 /// before the first call (the select leaves its own histogram row zeroed for the next one).
 int64_t qsadec_select_scratch_ints(int64_t nq);
@@ -48,6 +57,10 @@ void qsadec_bench_select_stage(int stage, int abl, const float* pooled, const fl
 void qsadec_bench_attn_abl(int abl, int merge, const float* q, const QsaAttnPools& pools, const int32_t* ids,
                            const int32_t* steps, int64_t cap, const QsaShapes& s, float* scratch, float* attn,
                            int64_t nq, void* stream);
+/// the top-k alone on given score rows (a prep kernel first builds the fused scorer's pass-0 row); variant 0 = the
+/// proto's five kernels, 30 / 33 / 40 = QSASEL's; prep_only: the prep alone
+void qsadec_bench_topk(int variant, bool prep_only, const float* scores, const int32_t* steps, int64_t nq,
+                       int64_t max_blocks, int64_t cap, int32_t* ids, int32_t* scratch, void* stream);
 /// registers / CTAs per SM of a bench kernel (for the report)
 void qsadec_bench_attrs(char* buf, int len);
 

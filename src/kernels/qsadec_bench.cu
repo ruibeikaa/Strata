@@ -284,11 +284,15 @@ int main(int argc, char** argv) {
     if (want("parity")) {
         std::vector<float> ha, hb;
         std::vector<int32_t> ia, ib;
-        const int sel_variants[] = {0, 1, 2, 3, 4, 5, 10, 20, 21, 22, 23, 24};
+        // QSADEC_VARIANTS=a,b,...: the select variants compared (default all; QSASEL added 30); QSADEC_PCTX: the contexts
+        std::vector<int64_t> sel_variants = {0, 1, 2, 3, 4, 5, 10, 20, 21, 22, 23, 24, 30};
+        if (const char* vv = std::getenv("QSADEC_VARIANTS")) sel_variants = parse_list(vv);
+        std::vector<int64_t> pctx = {70001, 115000, 300000, 300003, 1000000};
+        if (const char* pc = std::getenv("QSADEC_PCTX")) pctx = parse_list(pc);
         for (int mode = 0; mode < 3; ++mode) {
             gen_keys(mode, 11 + mode);
             CK(cudaDeviceSynchronize());
-            for (int64_t ctx : {(int64_t) 70001, (int64_t) 115000, (int64_t) 300000, (int64_t) 300003, (int64_t) 1000000}) {
+            for (int64_t ctx : pctx) {
                 for (int64_t T : Ts) {
                     set_steps(ctx, (int) T);
                     CK(cudaMemsetAsync(sc_a, 0, (size_t) MAXT * max_blocks * 4, st));
@@ -299,7 +303,8 @@ int main(int argc, char** argv) {
                     CK(cudaMemcpy(ha.data(), sc_a, ha.size() * 4, cudaMemcpyDeviceToHost));
                     CK(cudaMemcpy(ia.data(), ids_a, ia.size() * 4, cudaMemcpyDeviceToHost));
                     if (neg) flip(qidx, 5);
-                    for (int v : sel_variants) {
+                    for (int64_t v64 : sel_variants) {
+                        const int v = (int) v64;
                         CK(cudaMemsetAsync(scr_b, 0, (size_t) scr_ints * 4, st));
                         for (int rep = 0; rep < 2; ++rep) {
                             CK(cudaMemsetAsync(sc_b, 0x7f, (size_t) MAXT * max_blocks * 4, st));
@@ -427,6 +432,24 @@ int main(int argc, char** argv) {
                     for (int i = 0; i < T; ++i) CK(cudaMemsetAsync(scr_b + i * qints, 0, 256 * 4, st));
                 });
             }
+            if (want("qsx") && ctx >= 8192) {   // production: STRATA_SELECT_LONG_AT=8192   // QSASEL: the proto select, its scorer alone, the one-kernel top-k, extras
+                std::vector<Arm> arms;
+                arms.push_back({"PROTO DEFAULT (dxs + 5 top-k)", [&] { k::qsadec_select(pooled, dead, qidx, steps, T, max_blocks, cap, s, sc_b, ids_b, scr_b, st, 0); }, {}});
+                arms.push_back({"  dxs scorer alone (31)", [&] { k::qsadec_select(pooled, dead, qidx, steps, T, max_blocks, cap, s, sc_b, ids_b, scr_b, st, 31); }, {}});
+                arms.push_back({"QSASEL dxs + 1 top-k (30)", [&] { k::qsadec_select(pooled, dead, qidx, steps, T, max_blocks, cap, s, sc_b, ids_b, scr_b, st, 30); }, {}});
+                if (const char* xv = std::getenv("QSEL_EXTRA"))
+                    for (int64_t v : parse_list(xv)) {
+                        char nm[48];
+                        std::snprintf(nm, sizeof nm, "variant %lld", (long long) v);
+                        arms.push_back({nm, [&, v] { k::qsadec_select(pooled, dead, qidx, steps, T, max_blocks, cap, s, sc_b, ids_b, scr_b, st, (int) v); }, {}});
+                    }
+                std::snprintf(title, sizeof title, "== qsel ctx %lld T %d", (long long) ctx, T);
+                const int64_t qints = k::qsadec_select_scratch_ints(1);
+                run_arms(arms, title, [&] {
+                    CK(cudaStreamSynchronize(st));
+                    for (int i = 0; i < T; ++i) CK(cudaMemsetAsync(scr_b + i * qints, 0, 256 * 4, st));
+                });
+            }
             if (want("attn")) {
                 std::vector<Arm> arms;
                 arms.push_back({"prod attn (pre75 + merge v1)", [&] { prod_attn(T, ids_a, as_a, at_a); }, {}});
@@ -472,6 +495,81 @@ int main(int argc, char** argv) {
                 std::snprintf(title, sizeof title, "== attention ablations ctx %lld T %d (chunk + merge parts)", (long long) ctx, T);
                 run_arms(arms, title, nullptr);
             }
+        }
+    }
+
+    // ---------------------------------------------------------------- QSASEL: the top-k on REAL score rows
+    // QSADEC_REAL=file[,file...]: STRATA_QSASEL_DUMP files (an engine's production score rows and steps of one select
+    // call); the ids of every top-k variant against qsa_block_topk_long (twice in a row: self-reset), then timings of
+    // the prep alone and prep + each top-k (the prep builds the fused scorer's pass-0 row).
+    if (const char* rf = std::getenv("QSADEC_REAL")) {
+        std::string files(rf);
+        size_t a0 = 0;
+        while (a0 < files.size()) {
+            size_t b0 = files.find(',', a0);
+            if (b0 == std::string::npos) b0 = files.size();
+            const std::string path = files.substr(a0, b0 - a0);
+            a0 = b0 + 1;
+            std::FILE* f = std::fopen(path.c_str(), "rb");
+            if (!f) { std::perror(path.c_str()); continue; }
+            int32_t nq = 0, ksc = 0;
+            int64_t mb = 0;
+            if (std::fread(&nq, 4, 1, f) != 1 || std::fread(&ksc, 4, 1, f) != 1 || std::fread(&mb, 8, 1, f) != 1 ||
+                ksc != k::kStepCount || mb != max_blocks || nq < 1 || nq > MAXT) {
+                std::printf("real %s: header mismatch (nq %d, steps %d, max_blocks %lld)\n", path.c_str(), nq, ksc, (long long) mb);
+                std::fclose(f);
+                continue;
+            }
+            hsteps.assign((size_t) nq * k::kStepCount, 0);
+            if (std::fread(hsteps.data(), 4, hsteps.size(), f) != hsteps.size()) { std::fclose(f); continue; }
+            CK(cudaMemcpy(steps, hsteps.data(), hsteps.size() * 4, cudaMemcpyHostToDevice));
+            CK(cudaMemset(sc_a, 0, (size_t) MAXT * max_blocks * 4));
+            bool okr = true;
+            for (int q = 0; q < nq; ++q) {
+                const int64_t nb = hsteps[(size_t) q * k::kStepCount + k::kStepNBid];
+                const int64_t rows = std::min<int64_t>(nb + 1, max_blocks);
+                std::vector<float> row((size_t) rows);
+                okr = okr && std::fread(row.data(), 4, row.size(), f) == row.size();
+                CK(cudaMemcpy(sc_a + (size_t) q * max_blocks, row.data(), row.size() * 4, cudaMemcpyHostToDevice));
+            }
+            std::fclose(f);
+            if (!okr) { std::printf("real %s: short file\n", path.c_str()); continue; }
+            const int64_t n_kv = hsteps[k::kStepNKv];
+            k::qsa_block_topk_long(sc_a, steps, nq, max_blocks, cap, s, ids_a, st, -1, scr_a);
+            CK(cudaStreamSynchronize(st));
+            std::vector<int32_t> ia((size_t) nq * cap), ib(ia.size());
+            CK(cudaMemcpy(ia.data(), ids_a, ia.size() * 4, cudaMemcpyDeviceToHost));
+            for (int v : {0, 30, 33, 40}) {
+                CK(cudaMemsetAsync(scr_b, 0, (size_t) scr_ints * 4, st));
+                for (int rep = 0; rep < 2; ++rep) {
+                    CK(cudaMemsetAsync(ids_b, 0x7f, (size_t) MAXT * cap * 4, st));
+                    k::qsadec_bench_topk(v, false, sc_a, steps, nq, max_blocks, cap, ids_b, scr_b, st);
+                    CK(cudaStreamSynchronize(st));
+                    CK(cudaMemcpy(ib.data(), ids_b, ib.size() * 4, cudaMemcpyDeviceToHost));
+                    for (int q = 0; q < nq; ++q) {
+                        const int64_t w = hsteps[(size_t) q * k::kStepCount + k::kStepWidth];
+                        const bool ok = std::memcmp(ia.data() + (size_t) q * cap, ib.data() + (size_t) q * cap, (size_t) w * 4) == 0;
+                        ++checked;
+                        if (!ok) {
+                            ++bad;
+                            int64_t fi = 0;
+                            while (fi < w && ia[(size_t) q * cap + fi] == ib[(size_t) q * cap + fi]) ++fi;
+                            std::printf("MISMATCH real %s v%d q %d rep %d: ids differ from %lld of %lld (%d vs %d)\n", path.c_str(), v, q,
+                                        rep, (long long) fi, (long long) w, ia[(size_t) q * cap + fi], ib[(size_t) q * cap + fi]);
+                        }
+                    }
+                }
+            }
+            std::vector<Arm> arms;
+            arms.push_back({"prep alone", [&] { k::qsadec_bench_topk(0, true, sc_a, steps, nq, max_blocks, cap, ids_b, scr_b, st); }, {}});
+            for (int v : {0, 30, 33, 40}) {
+                char nm[48];
+                std::snprintf(nm, sizeof nm, "prep + top-k %d", v);
+                arms.push_back({nm, [&, v] { k::qsadec_bench_topk(v, false, sc_a, steps, nq, max_blocks, cap, ids_b, scr_b, st); }, {}});
+            }
+            char title[256];
+            std::snprintf(title, sizeof title, "== real top-k %s: nq %d n_kv %lld", path.c_str(), nq, (long long) n_kv);
+            run_arms(arms, title, nullptr);
         }
     }
 
