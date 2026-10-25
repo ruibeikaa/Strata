@@ -1857,7 +1857,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                             strata::kernels::qsadec_select(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID,
                                                            step_ + tb * kStepCount, n, max_blocks_, cap_, s,
                                                            scores_ + (size_t) tb * max_blocks_, sel_ + (size_t) tb * cap_,
-                                                           qsadec_scratch_, ns, 0))
+                                                           qsadec_scratch_, ns,
+                                                           strata::kernels::qsasel_variant()))   // STRATA_QSASEL (0 = off)
                             return;
                         qsa_block_scores_long(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n,
                                               max_blocks_, s, scores_ + (size_t) tb * max_blocks_, ns, -1);
