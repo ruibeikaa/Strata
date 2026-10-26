@@ -98,6 +98,8 @@ private:
     int64_t tc_w_elems_ = 0;
     uint16_t* tc_x_ = nullptr;
     int64_t tc_x_elems_ = 0;
+    float* nt_x_ = nullptr;   // STRATA_GEMM_ALGO6=2: the transposed activation slice (FP32, n x K column-major)
+    int64_t nt_x_elems_ = 0;
     bool native_mmq(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                     int64_t ldy);
     /// A padded X (ldx > K) that no kernel above took: its T rows copied to a contiguous FP16 buffer of stride K, grown
@@ -114,6 +116,13 @@ private:
     /// Pascal: Y = X . W^T as cublasSgemm with W already FP32 (a resident copy) and X widened in the same slices as
     /// STRATA_DENSE_F32's per-chunk route; false (nothing launched) when the activation buffer cannot be had
     bool sgemm_f32w(const uint16_t* X, const float* Wf, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy, float beta);
+    /// Pascal, STRATA_GEMM_ALGO6: the FP32 route's product - the cublasSgemm call, or (where the table takes the shape
+    /// and T) the same product as cublasGemmEx(OP_T, OP_N) with a fixed algorithm, which is bitwise its output
+    void sgemm_f32(const float* Xf, const float* Wf, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy, float beta);
+    /// Pascal, STRATA_GEMM_ALGO6=2: Y = X . Wt^T with Wt the resident FP32 weight stored column-major (element (i, k) at
+    /// i + k*N) and X transposed per slice into nt_x_ (FP32, element (t, k) at t + k*n); false: nothing launched (no room
+    /// for that buffer)
+    bool sgemm_nt(const uint16_t* X, const float* Wt, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy, float beta);
     /// Y = X . W^T with FP16 out, written into Y's own rows and widened there (no buffer): prompt_f16() only.
     void f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy);
 };
