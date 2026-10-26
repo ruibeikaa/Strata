@@ -81,6 +81,12 @@ struct Config {
     int lkc_adapt = 0;
     int lkc_adapt_acc = 0;
     int lkc_adapt_warm = 8;
+    // ... and the third test: a copy job is a *stream* of long matches, an edit step that happens to echo a kept line
+    // is not.  Once lkc_rate_warm windows of the request have been decided, a tail needs lkc_rate per cent of them to
+    // have carried a long match (0: off).  On the real copy turns 39-45% of the windows carry one, on the edit step
+    // that loses 4-5% to its tails 6-7% do.
+    int lkc_rate = 0;
+    int lkc_rate_warm = 16;
 
     int depth() const { return mode == Mode::B ? 3 : 2; }
     int ns() const { return mode == Mode::N2 ? 2 : slots > 0 ? slots : mode == Mode::B0 ? 3 : 4; }
@@ -233,6 +239,8 @@ struct Stats {
     int64_t lkc_windows = 0, lkc_tokens = 0, lkc_reached = 0, lkc_ok = 0, lkc_div = 0, lkc_lkwin = 0, lkc_fresh = 0;
     int64_t lkc_cut = 0, lkc_lookups = 0;
     int64_t lkc_adapt_stop = 0;      // tails not taken because of STRATA_LKCHAIN_ADAPT (match too short or acceptance low)
+    int64_t lkc_probe_n = 0, lkc_probe_hit = 0;   // windows decided, of them with a long match (the copy-rate test)
+    int64_t lkc_rate_stop = 0;       // tails not taken because the request does not look like a copy job
 };
 
 // The verdict cases as counted (a verdict can count under two: 5/6 also count their 1x/2/3)

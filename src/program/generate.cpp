@@ -363,12 +363,12 @@ static const char* pipe_dbg_env(const char* name) {
 // acceptance stays at or above the floor.  Without it a request whose matches are short or whose continuation is wrong
 // pays for the extra rows and gets nothing back (LKCHAIN.md: real_edit_abl12, -9..-12%).  -1 in the struct: not given.
 struct LkcSettings { bool set = false; int k = 0, m = 8, div = 0, fresh = 0, pol = 0, rows = 0, adapt = -1, adapt_acc = -1,
-                        adapt_warm = -1; };
+                        adapt_warm = -1, rate = -1, rate_warm = -1; };
 static bool lkc_parse(const char* v, LkcSettings& o) {
     if (v == nullptr) return false;
-    int x[9] = {0, 8, 0, 0, 0, 0, -1, -1, -1};
-    const int n = std::sscanf(v, "%d,%d,%d,%d,%d,%d,%d,%d,%d", &x[0], &x[1], &x[2], &x[3], &x[4], &x[5], &x[6], &x[7],
-                             &x[8]);
+    int x[11] = {0, 8, 0, 0, 0, 0, -1, -1, -1, -1, -1};
+    const int n = std::sscanf(v, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d", &x[0], &x[1], &x[2], &x[3], &x[4], &x[5], &x[6],
+                             &x[7], &x[8], &x[9], &x[10]);
     if (n < 1) return false;
     o.set = true;
     o.k = std::clamp(x[0], 0, 7);
@@ -380,6 +380,8 @@ static bool lkc_parse(const char* v, LkcSettings& o) {
     o.adapt = n >= 7 ? std::max(0, x[6]) : -1;
     o.adapt_acc = n >= 8 ? std::clamp(x[7], 0, 100) : -1;
     o.adapt_warm = n >= 9 ? std::clamp(x[8], 0, 64) : -1;
+    o.rate = n >= 10 ? std::clamp(x[9], 0, 100) : -1;
+    o.rate_warm = n >= 11 ? std::clamp(x[10], 0, 4096) : -1;
     return true;
 }
 // the default of the two ADAPT numbers, for a STRATA_LKCHAIN / STRATA_LKCHAIN_FILE that does not carry fields 7-8
@@ -15953,6 +15955,8 @@ int main(int argc, char** argv) {
                     cfg.lkc_adapt = lk.adapt >= 0 ? lk.adapt : adapt;
                     cfg.lkc_adapt_acc = lk.adapt_acc >= 0 ? lk.adapt_acc : adapt_acc;
                     cfg.lkc_adapt_warm = lk.adapt_warm >= 0 ? lk.adapt_warm : 8;
+                    cfg.lkc_rate = lk.rate >= 0 ? lk.rate : 0;
+                    cfg.lkc_rate_warm = lk.rate_warm >= 0 ? lk.rate_warm : 16;
                     cfg.S_sfx = std::min(g_lkc_s_sfx, S);
                 } else if (g_lkc_s_sfx > 0) {
                     cfg.S_sfx = std::min(g_lkc_s_sfx, S);   // (N2: today's lookup windows, no tails)
@@ -16398,10 +16402,13 @@ int main(int argc, char** argv) {
                                      (long long) st4.lkc_tokens, (long long) st4.lkc_reached, (long long) st4.lkc_ok,
                                      (long long) st4.lkc_cut, (long long) st4.lkc_div, (long long) st4.lkc_lkwin,
                                      (long long) st4.lkc_fresh);
-                    if (cfg.lkc_adapt > 0 || cfg.lkc_adapt_acc > 0)
+                    if (cfg.lkc_adapt > 0 || cfg.lkc_adapt_acc > 0 || cfg.lkc_rate > 0)
                         std::fprintf(stderr, "strata pipeline lookup chain adapt (match %d, acceptance %d per cent after "
-                                             "%d tail tokens): %lld tails not taken\n", cfg.lkc_adapt,
-                                     cfg.lkc_adapt_acc, cfg.lkc_adapt_warm, (long long) st4.lkc_adapt_stop);
+                                             "%d tail tokens, copy rate %d per cent after %d windows): %lld tails not "
+                                             "taken, %lld of %lld windows carried a long match (%lld for the rate)\n",
+                                     cfg.lkc_adapt, cfg.lkc_adapt_acc, cfg.lkc_adapt_warm, cfg.lkc_rate,
+                                     cfg.lkc_rate_warm, (long long) st4.lkc_adapt_stop, (long long) st4.lkc_probe_hit,
+                                     (long long) st4.lkc_probe_n, (long long) st4.lkc_rate_stop);
                     std::fprintf(stderr, "strata pipeline depth3: held1 %lld windows %.2f ms | held2 %lld windows %.2f ms | C made "
                                          "%lld launched %lld on %lld doomed %lld | undo jobs %lld stage-waits %lld (%.1f ms) | slot "
                                          "waits %lld (%.1f ms) | restage %lld (%lld guesses) | chain waits %lld (%.1f ms) late %lld | "
