@@ -931,13 +931,15 @@ size_t f32_resident_reserve() {
 }
 std::mutex g_shadow_mu;
 std::unordered_map<const void*, float*> g_shadow;   // weight address -> its FP32 copy (nullptr: did not fit, not retried)
+std::unordered_map<const void*, float*> g_shadow_t;  // the same weights' transposed copies (STRATA_GEMM_ALGO6=2)
 uint64_t g_shadow_bytes[64] = {};
 int g_shadow_count[64] = {}, g_shadow_refused[64] = {};
 // the FP32 copy of the weight at `key` (`elems` values), made on first use by `make(dst)` on `st`; nullptr: no copy
 template <class Make>
-const float* shadow_get(const void* key, int64_t elems, cudaStream_t st, Make make) {
+const float* shadow_get_in(std::unordered_map<const void*, float*>& into, const void* key, int64_t elems, cudaStream_t st,
+                           Make make, const char* what) {
     std::lock_guard<std::mutex> lk(g_shadow_mu);
-    if (const auto it = g_shadow.find(key); it != g_shadow.end()) return it->second;
+    if (const auto it = into.find(key); it != into.end()) return it->second;
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return nullptr; }
     const size_t bytes = (size_t) elems * 4;
@@ -947,27 +949,107 @@ const float* shadow_get(const void* key, int64_t elems, cudaStream_t st, Make ma
         cudaMalloc((void**) &p, bytes) == cudaSuccess) {
         make(p);
         if (cudaStreamSynchronize(st) != cudaSuccess) {   // (the copy is read by later chunks on this stream only)
-            std::fprintf(stderr, "strata prefill: STRATA_DENSE_F32_RESIDENT: making a copy failed on GPU %d\n", dev);
+            std::fprintf(stderr, "strata prefill: %s: making a copy failed on GPU %d\n", what, dev);
             std::exit(1);
         }
         const uint64_t before = g_shadow_bytes[dev];
         g_shadow_bytes[dev] += bytes;
         ++g_shadow_count[dev];
         if (before == 0 || (before >> 28) != (g_shadow_bytes[dev] >> 28))   // the first, then every 256 MiB
-            std::fprintf(stderr, "strata prefill: STRATA_DENSE_F32_RESIDENT: GPU %d keeps %d FP32 weight copies, %.0f MiB "
-                                 "(%.0f MiB free)\n", dev, g_shadow_count[dev], g_shadow_bytes[dev] / 1048576.0,
+            std::fprintf(stderr, "strata prefill: %s: GPU %d keeps %d FP32 weight copies, %.0f MiB "
+                                 "(%.0f MiB free)\n", what, dev, g_shadow_count[dev], g_shadow_bytes[dev] / 1048576.0,
                          (free_b - bytes) / 1048576.0);
     } else {
         cudaGetLastError();
         p = nullptr;
         if (g_shadow_refused[dev]++ < 4)
-            std::fprintf(stderr, "strata prefill: STRATA_DENSE_F32_RESIDENT: GPU %d: no room for a %.1f MiB FP32 copy (%.0f MiB "
+            std::fprintf(stderr, "strata prefill: %s: GPU %d: no room for a %.1f MiB FP32 copy (%.0f MiB "
                                  "free, reserve %.0f MiB; %d copies, %.0f MiB kept): this weight keeps its per-call route\n",
-                         dev, bytes / 1048576.0, free_b / 1048576.0, f32_resident_reserve() / 1048576.0, g_shadow_count[dev],
-                         g_shadow_bytes[dev] / 1048576.0);
+                         what, dev, bytes / 1048576.0, free_b / 1048576.0, f32_resident_reserve() / 1048576.0,
+                         g_shadow_count[dev], g_shadow_bytes[dev] / 1048576.0);
     }
-    g_shadow.emplace(key, p);
+    into.emplace(key, p);
     return p;
+}
+template <class Make>
+const float* shadow_get(const void* key, int64_t elems, cudaStream_t st, Make make) {
+    return shadow_get_in(g_shadow, key, elems, st, make, "STRATA_DENSE_F32_RESIDENT");
+}
+
+// ---- Pascal, opt-in (STRATA_GEMM_ALGO6=1 / 2): a fixed cuBLAS algorithm for the prompt GEMMs ---------------------------
+// Measured on a GP100 die with cuBLAS 12.9 (the engine's own library; campaign dsw1 §2, dsw4 §1-2): for the
+// FP16-operand products of the dense projections cuBLAS's DEFAULT algorithm is not its fastest kernel at most chunk
+// sizes, and the same holds for the cublasSgemm call STRATA_DENSE_F32 makes on the FP32 copies (T 512/768 of the
+// 10240-row weight: 4.7-5.6 TF/s of the 6.45 the die has).  CUBLAS_GEMM_ALGO6 reproduces the DEFAULT call's output byte
+// for byte - an algorithm changes the tile, not the k direction's accumulation order - for the shapes and chunk sizes
+// the tables below take (w4_algo6_verify: the whole output memcmp'd at every T from 128 to 8192 of the five dense
+// shapes, both routes), and runs 3-16% faster.
+//   =1  the FP16 products from f16_algo6_t, and the FP32 route's product as cublasGemmEx(OP_T, OP_N, ..., ALGO6)
+//       (+2.7..3.4% of the dense GEMM time).  T outside the tables, and every other shape, keep their calls.
+//   =2  as =1, and the FP32 route's weight is also kept transposed (column-major, next to the untransposed copy
+//       F32RES keeps) so its product is cublasGemmEx(OP_N, OP_T, ..., ALGO6) on that copy and the per-slice transposed
+//       X: +6.0..6.5% instead of +3%.  The transposed copy is budgeted like the F32RES copies
+//       (STRATA_F32_RESIDENT_RESERVE_MIB); a copy that does not fit leaves that shape on the =1 route.
+// Off by default and off outside compute capability 6.x: with the switch unset the calls are exactly f32res's.
+int gemm_algo6_mode() {
+    static const int m = [] {
+        const char* v = std::getenv("STRATA_GEMM_ALGO6");
+        const int n = v != nullptr && v[0] != '\0' ? std::atoi(v) : 0;
+        const int cc = current_cc();
+        return (cc >= 60 && cc < 70) ? std::min(2, std::max(0, n)) : 0;
+    }();
+    return m;
+}
+// The FP16-operand products whose ALGO6 call is the DEFAULT call's output and faster, by shape and T (the windows are
+// measured, not guessed: at T 800-1024 and 1536 of the 2560-row output projections ALGO6 is the slower one, and below
+// T 512 cuBLAS's DEFAULT there moves to a kernel family whose bits ALGO6 does not reproduce).
+bool f16_algo6_t(int64_t N, int64_t K, int64_t T) {
+    if (K == 2560 && (N == 10240 || N == 12288 || N == 6144)) return T >= 700 && T <= 8192;
+    if (N == 2560 && (K == 6144 || K == 4096)) return (T >= 700 && T <= 800) || (T >= 1660 && T <= 1920);
+    return false;
+}
+// The FP32 copies' products that ALGO6 reproduces and speeds up (both the OP_T/OP_N and the OP_N/OP_T form): the three
+// 2560-column dense weights, from the chunk size at which STRATA_DENSE_F32's route takes them.
+bool f32_algo6_t(int64_t N, int64_t K, int64_t T) {
+    if (K != 2560) return false;
+    if (N == 10240 || N == 12288) return T >= 256 && T <= 8192;
+    if (N == 6144) return T >= 512 && T <= 8192;
+    return false;
+}
+// FP16 row-major N x K -> FP32 column-major N x K (op(A) = N): dst[i + k*N] = src[i*K + k], 32 x 32 tiles
+__global__ void f16_transpose_w_kernel(const uint16_t* __restrict__ src, float* __restrict__ dst, int64_t N, int64_t K) {
+    __shared__ uint16_t tile[32][33];
+    const int64_t i0 = (int64_t) blockIdx.y * 32, k0 = (int64_t) blockIdx.x * 32;
+    const int64_t i = i0 + threadIdx.y, k = k0 + threadIdx.x;
+    if (i < N && k < K) tile[threadIdx.y][threadIdx.x] = src[i * K + k];
+    __syncthreads();
+    const int64_t i2 = i0 + threadIdx.x, k2 = k0 + threadIdx.y;   // swapped: consecutive threads write consecutive i
+    if (i2 < N && k2 < K) dst[i2 + k2 * N] = __half2float(__ushort_as_half(tile[threadIdx.x][threadIdx.y]));
+}
+// FP16 row-major n x K -> FP32 column-major n x K (op(B) = T): dst[t + k*n] = src[t*K + k]
+__global__ void f16_transpose_x_kernel(const uint16_t* __restrict__ src, float* __restrict__ dst, int64_t n, int64_t K) {
+    __shared__ uint16_t tile[32][33];
+    const int64_t t0 = (int64_t) blockIdx.y * 32, k0 = (int64_t) blockIdx.x * 32;
+    const int64_t t = t0 + threadIdx.y, k = k0 + threadIdx.x;
+    if (t < n && k < K) tile[threadIdx.y][threadIdx.x] = src[t * K + k];
+    __syncthreads();
+    const int64_t t2 = t0 + threadIdx.x, k2 = k0 + threadIdx.y;
+    if (t2 < n && k2 < K) dst[t2 + k2 * n] = __half2float(__ushort_as_half(tile[threadIdx.x][threadIdx.y]));
+}
+void f16_transpose_w(const uint16_t* src, float* dst, int64_t N, int64_t K, cudaStream_t st) {
+    f16_transpose_w_kernel<<<dim3((unsigned) ((K + 31) / 32), (unsigned) ((N + 31) / 32)), dim3(32, 32), 0, st>>>(src, dst, N, K);
+}
+void f16_transpose_x(const uint16_t* src, float* dst, int64_t n, int64_t K, cudaStream_t st) {
+    f16_transpose_x_kernel<<<dim3((unsigned) ((K + 31) / 32), (unsigned) ((n + 31) / 32)), dim3(32, 32), 0, st>>>(src, dst, n, K);
+}
+bool grow_f32(float*& p, int64_t& have, int64_t want) {   // `have`, `want`: 4-byte elements
+    if (have >= want) return true;
+    if (p) cudaFree(p);
+    p = nullptr;
+    have = 0;
+    if (cudaMalloc((void**) &p, (size_t) want * 4) != cudaSuccess) { cudaGetLastError(); p = nullptr; return false; }
+    have = want;
+    return true;
 }
 #endif
 }  // namespace
@@ -986,14 +1068,56 @@ bool Gemm::sgemm_f32w(const uint16_t* X, const float* wf, float* Y, int64_t T, i
         std::fprintf(stderr, "prefill gemm: the dense projections' FP16 GEMMs run as cublasSgemm on resident FP32 copies "
                              "(STRATA_DENSE_F32=1 + STRATA_DENSE_F32_RESIDENT=1)\n");
     }
-    const float alpha = 1.0f;
     float* const xf = reinterpret_cast<float*>(tc_x_);
     for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
         const int64_t n = std::min<int64_t>(x_rows, T - t0);
         f16_to_f32(X + t0 * K, xf, n * K, (cudaStream_t) stream_);
-        ck(cublasSgemm((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) n, (int) K, &alpha, wf, (int) K,
-                       xf, (int) K, &beta, Y + t0 * ldy, (int) ldy),
-           "cublasSgemm (FP16 operands, STRATA_DENSE_F32_RESIDENT)");
+        sgemm_f32(xf, wf, Y + t0 * ldy, n, N, K, ldy, beta);
+    }
+    return true;
+}
+// The FP32 route's product: production's cublasSgemm call, or (STRATA_GEMM_ALGO6, inside its table) the same product
+// through cublasGemmEx with a fixed algorithm - which w4_algo6_verify found byte for byte the cublasSgemm output's.
+void Gemm::sgemm_f32(const float* xf, const float* wf, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy, float beta) {
+    const float alpha = 1.0f;
+    if (gemm_algo6_mode() >= 1 && f32_algo6_t(N, K, T)) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::fprintf(stderr, "prefill gemm: the FP32 dense products run as cublasGemmEx with ALGO6 "
+                                 "(STRATA_GEMM_ALGO6=%d; bitwise cublasSgemm's at the sizes of the table)\n", gemm_algo6_mode());
+        }
+        ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, wf,
+                        CUDA_R_32F, (int) K, xf, CUDA_R_32F, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_ALGO6),
+           "cublasGemmEx (FP32 operands, STRATA_GEMM_ALGO6)");
+        return;
+    }
+    ck(cublasSgemm((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, wf, (int) K,
+                   xf, (int) K, &beta, Y, (int) ldy),
+       "cublasSgemm (FP16 operands, STRATA_DENSE_F32_RESIDENT)");
+}
+// STRATA_GEMM_ALGO6=2's product: op(A) = N on the resident column-major weight, op(B) = T on the per-slice transposed
+// activation; cublasGemmEx(..., ALGO6), the same products in the same order as sgemm_f32w's call (w4_algo6_verify).
+bool Gemm::sgemm_nt(const uint16_t* X, const float* wt, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy, float beta) {
+    const int64_t n_sl = (T * K + kXSliceElems - 1) / kXSliceElems;
+    const int64_t x_rows = (T + n_sl - 1) / n_sl;
+    if (nt_x_elems_ < x_rows * K) cudaStreamSynchronize((cudaStream_t) stream_);
+    if (!grow_f32(nt_x_, nt_x_elems_, x_rows * K)) { cudaGetLastError(); return false; }
+    const float alpha = 1.0f;
+    static bool said = false;
+    if (!said) {
+        said = true;
+        std::fprintf(stderr, "prefill gemm: the FP32 dense products run as cublasGemmEx(OP_N, OP_T) with ALGO6 on the "
+                             "transposed weight copies (STRATA_GEMM_ALGO6=2)\n");
+    }
+    for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
+        const int64_t n = std::min<int64_t>(x_rows, T - t0);
+        f16_transpose_x(X + t0 * K, nt_x_, n, K, (cudaStream_t) stream_);
+        ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_N, CUBLAS_OP_T, (int) N, (int) n, (int) K, &alpha, wt,
+                        CUDA_R_32F, (int) N, nt_x_, CUDA_R_32F, (int) n, &beta, Y + t0 * ldy, CUDA_R_32F, (int) ldy,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_ALGO6),
+           "cublasGemmEx (FP32 operands, transposed, STRATA_GEMM_ALGO6=2)");
     }
     return true;
 }
@@ -1309,9 +1433,7 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
             for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
                 const int64_t n = std::min<int64_t>(x_rows, T - t0);
                 f16_to_f32(X + t0 * K, xf, n * K, (cudaStream_t) stream_);
-                ck(cublasSgemm((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) n, (int) K, &alpha, wf, (int) K,
-                               xf, (int) K, &beta, Y + t0 * ldy, (int) ldy),
-                   "cublasSgemm (FP16 operands, STRATA_DENSE_F32)");
+                sgemm_f32(xf, wf, Y + t0 * ldy, n, N, K, ldy, beta);
             }
             return;
         }
@@ -1335,7 +1457,22 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     cublasGemmAlgo_t algo = CUBLAS_GEMM_DEFAULT;
     for (int i = 0; i < f16_algo_n_; ++i)
         if (f16_algo_shape_[i] == shape) { algo = CUBLAS_GEMM_ALGO2; break; }
+#if defined(STRATA_EXPERIMENTAL_SM60)
+    // STRATA_GEMM_ALGO6: the shapes and chunk sizes whose ALGO6 call is this DEFAULT call's output, and faster
+    if (algo == CUBLAS_GEMM_DEFAULT && gemm_algo6_mode() >= 1 && f16_algo6_t(N, K, T)) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::fprintf(stderr, "prefill gemm: the dense projections' FP16 products run with ALGO6 "
+                                 "(STRATA_GEMM_ALGO6=%d; bitwise their DEFAULT calls at the shapes of the table)\n",
+                         gemm_algo6_mode());
+        }
+        algo = CUBLAS_GEMM_ALGO6;
+    }
+#endif
     cublasStatus_t st = f16_gemm(algo);
+    if (st == CUBLAS_STATUS_INTERNAL_ERROR && algo == CUBLAS_GEMM_ALGO6)   // (STRATA_GEMM_ALGO6: issue #1650's state)
+        st = f16_gemm(algo = CUBLAS_GEMM_DEFAULT);
     if (st == CUBLAS_STATUS_INTERNAL_ERROR && algo == CUBLAS_GEMM_DEFAULT) {
         if (f16_algo_n_ < kF16AlgoSlots) f16_algo_shape_[f16_algo_n_++] = shape;
         st = f16_gemm(CUBLAS_GEMM_ALGO2);
@@ -1502,6 +1639,15 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     if (beta == 0.0f && N * K <= scratch_elems_ && f32_resident_on()) {
         if (const int64_t min_t = dense_f32_min_t(N, K); min_t > 0 && T >= min_t && dense_f32_on()) {
             if (ldy <= 0) ldy = N;
+            // STRATA_GEMM_ALGO6=2: the weight's transposed copy (no room: the untransposed route below, which
+            // runs =1's call)
+            if (gemm_algo6_mode() >= 2 && f32_algo6_t(N, K, T)) {
+                const float* wt = shadow_get_in(g_shadow_t, W_blocks, N * K, (cudaStream_t) stream_, [&](float* dst) {
+                    strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
+                    f16_transpose_w(scratch_, dst, N, K, (cudaStream_t) stream_);
+                }, "STRATA_GEMM_ALGO6 (transposed FP32 copy)");
+                if (wt != nullptr && sgemm_nt(X, wt, Y, T, N, K, ldy, beta)) return;
+            }
             const float* wf = shadow_get(W_blocks, N * K, (cudaStream_t) stream_, [&](float* dst) {
                 strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
                 f16_to_f32(scratch_, dst, N * K, (cudaStream_t) stream_);
