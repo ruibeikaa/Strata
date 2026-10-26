@@ -67,7 +67,7 @@ using namespace strata::prefill::ws::detail;
 namespace nb = strata::core::nibble;
 
 enum : int { V_TIME = 1, V_NOLOAD = 2, V_NOSYNC = 4, V_NODEC = 8, V_DYT = 16, V_PF = 32, V_ST16 = 64, V_TAIL = 128,
-             V_DUFF = 256, V_DECF = 512, V_LB2 = 1024 };
+             V_DUFF = 256, V_DECF = 512, V_LB2 = 1024, V_TAILD = 2048 };
 
 struct alignas(16) Rec {
     unsigned long long t0, t1;     // %globaltimer at entry / exit (thread 0)
@@ -628,7 +628,7 @@ __device__ __forceinline__ float load_blk(const int* __restrict__ cw, const int 
     }
 }
 
-template <int NT, int TPP, int SB, int G, int PAR, int CHN, bool DUFF = false, bool DYT = false>
+template <int NT, int TPP, int SB, int G, int PAR, int CHN, bool DUFF = false, bool DYT = false, bool TAILD = false>
 __device__ __forceinline__ void blk_compute(const int* __restrict__ cw, const int p, const uint32_t (&tab)[4],
                                             const int (*act_s)[SB][16], const float* __restrict__ dyb, const int nt,
                                             float (&acc)[TPP]) {
@@ -643,8 +643,22 @@ __device__ __forceinline__ void blk_compute(const int* __restrict__ cw, const in
         dec(q, tab, wv);
     }
     if constexpr (DUFF) {
-        static_assert(TPP / G == 16 && G == 2 && CHN == 1, "the switch below: 16 token pairs, one chain");
-        auto grp = [&](auto K) {
+        static_assert((TPP / G == 16 || TPP / G == 8) && G == 2 && CHN == 1, "the switch below: 16 or 8 token pairs");
+        const int nf = TAILD ? (nt & ~(G - 1)) : (((nt + G - 1) / G) * G);
+#pragma unroll
+        for (int k = 0; k < G - 1; ++k)
+            if (nf + k < nt) {
+                const int t = nf + k;
+                const int4* a4 = (const int4*) act_s[t][b];
+                const int4 a0 = a4[0], a1 = a4[1], a2 = a4[2], a3 = a4[3];
+                int s0 = 0;
+                s0 = mad2(wv[0], a0.x, s0); s0 = mad2(wv[1], a0.y, s0); s0 = mad2(wv[2], a0.z, s0); s0 = mad2(wv[3], a0.w, s0);
+                s0 = mad2(wv[4], a1.x, s0); s0 = mad2(wv[5], a1.y, s0); s0 = mad2(wv[6], a1.z, s0); s0 = mad2(wv[7], a1.w, s0);
+                s0 = mad2(wv[8], a2.x, s0); s0 = mad2(wv[9], a2.y, s0); s0 = mad2(wv[10], a2.z, s0); s0 = mad2(wv[11], a2.w, s0);
+                s0 = mad2(wv[12], a3.x, s0); s0 = mad2(wv[13], a3.y, s0); s0 = mad2(wv[14], a3.z, s0); s0 = mad2(wv[15], a3.w, s0);
+                acc[t] = __fmaf_rn(__fmul_rn(dx, DYT ? dyb[b * TPP + t] : dyb[t * SB + b]), __int2float_rn(s0), acc[t]);
+            }
+        auto grp2 = [&](auto K) {
             constexpr int t0 = decltype(K)::value * G;
             float d0, d1;
             if constexpr (DYT) {
@@ -666,24 +680,38 @@ __device__ __forceinline__ void blk_compute(const int* __restrict__ cw, const in
             }
         };
         using std::integral_constant;
-        switch ((nt + G - 1) / G) {
-            case 16: grp(integral_constant<int, 15>{}); [[fallthrough]];
-            case 15: grp(integral_constant<int, 14>{}); [[fallthrough]];
-            case 14: grp(integral_constant<int, 13>{}); [[fallthrough]];
-            case 13: grp(integral_constant<int, 12>{}); [[fallthrough]];
-            case 12: grp(integral_constant<int, 11>{}); [[fallthrough]];
-            case 11: grp(integral_constant<int, 10>{}); [[fallthrough]];
-            case 10: grp(integral_constant<int, 9>{}); [[fallthrough]];
-            case 9: grp(integral_constant<int, 8>{}); [[fallthrough]];
-            case 8: grp(integral_constant<int, 7>{}); [[fallthrough]];
-            case 7: grp(integral_constant<int, 6>{}); [[fallthrough]];
-            case 6: grp(integral_constant<int, 5>{}); [[fallthrough]];
-            case 5: grp(integral_constant<int, 4>{}); [[fallthrough]];
-            case 4: grp(integral_constant<int, 3>{}); [[fallthrough]];
-            case 3: grp(integral_constant<int, 2>{}); [[fallthrough]];
-            case 2: grp(integral_constant<int, 1>{}); [[fallthrough]];
-            case 1: grp(integral_constant<int, 0>{}); [[fallthrough]];
-            default: break;
+        if constexpr (TPP / G == 8) {
+            switch (nf / G) {
+                case 8: grp2(integral_constant<int, 7>{}); [[fallthrough]];
+                case 7: grp2(integral_constant<int, 6>{}); [[fallthrough]];
+                case 6: grp2(integral_constant<int, 5>{}); [[fallthrough]];
+                case 5: grp2(integral_constant<int, 4>{}); [[fallthrough]];
+                case 4: grp2(integral_constant<int, 3>{}); [[fallthrough]];
+                case 3: grp2(integral_constant<int, 2>{}); [[fallthrough]];
+                case 2: grp2(integral_constant<int, 1>{}); [[fallthrough]];
+                case 1: grp2(integral_constant<int, 0>{}); [[fallthrough]];
+                default: break;
+            }
+        } else {
+            switch (nf / G) {
+                case 16: grp2(integral_constant<int, 15>{}); [[fallthrough]];
+                case 15: grp2(integral_constant<int, 14>{}); [[fallthrough]];
+                case 14: grp2(integral_constant<int, 13>{}); [[fallthrough]];
+                case 13: grp2(integral_constant<int, 12>{}); [[fallthrough]];
+                case 12: grp2(integral_constant<int, 11>{}); [[fallthrough]];
+                case 11: grp2(integral_constant<int, 10>{}); [[fallthrough]];
+                case 10: grp2(integral_constant<int, 9>{}); [[fallthrough]];
+                case 9: grp2(integral_constant<int, 8>{}); [[fallthrough]];
+                case 8: grp2(integral_constant<int, 7>{}); [[fallthrough]];
+                case 7: grp2(integral_constant<int, 6>{}); [[fallthrough]];
+                case 6: grp2(integral_constant<int, 5>{}); [[fallthrough]];
+                case 5: grp2(integral_constant<int, 4>{}); [[fallthrough]];
+                case 4: grp2(integral_constant<int, 3>{}); [[fallthrough]];
+                case 3: grp2(integral_constant<int, 2>{}); [[fallthrough]];
+                case 2: grp2(integral_constant<int, 1>{}); [[fallthrough]];
+                case 1: grp2(integral_constant<int, 0>{}); [[fallthrough]];
+                default: break;
+            }
         }
         return;
     }
@@ -722,7 +750,7 @@ __global__ void __launch_bounds__(NT, (V & V_LB2) ? 2 : 1) dn_kernel(const Chunk
                                                    const block_q8_1_mmq* __restrict__ xq, const int total_rows,
                                                    float* __restrict__ dst, Rec* __restrict__ rec) {
     static_assert((SB == 2 || SB == 4) && NT % 32 == 0 && TPP % G == 0, "");
-    constexpr bool TIME = V & V_TIME, NOSYNC = V & V_NOSYNC, DUFF = V & V_DUFF, DYT = V & V_DYT;
+    constexpr bool TIME = V & V_TIME, NOSYNC = V & V_NOSYNC, DUFF = V & V_DUFF, DYT = V & V_DYT, TAILD = V & V_TAILD;
     constexpr int NW = NT / 32, WPS = 9 * SB / 2, S = WPS | 1, NSTEP = NB / SB, PIECES = DN_ROWS / NT;
     constexpr int KI = (NT + 3 * NW - 1) / (3 * NW);
     constexpr int AW = 9 * SB;
@@ -831,8 +859,8 @@ __global__ void __launch_bounds__(NT, (V & V_LB2) ? 2 : 1) dn_kernel(const Chunk
             }
 #pragma unroll 1
             for (int p = 0; p < SB / 2; ++p) {
-                blk_compute<NT, TPP, SB, G, 0, CHN, DUFF, DYT>(cw, p, tab, act_s, dy_s, nt, acc);
-                blk_compute<NT, TPP, SB, G, 1, CHN, DUFF, DYT>(cw, p, tab, act_s, dy_s, nt, acc);
+                blk_compute<NT, TPP, SB, G, 0, CHN, DUFF, DYT, TAILD>(cw, p, tab, act_s, dy_s, nt, acc);
+                blk_compute<NT, TPP, SB, G, 1, CHN, DUFF, DYT, TAILD>(cw, p, tab, act_s, dy_s, nt, acc);
             }
             if constexpr (TIME) cC += clock64() - mk;
         }
@@ -1141,7 +1169,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> shards, models = { "ln0.5", "ln1.0", "flat32" };
     std::vector<int> layers = { 2, 0, 17, 21 }, ts = { 1536 };
     int reps = 15;
-    bool prod_only = false, v2_only = false, v2_round2 = false;
+    bool prod_only = false, v2_only = false, v2_round2 = false, t16_only = false;
     std::string csvdir;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1158,8 +1186,9 @@ int main(int argc, char** argv) {
         else if (a == "--reps") reps = std::atoi(next());
         else if (a == "--arms") {
             const std::string v = next();
-            prod_only = v == "prod";
+            prod_only = v == "prod";   // --arms prod: only the production entry points
             v2_only = v == "v2" || v == "v2r2";
+            t16_only = v == "t16";
             v2_round2 = v == "v2r2";
         }
         else if (a == "--csv") csvdir = next();
@@ -1229,6 +1258,50 @@ int main(int argc, char** argv) {
         else if (fmt == nib::kIQ3_XXS) { GU_ARMS(32, 1, 4, nib::kIQ3_XXS) }
         else if (fmt == nib::kIQ3_S) { GU_ARMS(32, 2, 4, nib::kIQ3_S) }
 #undef GU_ARMS
+        return v;
+    };
+    // W13: the 16-token tiers (production's at u < 25 / 18 / 18 for the 4-bit gate/up, u < 20 for the IQ4_NL down)
+    auto gu16_arms = [&](int fmt) {
+        std::vector<Arm> v;
+        auto add = [&](const char* name, Launch go, bool exact) { v.push_back({ name, std::move(go), exact }); };
+        if (fmt == nib::kIQ2_S) { add("16 copy V0", gu_launch<16, 0, 2, nib::kIQ2_S, 0>(), true); gu_attr<16, 0, 2, nib::kIQ2_S, 0>(v.back().regs, v.back().smem, v.back().ctas); }
+        if (fmt == nib::kIQ2_S) { add("16 copy TIME", gu_launch<16, 0, 2, nib::kIQ2_S, V_TIME>(), true); gu_attr<16, 0, 2, nib::kIQ2_S, V_TIME>(v.back().regs, v.back().smem, v.back().ctas); }
+        if (fmt == nib::kIQ2_S) { add("16 abl MACONLY", gu_launch<16, 0, 2, nib::kIQ2_S, V_NOLOAD | V_NOSYNC | V_NODEC>(), false); gu_attr<16, 0, 2, nib::kIQ2_S, V_NOLOAD | V_NOSYNC | V_NODEC>(v.back().regs, v.back().smem, v.back().ctas); }
+        if (fmt == nib::kIQ2_S) { add("16 abl NODEC", gu_launch<16, 0, 2, nib::kIQ2_S, V_NODEC>(), false); gu_attr<16, 0, 2, nib::kIQ2_S, V_NODEC>(v.back().regs, v.back().smem, v.back().ctas); }
+        if (fmt == nib::kIQ2_S) { add("16 fix ST16 TAIL DUFF DYT", gu_launch<16, 0, 2, nib::kIQ2_S, V_ST16 | V_TAIL | V_DUFF | V_DYT>(), true); gu_attr<16, 0, 2, nib::kIQ2_S, V_ST16 | V_TAIL | V_DUFF | V_DYT>(v.back().regs, v.back().smem, v.back().ctas); }
+        if (fmt == nib::kIQ2_S) { add("16 fix ALL", gu_launch<16, 0, 2, nib::kIQ2_S, V_ST16 | V_TAIL | V_DUFF | V_DYT>(), true); gu_attr<16, 0, 2, nib::kIQ2_S, V_ST16 | V_TAIL | V_DUFF | V_DYT>(v.back().regs, v.back().smem, v.back().ctas); }
+        if (fmt == nib::kIQ2_S) { add("16 fix ALL (other CVT)", gu_launch<16, 1, 2, nib::kIQ2_S, V_ST16 | V_TAIL | V_DUFF | V_DYT>(), true); gu_attr<16, 1, 2, nib::kIQ2_S, V_ST16 | V_TAIL | V_DUFF | V_DYT>(v.back().regs, v.back().smem, v.back().ctas); }
+        if (fmt == nib::kIQ3_XXS) { add("16 copy V0", gu_launch<16, 1, 2, nib::kIQ3_XXS, 0>(), true); gu_attr<16, 1, 2, nib::kIQ3_XXS, 0>(v.back().regs, v.back().smem, v.back().ctas); }
+        if (fmt == nib::kIQ3_XXS) { add("16 copy TIME", gu_launch<16, 1, 2, nib::kIQ3_XXS, V_TIME>(), true); gu_attr<16, 1, 2, nib::kIQ3_XXS, V_TIME>(v.back().regs, v.back().smem, v.back().ctas); }
+        if (fmt == nib::kIQ3_XXS) { add("16 abl MACONLY", gu_launch<16, 1, 2, nib::kIQ3_XXS, V_NOLOAD | V_NOSYNC | V_NODEC>(), false); gu_attr<16, 1, 2, nib::kIQ3_XXS, V_NOLOAD | V_NOSYNC | V_NODEC>(v.back().regs, v.back().smem, v.back().ctas); }
+        if (fmt == nib::kIQ3_XXS) { add("16 abl NODEC", gu_launch<16, 1, 2, nib::kIQ3_XXS, V_NODEC>(), false); gu_attr<16, 1, 2, nib::kIQ3_XXS, V_NODEC>(v.back().regs, v.back().smem, v.back().ctas); }
+        if (fmt == nib::kIQ3_XXS) { add("16 fix ST16 TAIL DUFF DYT", gu_launch<16, 1, 2, nib::kIQ3_XXS, V_ST16 | V_TAIL | V_DUFF | V_DYT>(), true); gu_attr<16, 1, 2, nib::kIQ3_XXS, V_ST16 | V_TAIL | V_DUFF | V_DYT>(v.back().regs, v.back().smem, v.back().ctas); }
+        if (fmt == nib::kIQ3_XXS) { add("16 fix ALL", gu_launch<16, 1, 2, nib::kIQ3_XXS, V_ST16 | V_TAIL | V_DUFF | V_DECF | V_DYT>(), true); gu_attr<16, 1, 2, nib::kIQ3_XXS, V_ST16 | V_TAIL | V_DUFF | V_DECF | V_DYT>(v.back().regs, v.back().smem, v.back().ctas); }
+        if (fmt == nib::kIQ3_XXS) { add("16 fix ALL (other CVT)", gu_launch<16, 2, 2, nib::kIQ3_XXS, V_ST16 | V_TAIL | V_DUFF | V_DECF | V_DYT>(), true); gu_attr<16, 2, 2, nib::kIQ3_XXS, V_ST16 | V_TAIL | V_DUFF | V_DECF | V_DYT>(v.back().regs, v.back().smem, v.back().ctas); }
+        if (fmt == nib::kIQ3_S) { add("16 fix ALL (other CVT)", gu_launch<16, 1, 2, nib::kIQ3_S, V_ST16 | V_TAIL | V_DUFF | V_DECF | V_DYT>(), true); gu_attr<16, 1, 2, nib::kIQ3_S, V_ST16 | V_TAIL | V_DUFF | V_DECF | V_DYT>(v.back().regs, v.back().smem, v.back().ctas); }
+        if (fmt == nib::kIQ3_S) { add("16 copy V0", gu_launch<16, 2, 2, nib::kIQ3_S, 0>(), true); gu_attr<16, 2, 2, nib::kIQ3_S, 0>(v.back().regs, v.back().smem, v.back().ctas); }
+        if (fmt == nib::kIQ3_S) { add("16 copy TIME", gu_launch<16, 2, 2, nib::kIQ3_S, V_TIME>(), true); gu_attr<16, 2, 2, nib::kIQ3_S, V_TIME>(v.back().regs, v.back().smem, v.back().ctas); }
+        if (fmt == nib::kIQ3_S) { add("16 abl MACONLY", gu_launch<16, 2, 2, nib::kIQ3_S, V_NOLOAD | V_NOSYNC | V_NODEC>(), false); gu_attr<16, 2, 2, nib::kIQ3_S, V_NOLOAD | V_NOSYNC | V_NODEC>(v.back().regs, v.back().smem, v.back().ctas); }
+        if (fmt == nib::kIQ3_S) { add("16 abl NODEC", gu_launch<16, 2, 2, nib::kIQ3_S, V_NODEC>(), false); gu_attr<16, 2, 2, nib::kIQ3_S, V_NODEC>(v.back().regs, v.back().smem, v.back().ctas); }
+        if (fmt == nib::kIQ3_S) { add("16 fix ST16 TAIL DUFF DYT", gu_launch<16, 2, 2, nib::kIQ3_S, V_ST16 | V_TAIL | V_DUFF | V_DECF | V_DYT>(), true); gu_attr<16, 2, 2, nib::kIQ3_S, V_ST16 | V_TAIL | V_DUFF | V_DECF | V_DYT>(v.back().regs, v.back().smem, v.back().ctas); }
+        if (fmt == nib::kIQ3_S) { add("16 fix ALL", gu_launch<16, 2, 2, nib::kIQ3_S, V_ST16 | V_TAIL | V_DUFF | V_DECF | V_DYT>(), true); gu_attr<16, 2, 2, nib::kIQ3_S, V_ST16 | V_TAIL | V_DUFF | V_DECF | V_DYT>(v.back().regs, v.back().smem, v.back().ctas); }
+        return v;
+    };
+    auto dn16_arms = [&]() {
+        std::vector<Arm> v;
+        // production's IQ4_NL tier below u 20: 256 x 16, 4-block steps, G 2, one chain
+        v.push_back({ "16 copy V0", dn_launch<256, 16, 4, 2, 1, 0>(), true }); dn_attr<256, 16, 4, 2, 1, 0>(v.back().regs, v.back().smem, v.back().ctas);
+        v.push_back({ "16 copy TIME", dn_launch<256, 16, 4, 2, 1, V_TIME>(), true }); dn_attr<256, 16, 4, 2, 1, V_TIME>(v.back().regs, v.back().smem, v.back().ctas);
+        v.push_back({ "16 abl NOSYNC", dn_launch<256, 16, 4, 2, 1, V_NOSYNC>(), false }); dn_attr<256, 16, 4, 2, 1, V_NOSYNC>(v.back().regs, v.back().smem, v.back().ctas);
+        v.push_back({ "16 fix DUFF", dn_launch<256, 16, 4, 2, 1, V_DUFF>(), true }); dn_attr<256, 16, 4, 2, 1, V_DUFF>(v.back().regs, v.back().smem, v.back().ctas);
+        v.push_back({ "16 fix DYT", dn_launch<256, 16, 4, 2, 1, V_DYT>(), true }); dn_attr<256, 16, 4, 2, 1, V_DYT>(v.back().regs, v.back().smem, v.back().ctas);
+        v.push_back({ "16 fix TAILD", dn_launch<256, 16, 4, 2, 1, V_TAILD>(), true }); dn_attr<256, 16, 4, 2, 1, V_TAILD>(v.back().regs, v.back().smem, v.back().ctas);
+        v.push_back({ "16 fix DUFF DYT", dn_launch<256, 16, 4, 2, 1, V_DUFF | V_DYT>(), true }); dn_attr<256, 16, 4, 2, 1, V_DUFF | V_DYT>(v.back().regs, v.back().smem, v.back().ctas);
+        v.push_back({ "16 fix DUFF DYT TAILD", dn_launch<256, 16, 4, 2, 1, V_DUFF | V_DYT | V_TAILD>(), true }); dn_attr<256, 16, 4, 2, 1, V_DUFF | V_DYT | V_TAILD>(v.back().regs, v.back().smem, v.back().ctas);
+        v.push_back({ "16 fix DUFF DYT TAILD LB2", dn_launch<256, 16, 4, 2, 1, V_DUFF | V_DYT | V_TAILD | V_LB2>(), true }); dn_attr<256, 16, 4, 2, 1, V_DUFF | V_DYT | V_TAILD | V_LB2>(v.back().regs, v.back().smem, v.back().ctas);
+        // the 32-token tier with the one-token tail (production's tier at u >= 20)
+        v.push_back({ "32 fix DUFF DYT TAILD", dn_launch<256, 32, 2, 2, 1, V_DUFF | V_DYT | V_TAILD>(), true }); dn_attr<256, 32, 2, 2, 1, V_DUFF | V_DYT | V_TAILD>(v.back().regs, v.back().smem, v.back().ctas);
+        v.push_back({ "32 prod DUFF DYT", dn_launch<256, 32, 2, 2, 1, V_DUFF | V_DYT>(), true }); dn_attr<256, 32, 2, 2, 1, V_DUFF | V_DYT>(v.back().regs, v.back().smem, v.back().ctas);
         return v;
     };
     auto dn_arms = [&]() {
@@ -1361,8 +1434,11 @@ int main(int argc, char** argv) {
         int64_t* dxn = nullptr;
         CK(cudaMalloc(&dxp, kNE * 8));
         CK(cudaMalloc(&dxn, kNE * 8));
-        std::vector<Arm> GA = (Y.V.on && !prod_only) ? (v2_only ? v2_gu_arms(gt) : gu_arms(gt)) : std::vector<Arm>{};
-        std::vector<Arm> DA = (dt == GGML_TYPE_IQ4_NL && !prod_only) ? (v2_only ? v2_dn_arms() : dn_arms()) : std::vector<Arm>{};
+        std::vector<Arm> GA = (Y.V.on && !prod_only) ? (t16_only ? gu16_arms(gt) : v2_only ? v2_gu_arms(gt) : gu_arms(gt))
+                                                     : std::vector<Arm>{};
+        std::vector<Arm> DA = (dt == GGML_TYPE_IQ4_NL && !prod_only)
+                                  ? (t16_only ? dn16_arms() : v2_only ? v2_dn_arms() : dn_arms())
+                                  : std::vector<Arm>{};
         if (v2_round2) {   // round 2: the one-row kernels, the tier crossover, two-row references and phases only
             const char* keep[] = { "v2 R1 staged (=FAST)", "v2 R1 CD LB4", "v2 R1 CD LB3", "v2 R2 CD LB3", "v2 R2 CD LB3 CH1",
                                    "v2 R2 QG CD LB3", "v2 R2 TIME", "v2 R2 QG TIME", "v2 R2 abl NODEC", "v2 R2 abl NOSTAGE",
@@ -1549,6 +1625,41 @@ int main(int argc, char** argv) {
                                 same ? "memcmp equal" : "DIFFER");
                     if (!same) ++fails;
                 }
+                // STRATA_WS_V3=1 (ws::set_v3(1)): the 16-token tiers with the 32-token kernels' recipe (W13), against the
+                // default kernels - gate/up below the 32-token tier's u and the IQ4_NL down below u 20
+                {
+                    const bool t16_gu = gt == nib::kIQ2_S ? u < 25.0 : u < 18.0, t16_dn = dt == GGML_TYPE_IQ4_NL && u < 20.0 && u >= 5.0;
+                    if (Y.V.on && gu_ok_n) {
+                        ws::Layer Lf = Ln;
+                        Lf.gu = GUx;
+                        CK(cudaMemset(GUx, 0xFF, gub));
+                        ws::set_v3(1);
+                        const bool ok = ws::gate_up(Lf, nullptr);
+                        ws::set_v3(0);
+                        CK(cudaDeviceSynchronize());
+                        CK(cudaGetLastError());
+                        CK(cudaMemcpy(tmp.data(), GUx, gub, cudaMemcpyDeviceToHost));
+                        const bool same = ok && std::memcmp(tmp.data(), refgu.data(), gub) == 0;
+                        std::printf("CHECK production gate/up 4-bit V3 (%s) vs default: %s\n",
+                                    t16_gu ? "the 16-token tier's fast kernel" : "not the V3 tier: default kernel",
+                                    same ? "memcmp equal" : "DIFFER");
+                        if (!same) ++fails;
+                    }
+                    ws::Layer Ldf = Lg;
+                    Ldf.dm = DMx;
+                    CK(cudaMemset(DMx, 0xFF, dmb));
+                    ws::set_v3(1);
+                    ws::down(Ldf, nullptr);
+                    ws::set_v3(0);
+                    CK(cudaDeviceSynchronize());
+                    CK(cudaGetLastError());
+                    CK(cudaMemcpy(tmp.data(), DMx, dmb, cudaMemcpyDeviceToHost));
+                    const bool same = std::memcmp(tmp.data(), refdm.data(), dmb) == 0;
+                    std::printf("CHECK production down V3 (%s) vs default: %s\n",
+                                t16_dn ? "the 16-token tier's fast kernel" : "not the IQ4_NL V3 tier: default kernel",
+                                same ? "memcmp equal" : "DIFFER");
+                    if (!same) ++fails;
+                }
                 Args A{ dch, (const char*) Ln.w, Ln.xoff, Lg.down_off, (const block_q8_1_mmq*) xq, (const block_q8_1_mmq*) HQ, R,
                         GUx, DMx, drec, (int64_t) nch };
                 Args AD = A;
@@ -1595,6 +1706,16 @@ int main(int argc, char** argv) {
                     arms.push_back({ "PROD gate/up 4-bit V2", [&] { ws::set_v2(1); ws::gate_up(Ln, nullptr); ws::set_v2(0); },
                                      mac_gu, {} });
                 arms.push_back({ "PROD down V2", [&] { ws::set_v2(1); ws::down(Lg, nullptr); ws::set_v2(0); }, mac_dn, {} });
+                if (Y.V.on)
+                    arms.push_back({ "PROD gate/up 4-bit V3", [&] { ws::set_v3(1); ws::gate_up(Ln, nullptr); ws::set_v3(0); },
+                                     mac_gu, {} });
+                arms.push_back({ "PROD down V3", [&] { ws::set_v3(1); ws::down(Lg, nullptr); ws::set_v3(0); }, mac_dn, {} });
+                // W13: FAST + V3 together = what STRATA_WS_FAST=1 STRATA_WS_V3=1 does in the engine
+                if (Y.V.on)
+                    arms.push_back({ "PROD gate/up 4-bit FAST+V3", [&] { ws::set_fast(1); ws::set_v3(1); ws::gate_up(Ln, nullptr);
+                                                                      ws::set_v3(0); ws::set_fast(0); }, mac_gu, {} });
+                arms.push_back({ "PROD down FAST+V3", [&] { ws::set_fast(1); ws::set_v3(1); ws::down(Lg, nullptr);
+                                                           ws::set_v3(0); ws::set_fast(0); }, mac_dn, {} });
                 for (auto& a : GA) arms.push_back({ "gu " + a.name, [&a, &A] { a.go(A); }, mac_gu, {} });
                 for (auto& a : DA) arms.push_back({ "dn " + a.name, [&a, &AD] { a.go(AD); }, mac_dn, {} });
                 // production again at the end of the round: position / clock drift within a round
