@@ -3465,6 +3465,8 @@ int main(int argc, char** argv) {
             c0.lkc_adapt = r.p(0.5) ? 0 : (r.p(0.5) ? 24 : 40);
             c0.lkc_adapt_acc = r.p(0.3) ? (r.p(0.5) ? 90 : 60) : 0;
             c0.lkc_adapt_warm = r.p(0.5) ? 0 : 8;
+            c0.lkc_rate = r.p(0.5) ? 0 : (r.p(0.5) ? 25 : 60);   // the copy-rate test, same restriction
+            c0.lkc_rate_warm = r.p(0.5) ? 0 : 16;
             rc.w.lkc_rate = r.p(0.2) ? 0.95 : 0.5;
             if (rc.w.lookup_t <= 0) rc.w.lookup_t = 4;
             for (size_t i = 0; i < rc.w.lk.size(); ++i) rc.w.lk[i] = rc.w.lk[i] || r.p(0.05);

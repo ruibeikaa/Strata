@@ -416,6 +416,11 @@ bool Sched::lkc_tail_ok(int match) {
     if (ok && c_.lkc_adapt_acc > 0 && st_.lkc_tokens >= c_.lkc_adapt_warm &&
         st_.lkc_ok * 100 < (int64_t) c_.lkc_adapt_acc * st_.lkc_tokens)
         ok = false;
+    if (ok && c_.lkc_rate > 0 && st_.lkc_probe_n >= c_.lkc_rate_warm &&
+        st_.lkc_probe_hit * 100 < (int64_t) c_.lkc_rate * st_.lkc_probe_n) {
+        ok = false;
+        ++st_.lkc_rate_stop;
+    }
     if (!ok) ++st_.lkc_adapt_stop;
     return ok;
 }
@@ -457,6 +462,8 @@ void Sched::lkc_extend(PlIo& io, PW& w, bool pushed, const int32_t* oc, int idx_
     Lookup L;
     ++st_.lkc_lookups;
     const int k = io.lookup_after(pend, n, room, L);
+    ++st_.lkc_probe_n;                          // the copy-rate test's denominator: every window this run decided
+    if (k > 0 && L.match >= std::max(c_.lkc_m, c_.lkc_adapt)) ++st_.lkc_probe_hit;
     if (k <= 0 || !lkc_tail_ok(L.match)) return;
     int take = std::min(k, room);
     if (!(c_.lkc_div > 0 && L.match >= c_.lkc_div)) {
