@@ -362,11 +362,13 @@ static const char* pipe_dbg_env(const char* name) {
 // taken where its match is that long, and - once the request has offered 8 tail tokens - only while its running tail
 // acceptance stays at or above the floor.  Without it a request whose matches are short or whose continuation is wrong
 // pays for the extra rows and gets nothing back (LKCHAIN.md: real_edit_abl12, -9..-12%).  -1 in the struct: not given.
-struct LkcSettings { bool set = false; int k = 0, m = 8, div = 0, fresh = 0, pol = 0, rows = 0, adapt = -1, adapt_acc = -1; };
+struct LkcSettings { bool set = false; int k = 0, m = 8, div = 0, fresh = 0, pol = 0, rows = 0, adapt = -1, adapt_acc = -1,
+                        adapt_warm = -1; };
 static bool lkc_parse(const char* v, LkcSettings& o) {
     if (v == nullptr) return false;
-    int x[8] = {0, 8, 0, 0, 0, 0, -1, -1};
-    const int n = std::sscanf(v, "%d,%d,%d,%d,%d,%d,%d,%d", &x[0], &x[1], &x[2], &x[3], &x[4], &x[5], &x[6], &x[7]);
+    int x[9] = {0, 8, 0, 0, 0, 0, -1, -1, -1};
+    const int n = std::sscanf(v, "%d,%d,%d,%d,%d,%d,%d,%d,%d", &x[0], &x[1], &x[2], &x[3], &x[4], &x[5], &x[6], &x[7],
+                             &x[8]);
     if (n < 1) return false;
     o.set = true;
     o.k = std::clamp(x[0], 0, 7);
@@ -377,6 +379,7 @@ static bool lkc_parse(const char* v, LkcSettings& o) {
     o.rows = std::clamp(x[5], 0, 8);
     o.adapt = n >= 7 ? std::max(0, x[6]) : -1;
     o.adapt_acc = n >= 8 ? std::clamp(x[7], 0, 100) : -1;
+    o.adapt_warm = n >= 9 ? std::clamp(x[8], 0, 64) : -1;
     return true;
 }
 // the default of the two ADAPT numbers, for a STRATA_LKCHAIN / STRATA_LKCHAIN_FILE that does not carry fields 7-8
@@ -15949,7 +15952,7 @@ int main(int argc, char** argv) {
                     lkc_adapt_env(adapt, adapt_acc);
                     cfg.lkc_adapt = lk.adapt >= 0 ? lk.adapt : adapt;
                     cfg.lkc_adapt_acc = lk.adapt_acc >= 0 ? lk.adapt_acc : adapt_acc;
-                    cfg.lkc_adapt_warm = 8;
+                    cfg.lkc_adapt_warm = lk.adapt_warm >= 0 ? lk.adapt_warm : 8;
                     cfg.S_sfx = std::min(g_lkc_s_sfx, S);
                 } else if (g_lkc_s_sfx > 0) {
                     cfg.S_sfx = std::min(g_lkc_s_sfx, S);   // (N2: today's lookup windows, no tails)
