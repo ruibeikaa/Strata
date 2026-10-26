@@ -434,11 +434,15 @@ static const char* pipe_dbg_env(const char* name) {
 // 6 keeps every window as wide as today's, the bit-exact setting on sm_60 - LKCHAIN.md).  Set at all (even "0"), it raises the verify window to
 // kVerifyMaxT (8) rows for the tails; plain lookup windows keep today's size.  STRATA_LKCHAIN_FILE=<file>: the same five
 // numbers re-read at every request (an A/B on one server).  Only drafts change: the verified text is the serial loop's.
-struct LkcSettings { bool set = false; int k = 0, m = 8, div = 0, fresh = 0, pol = 0, rows = 0; };
+// ADAPT (fields 7-8, or STRATA_LKCHAIN_ADAPT="<min match>[,<tail acceptance floor in per cent>]"): a lookup tail is only
+// taken where its match is that long, and - once the request has offered 8 tail tokens - only while its running tail
+// acceptance stays at or above the floor.  Without it a request whose matches are short or whose continuation is wrong
+// pays for the extra rows and gets nothing back (LKCHAIN.md: real_edit_abl12, -9..-12%).  -1 in the struct: not given.
+struct LkcSettings { bool set = false; int k = 0, m = 8, div = 0, fresh = 0, pol = 0, rows = 0, adapt = -1, adapt_acc = -1; };
 static bool lkc_parse(const char* v, LkcSettings& o) {
     if (v == nullptr) return false;
-    int x[6] = {0, 8, 0, 0, 0, 0};
-    const int n = std::sscanf(v, "%d,%d,%d,%d,%d,%d", &x[0], &x[1], &x[2], &x[3], &x[4], &x[5]);
+    int x[8] = {0, 8, 0, 0, 0, 0, -1, -1};
+    const int n = std::sscanf(v, "%d,%d,%d,%d,%d,%d,%d,%d", &x[0], &x[1], &x[2], &x[3], &x[4], &x[5], &x[6], &x[7]);
     if (n < 1) return false;
     o.set = true;
     o.k = std::clamp(x[0], 0, 7);
@@ -447,7 +451,22 @@ static bool lkc_parse(const char* v, LkcSettings& o) {
     o.fresh = std::max(0, x[3]);
     o.pol = x[4] != 0 ? 1 : 0;
     o.rows = std::clamp(x[5], 0, 8);
+    o.adapt = n >= 7 ? std::max(0, x[6]) : -1;
+    o.adapt_acc = n >= 8 ? std::clamp(x[7], 0, 100) : -1;
     return true;
+}
+// the default of the two ADAPT numbers, for a STRATA_LKCHAIN / STRATA_LKCHAIN_FILE that does not carry fields 7-8
+static void lkc_adapt_env(int& match, int& acc) {
+    static const int* v = [] {
+        static int a[2] = {0, 0};
+        if (const char* e = std::getenv("STRATA_LKCHAIN_ADAPT")) {
+            int m = 0, c = 0;
+            if (std::sscanf(e, "%d,%d", &m, &c) >= 1) { a[0] = std::max(0, m); a[1] = std::clamp(c, 0, 100); }
+        }
+        return a;
+    }();
+    match = v[0];
+    acc = v[1];
 }
 static const LkcSettings& lkc_env() {
     static const LkcSettings s = [] { LkcSettings o; lkc_parse(std::getenv("STRATA_LKCHAIN"), o); return o; }();
@@ -3903,6 +3922,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: STRATA_LKCHAIN=%d,%d,%d,%d,%d: verify windows up to 8 rows (the MTP's %d, a "
                              "plain lookup window's %d)\n", lkc_env().k, lkc_env().m, lkc_env().div, lkc_env().fresh,
                      lkc_env().pol, o.mtp_max_t, g_lkc_s_sfx);
+        int am = 0, aa = 0;
+        lkc_adapt_env(am, aa);
+        if (am > 0 || aa > 0)
+            std::fprintf(stderr, "strata generate: STRATA_LKCHAIN_ADAPT=%d,%d: a tail is taken only where the lookup's "
+                                 "match is at least %d tokens%s\n", am, aa, am,
+                         aa > 0 ? " and the request's own tail acceptance (after 8 tail tokens) is at least that "
+                                  "many per cent" : "");
     }
     strata::core::layer_set_shared_early(!o.shared_late);
     if (!o.native_preset.empty()) {
@@ -16889,6 +16915,11 @@ int main(int argc, char** argv) {
                     cfg.lkc_fresh = lk.fresh;
                     cfg.lkc_policy = lk.pol != 0;
                     cfg.lkc_rows = lk.rows;
+                    int adapt = 0, adapt_acc = 0;
+                    lkc_adapt_env(adapt, adapt_acc);
+                    cfg.lkc_adapt = lk.adapt >= 0 ? lk.adapt : adapt;
+                    cfg.lkc_adapt_acc = lk.adapt_acc >= 0 ? lk.adapt_acc : adapt_acc;
+                    cfg.lkc_adapt_warm = 8;
                     cfg.S_sfx = std::min(g_lkc_s_sfx, S);
                 } else if (g_lkc_s_sfx > 0) {
                     cfg.S_sfx = std::min(g_lkc_s_sfx, S);   // (N2: today's lookup windows, no tails)
@@ -17313,6 +17344,10 @@ int main(int argc, char** argv) {
                                      (long long) st4.lkc_tokens, (long long) st4.lkc_reached, (long long) st4.lkc_ok,
                                      (long long) st4.lkc_cut, (long long) st4.lkc_div, (long long) st4.lkc_lkwin,
                                      (long long) st4.lkc_fresh);
+                    if (cfg.lkc_adapt > 0 || cfg.lkc_adapt_acc > 0)
+                        std::fprintf(stderr, "strata pipeline lookup chain adapt (match %d, acceptance %d per cent after "
+                                             "%d tail tokens): %lld tails not taken\n", cfg.lkc_adapt,
+                                     cfg.lkc_adapt_acc, cfg.lkc_adapt_warm, (long long) st4.lkc_adapt_stop);
                     std::fprintf(stderr, "strata pipeline depth3: held1 %lld windows %.2f ms | held2 %lld windows %.2f ms | C made "
                                          "%lld launched %lld on %lld doomed %lld | undo jobs %lld stage-waits %lld (%.1f ms) | slot "
                                          "waits %lld (%.1f ms) | restage %lld (%lld guesses) | chain waits %lld (%.1f ms) late %lld | "

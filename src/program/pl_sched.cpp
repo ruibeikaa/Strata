@@ -353,7 +353,8 @@ bool Sched::pick_lookup(PlIo& io, PW& w, const int32_t* chain0) {
     // draft below spec_min_p) may take a long match's continuation even when its first token differs
     bool against = false;
     if (L.tok[0] != chain0[0]) {
-        if (!(c_.lkc_fresh > 0 && w.T == 1 && L.match >= c_.lkc_fresh)) return true;
+        // (STRATA_LKCHAIN_ADAPT: a fresh window against the draft needs the longer of the two matches - a restriction)
+        if (!(c_.lkc_fresh > 0 && w.T == 1 && L.match >= std::max(c_.lkc_fresh, c_.lkc_adapt))) return true;
         against = true;
     }
     int t = 0;
@@ -399,6 +400,26 @@ float Sched::lkc_q(int match) {
     return match < 4 ? 0.5f : match < 8 ? 0.65f : match < 16 ? 0.85f : match < 32 ? 0.93f : 0.96f;
 }
 
+// STRATA_LKCHAIN_ADAPT: is a lookup tail worth the rows it adds?  A tail row costs about 6-8 ms and an accepted token
+// pays about 9-10 ms on this engine (LKCHAIN.md 4.3, DECODE-SCREEN.md 3), so a tail only pays where the lookup is
+// nearly always right.  Two tests, both restrictions - they never enable a tail that today's rule would not take:
+//   lkc_adapt      the lookup's match is at least this long (its first-token accuracy is accept.md 5's: 0.85 at 8-15,
+//                  0.93 at 16-31, 0.96 at 32+).  Below it the window keeps today's width and no tail is taken.
+//   lkc_adapt_acc  once the request has offered lkc_adapt_warm tail tokens, its running acceptance of them (accepted
+//                  tail tokens over offered ones) must stay at or above this many per cent; below it the rest of the
+//                  request takes no tails.  This is what a match length alone cannot see: a request whose matches are
+//                  long but whose continuation is wrong (LKCHAIN.md: real_edit_abl12, -9..-12%) stops paying for rows.
+bool Sched::lkc_tail_ok(int match) {
+    if (match < c_.lkc_m) return false;
+    bool ok = true;
+    if (c_.lkc_adapt > 0 && match < c_.lkc_adapt) ok = false;
+    if (ok && c_.lkc_adapt_acc > 0 && st_.lkc_tokens >= c_.lkc_adapt_warm &&
+        st_.lkc_ok * 100 < (int64_t) c_.lkc_adapt_acc * st_.lkc_tokens)
+        ok = false;
+    if (!ok) ++st_.lkc_adapt_stop;
+    return ok;
+}
+
 // the tokens not yet committed, in order: the oldest window's drafts (its row 0 is committed text already: the
 // verdict that made it emitted it), every later window's rows up to `w` (pushed: w is in win_; else w follows them).
 // -1: too many, or w not found
@@ -436,7 +457,7 @@ void Sched::lkc_extend(PlIo& io, PW& w, bool pushed, const int32_t* oc, int idx_
     Lookup L;
     ++st_.lkc_lookups;
     const int k = io.lookup_after(pend, n, room, L);
-    if (k <= 0 || L.match < c_.lkc_m) return;
+    if (k <= 0 || !lkc_tail_ok(L.match)) return;
     int take = std::min(k, room);
     if (!(c_.lkc_div > 0 && L.match >= c_.lkc_div)) {
         int j = 0;
@@ -476,7 +497,7 @@ bool Sched::lkc_lk_window(PlIo& io, PW& pred) {
     if (n < 1) return true;
     Lookup L;
     const int k = io.lookup_after(pend, n, c_.S, L);
-    if (k < 1 || L.match < c_.lkc_m) return true;
+    if (k < 1 || !lkc_tail_ok(L.match)) return true;
     float pa = 1.0f;
     for (int i = 0; i + 1 < pred.T; ++i) pa *= pred.prob[i];
     const float q = lkc_q(L.match);

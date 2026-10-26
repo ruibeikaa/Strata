@@ -72,6 +72,15 @@ struct Config {
                                    // (0: S).  6: today's widest window - on sm_60 a 7- or 8-row window does not compute
                                    // its rows bit for bit as a narrower one (LKCHAIN.md), so the text could change
     int S_sfx = 0;                 // a plain lookup window's rows at most (0: S) - today's S before lookup chaining
+    // STRATA_LKCHAIN_ADAPT: whether a tail (or a lookup-made window, or a fresh window taken against the drafter's
+    // first guess) is worth the rows it adds.  A window costs about 6-8 ms a row and pays about 9-10 ms a token
+    // (LKCHAIN.md 4.3, DECODE-SCREEN.md), so a tail only pays where the lookup is nearly always right: lkc_adapt is
+    // the shortest match that is taken (0: off, lkc_m alone applies), and lkc_adapt_acc the tail acceptance this
+    // request must have shown so far - in per cent, applied once lkc_adapt_warm tail tokens were offered (0: off).
+    // Without it a request whose short matches are usually wrong (a non-copy edit) pays for the rows and gets nothing.
+    int lkc_adapt = 0;
+    int lkc_adapt_acc = 0;
+    int lkc_adapt_warm = 8;
 
     int depth() const { return mode == Mode::B ? 3 : 2; }
     int ns() const { return mode == Mode::N2 ? 2 : slots > 0 ? slots : mode == Mode::B0 ? 3 : 4; }
@@ -223,6 +232,7 @@ struct Stats {
     // by a landed chain output that differed
     int64_t lkc_windows = 0, lkc_tokens = 0, lkc_reached = 0, lkc_ok = 0, lkc_div = 0, lkc_lkwin = 0, lkc_fresh = 0;
     int64_t lkc_cut = 0, lkc_lookups = 0;
+    int64_t lkc_adapt_stop = 0;      // tails not taken because of STRATA_LKCHAIN_ADAPT (match too short or acceptance low)
 };
 
 // The verdict cases as counted (a verdict can count under two: 5/6 also count their 1x/2/3)
@@ -326,6 +336,7 @@ private:
     void lkc_extend(PlIo& io, PW& w, bool pushed, const int32_t* oc, int idx_after, int k_landed);
     int lkc_pending(const PW& w, bool pushed, int32_t* out, int cap) const;
     bool lkc_lk_window(PlIo& io, PW& pred);
+    bool lkc_tail_ok(int match);
     static float lkc_q(int match);
     bool launch_chain(PlIo& io, const ChainReq& r);
     bool request_round(PlIo& io);
