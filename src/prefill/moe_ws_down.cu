@@ -443,11 +443,13 @@ __global__ void __launch_bounds__(NT, 1) dn_kernel(const Chunk* __restrict__ chu
 //   DUFF  a switch on the number of token pairs falls through the 16 unrolled pairs (a jump table) instead of a guard
 //         per pair and block
 //   DYT   dy as [block][token]: a pair's two dy in one LDS.64
-template <int NT, int TPP, int SB, int G, int PAR>
+// TAILD (W13): whole token pairs only, the last nt % G tokens one by one into their own sums - the same per-token
+// operations in the same order, so a pass of 15 tokens runs 15 tokens instead of 16
+template <int NT, int TPP, int SB, int G, int PAR, bool TAILD = false>
 __device__ __forceinline__ void blk_compute_fast(const int* __restrict__ cw, const int p, const uint32_t (&tab)[4],
                                                  const int (*act_s)[SB][16], const float* __restrict__ dyb, const int nt,
                                                  float (&acc)[TPP]) {
-    static_assert(TPP / G == 16 && G == 2, "the switch below: 16 token pairs");
+    static_assert((TPP / G == 16 || TPP / G == 8) && G == 2, "the switch below: 16 or 8 token pairs");
     const int b = 2 * p + PAR;   // block within the step
     int wv[16];
     float dx;
@@ -456,23 +458,57 @@ __device__ __forceinline__ void blk_compute_fast(const int* __restrict__ cw, con
         dx = load_blk<PAR>(cw, p, q);
         dec(q, tab, wv);
     }
+    // one token's 32-value block: the same int chain and epilogue dn_kernel has
+    auto one = [&](const int t, const float dy) {
+        const int4* a4 = (const int4*) act_s[t][b];
+        const int4 a0 = a4[0], a1 = a4[1], a2 = a4[2], a3 = a4[3];
+        int s0 = 0;
+        s0 = mad2(wv[0], a0.x, s0); s0 = mad2(wv[1], a0.y, s0); s0 = mad2(wv[2], a0.z, s0); s0 = mad2(wv[3], a0.w, s0);
+        s0 = mad2(wv[4], a1.x, s0); s0 = mad2(wv[5], a1.y, s0); s0 = mad2(wv[6], a1.z, s0); s0 = mad2(wv[7], a1.w, s0);
+        s0 = mad2(wv[8], a2.x, s0); s0 = mad2(wv[9], a2.y, s0); s0 = mad2(wv[10], a2.z, s0); s0 = mad2(wv[11], a2.w, s0);
+        s0 = mad2(wv[12], a3.x, s0); s0 = mad2(wv[13], a3.y, s0); s0 = mad2(wv[14], a3.z, s0); s0 = mad2(wv[15], a3.w, s0);
+        acc[t] = __fmaf_rn(__fmul_rn(dx, dy), __int2float_rn(s0), acc[t]);
+    };
     // pairs past nt's run on stale shared memory and are not written, as dn_kernel's
     auto grp = [&](auto K) {
         constexpr int t0 = decltype(K)::value * G;
         const float2 d2 = *(const float2*) &dyb[b * TPP + t0];
 #pragma unroll
-        for (int t = t0; t < t0 + G; ++t) {
-            const int4* a4 = (const int4*) act_s[t][b];
-            const int4 a0 = a4[0], a1 = a4[1], a2 = a4[2], a3 = a4[3];
-            int s0 = 0;
-            s0 = mad2(wv[0], a0.x, s0); s0 = mad2(wv[1], a0.y, s0); s0 = mad2(wv[2], a0.z, s0); s0 = mad2(wv[3], a0.w, s0);
-            s0 = mad2(wv[4], a1.x, s0); s0 = mad2(wv[5], a1.y, s0); s0 = mad2(wv[6], a1.z, s0); s0 = mad2(wv[7], a1.w, s0);
-            s0 = mad2(wv[8], a2.x, s0); s0 = mad2(wv[9], a2.y, s0); s0 = mad2(wv[10], a2.z, s0); s0 = mad2(wv[11], a2.w, s0);
-            s0 = mad2(wv[12], a3.x, s0); s0 = mad2(wv[13], a3.y, s0); s0 = mad2(wv[14], a3.z, s0); s0 = mad2(wv[15], a3.w, s0);
-            acc[t] = __fmaf_rn(__fmul_rn(dx, t == t0 ? d2.x : d2.y), __int2float_rn(s0), acc[t]);
-        }
+        for (int t = t0; t < t0 + G; ++t) one(t, t == t0 ? d2.x : d2.y);
     };
     using std::integral_constant;
+    if constexpr (TAILD) {
+        const int nf = nt & ~(G - 1);
+#pragma unroll
+        for (int k = 0; k < G - 1; ++k)
+            if (nf + k < nt) one(nf + k, dyb[b * TPP + nf + k]);
+        switch (nf / G) {
+            case 8: grp(integral_constant<int, 7>{}); [[fallthrough]];
+            case 7: grp(integral_constant<int, 6>{}); [[fallthrough]];
+            case 6: grp(integral_constant<int, 5>{}); [[fallthrough]];
+            case 5: grp(integral_constant<int, 4>{}); [[fallthrough]];
+            case 4: grp(integral_constant<int, 3>{}); [[fallthrough]];
+            case 3: grp(integral_constant<int, 2>{}); [[fallthrough]];
+            case 2: grp(integral_constant<int, 1>{}); [[fallthrough]];
+            case 1: grp(integral_constant<int, 0>{}); [[fallthrough]];
+            default: break;
+        }
+        return;
+    }
+    if constexpr (TPP / G == 8) {
+        switch ((nt + G - 1) / G) {
+            case 8: grp(integral_constant<int, 7>{}); [[fallthrough]];
+            case 7: grp(integral_constant<int, 6>{}); [[fallthrough]];
+            case 6: grp(integral_constant<int, 5>{}); [[fallthrough]];
+            case 5: grp(integral_constant<int, 4>{}); [[fallthrough]];
+            case 4: grp(integral_constant<int, 3>{}); [[fallthrough]];
+            case 3: grp(integral_constant<int, 2>{}); [[fallthrough]];
+            case 2: grp(integral_constant<int, 1>{}); [[fallthrough]];
+            case 1: grp(integral_constant<int, 0>{}); [[fallthrough]];
+            default: break;
+        }
+        return;
+    }
     switch ((nt + G - 1) / G) {
         case 16: grp(integral_constant<int, 15>{}); [[fallthrough]];
         case 15: grp(integral_constant<int, 14>{}); [[fallthrough]];
@@ -494,8 +530,9 @@ __device__ __forceinline__ void blk_compute_fast(const int* __restrict__ cw, con
     }
 }
 
-// dn_kernel with blk_compute_fast and dy_s as [SB][TPP]; everything else is dn_kernel's
-template <int NT, int TPP, int SB, int G>
+// dn_kernel with blk_compute_fast and dy_s as [SB][TPP]; everything else is dn_kernel's.
+// TAILD (W13): a pass runs whole token pairs plus the last token alone, so nt 15 runs 15 tokens, not 16
+template <int NT, int TPP, int SB, int G, bool TAILD = false>
 __global__ void __launch_bounds__(NT, 1) dn_kernel_fast(const Chunk* __restrict__ chunks, const char* __restrict__ w,
                                                         const int64_t* __restrict__ xoff, const int64_t xadd,
                                                         const block_q8_1_mmq* __restrict__ xq, const int total_rows,
@@ -596,8 +633,8 @@ __global__ void __launch_bounds__(NT, 1) dn_kernel_fast(const Chunk* __restrict_
             }
 #pragma unroll 1
             for (int p = 0; p < SB / 2; ++p) {
-                blk_compute_fast<NT, TPP, SB, G, 0>(cw, p, tab, act_s, dy_s, nt, acc);
-                blk_compute_fast<NT, TPP, SB, G, 1>(cw, p, tab, act_s, dy_s, nt, acc);
+                blk_compute_fast<NT, TPP, SB, G, 0, TAILD>(cw, p, tab, act_s, dy_s, nt, acc);
+                blk_compute_fast<NT, TPP, SB, G, 1, TAILD>(cw, p, tab, act_s, dy_s, nt, acc);
             }
         }
 #pragma unroll
@@ -621,8 +658,12 @@ void dn_q2_0(const Layer& L, double u, cudaStream_t s) {
 }
 
 // IQ4_NL: 128 rows x 8 tokens (4-block steps) below 5 rows per expert, 256 x 16 below 20, then 256 x 32 (2-block steps);
-// `fast` (STRATA_WS_FAST=1): the 256 x 32 tier runs dn_kernel_fast instead - the same Dm rows
-void dn_iq4_nl(const Layer& L, double u, cudaStream_t s, bool fast) {
+// `fast` (STRATA_WS_FAST=1): the 256 x 32 tier runs dn_kernel_fast instead - the same Dm rows.
+// `v3` (STRATA_WS_V3=1, W13): not used here - the 16-token tier's dn_kernel_fast (a one-token tail instead of a
+// 16th token) measured 9-12% SLOWER than dn_kernel at T 256-1536 and the 32-token tier's tail variant 2x too fast to be
+// doing the work (see campaign\dsw13-work\REPORT.md), so W13 ships the gate/up half of the switch only.
+void dn_iq4_nl(const Layer& L, double u, cudaStream_t s, bool fast, bool v3) {
+    (void) v3;
     if (L.nchunks <= 0) return;
     const char* w = (const char*) L.w;
     const block_q8_1_mmq* x = (const block_q8_1_mmq*) L.hq;

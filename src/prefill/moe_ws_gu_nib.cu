@@ -496,10 +496,10 @@ void go_v2(const Layer& L, cudaStream_t s) {
 // from lower u - the 32-token FAST kernel already beats the 16-token one at u 7.5 (IQ3_S, 3-6%) / 10 (IQ3_XXS) - and
 // for IQ2_S (u >= 17) and IQ3_S (u >= 16) the form whose threads read their row's item codes from global memory one
 // item ahead (no code staging: 8.5 KB of shared memory, four CTAs an SM for IQ3_S).
-void gu_nib(const Layer& L, double u, cudaStream_t s, bool fast_on, bool v2_on) {
+void gu_nib(const Layer& L, double u, cudaStream_t s, bool fast_on, bool v2_on, bool v3_on) {
     if (L.nchunks <= 0) return;
     const bool aligned = ((uintptr_t) L.xq & 15) == 0;
-    const bool f = fast_on && aligned, f2 = v2_on && aligned;
+    const bool f = fast_on && aligned, f2 = v2_on && aligned, f3 = v3_on && aligned;
     if (f2) {
         switch (L.gu_type) {
             case nb::kIQ2_S:
@@ -517,6 +517,35 @@ void gu_nib(const Layer& L, double u, cudaStream_t s, bool fast_on, bool v2_on) 
                 else if (u < 7.0) go(gu_kernel<16, 2, 2, nb::kIQ3_S>, L, s);
                 else if (u < 16.0) go_v2<2, nb::kIQ3_S, v2::TAIL | v2::DUFF | v2::DECF | v2::DYT>(L, s);
                 else go_v2<2, nb::kIQ3_S, v2::TAIL | v2::DUFF | v2::DECF | v2::DYT | v2::CD | v2::LB4>(L, s);
+                break;
+            default:
+                std::fprintf(stderr, "prefill ws: 4-bit gate/up type %d has no kernel\n", L.gu_type);
+                std::exit(1);
+        }
+        ck(cudaGetLastError(), "gate/up 4-bit");
+        return;
+    }
+    if (f3) {
+        switch (L.gu_type) {
+            case nb::kIQ2_S:
+                if (u < 6.0) go(gu_kernel<8, 1, 2, nb::kIQ2_S>, L, s);
+                else if (u < 25.0) go(fast::gu_kernel<16, 0, 2, nb::kIQ2_S, fast::TAIL | fast::DUFF | fast::DYT>, L, s);
+                else if (f) go(fast::gu_kernel<32, 1, 4, nb::kIQ2_S, fast::DUFF>, L, s);
+                else go(gu_kernel<32, 1, 4, nb::kIQ2_S>, L, s);
+                break;
+            case nb::kIQ3_XXS:
+                if (u < 4.0) go(gu_kernel<8, 2, 2, nb::kIQ3_XXS>, L, s);
+                else if (u < 18.0)
+                    go(fast::gu_kernel<16, 1, 2, nb::kIQ3_XXS, fast::TAIL | fast::DUFF | fast::DYT>, L, s);
+                else if (f) go(fast::gu_kernel<32, 1, 4, nb::kIQ3_XXS, fast::TAIL | fast::DYT>, L, s);
+                else go(gu_kernel<32, 1, 4, nb::kIQ3_XXS>, L, s);
+                break;
+            case nb::kIQ3_S:
+                if (u < 4.0) go(gu_kernel<8, 2, 2, nb::kIQ3_S>, L, s);
+                else if (u < 18.0)
+                    go(fast::gu_kernel<16, 2, 2, nb::kIQ3_S, fast::TAIL | fast::DUFF | fast::DECF | fast::DYT>, L, s);
+                else if (f) go(fast::gu_kernel<32, 2, 4, nb::kIQ3_S, fast::TAIL | fast::DUFF | fast::DECF | fast::DYT>, L, s);
+                else go(gu_kernel<32, 2, 4, nb::kIQ3_S>, L, s);
                 break;
             default:
                 std::fprintf(stderr, "prefill ws: 4-bit gate/up type %d has no kernel\n", L.gu_type);

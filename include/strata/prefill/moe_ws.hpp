@@ -36,6 +36,14 @@ void set_fast(int v);
 int v2();
 /// Benches and tests: 0 / 1 overrides v2(), -1 goes back to the environment.
 void set_v2(int v);
+/// STRATA_WS_V3=1 (opt-in, read once): the 16-token tier (gate/up on the 4-bit slots below the 32-token tier's
+/// thresholds, and the IQ4_NL down below u 20) runs STRATA_WS_FAST's kernels - 16-byte activation staging, a switch
+/// into the unrolled token groups, dy transposed, whole token pairs plus a one-token tail - so a pass of 15 rows runs
+/// 15 tokens instead of 16.  Every output's operations and their order are unchanged, so GU and Dm are the same bits.
+/// 0 (unset): the kernels as before.
+int v3();
+/// Benches and tests: 0 / 1 overrides v3(), -1 goes back to the environment.
+void set_v3(int v);
 /// The weight-stationary product of `ggml_type` beats the per-group MMQ at u rows per routed expert (the measured
 /// ratios, moe_ws.cu; u is clamped to the measured 2.5 .. 160).
 bool faster(int ggml_type, double u);
