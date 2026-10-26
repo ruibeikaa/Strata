@@ -1040,7 +1040,17 @@ bool Sched::verdict(PlIo& io) {
     PW W = win_[0];
     int a = 0;
     while (a < W.T - 1 && W.tok[a + 1] == outp_[a]) ++a;
-    {
+    // dsw23: the commit ends where the reply ends.  keep was a + 1 (the whole accepted window) while the emission loop
+    // stops at max_new or at a stop token, so the KV / GDN / indexer / PLE / MTP state - and end_, the session the next
+    // request matches - could run past the reply (a lookup chain's long tail left 2 tokens there, and the next request
+    // reused that phantom prefix: campaign/dsw17-work/REPORT.md 2).  Row k of the window sits at p + k and pick k is
+    // the token at p + k + 1, so covering the reply's last token takes ec + 1 rows: keep = min(a + 1, ec + 1).
+    const int ec = std::max(io.emit_count(W, a, outp_), 0);   // how many of the a + 1 picks the reply emits
+    if (const int keep = std::min(a + 1, ec + 1); keep < a + 1) {
+        ++st_.trim_commit;
+        a = keep - 1;
+    }
+    if (a >= 0) {
         PlOp m;
         m.op = Op::Commit;
         m.st = c_.n_front;
