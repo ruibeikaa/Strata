@@ -189,6 +189,17 @@ public:
     /// spec_min_p ends it), so the next launch need not wait for all of them.
     int chain_outputs_ready(std::string& err);
     bool chain_live() const { return chain_live_; }
+    /// STRATA_MTP_CATCHUP (opt-in): a window that never had a chain of its own gets its round anyway, so that every
+    /// committed cell of the drafter's K/V is written by a round (chain steps write the cells past a window with the
+    /// tokens they guessed, and only the next window's round puts the verified rows there).  The engine stages the
+    /// window's verified rows into catchup_buf(i) at its verdict; catchup_run is chain_launch's round half for those
+    /// rows (the same round graph, T = a + 1, the window's picks, no forced token, no chain step), run synchronously
+    /// while the drafter is idle, and it leaves the chain state (chain_live / chain_tok / chain_n) as it was.
+    float* catchup_buf(int i);   ///< staging slot i (0..kCatchupSlots-1) on the drafter's GPU, nullptr on failure
+    size_t catchup_row_bytes() const;   ///< one verified row's R in bytes (hc * n_embd floats)
+    bool catchup_run(int T, int a, int64_t p, const int32_t* tokens, int buf, std::string& err);
+    int catchups() const { return catchups_; }
+    static constexpr int kCatchupSlots = 64;
     const int32_t* chain_tok() const { return chain_tok_; }
     const float* chain_prob() const { return chain_prob_; }
     /// Opt-in (default off: a chain records nothing more than before): each chain_launch records source_done() on the
@@ -334,6 +345,9 @@ private:
     std::string rt_dir_;
     int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)
     int64_t prompt_len_ = 0;
+    float* cu_buf_ = nullptr;   // STRATA_MTP_CATCHUP: kCatchupSlots x max_t rows of R, allocated at the first use
+    size_t cu_stride_ = 0;      // floats a slot
+    int catchups_ = 0;
     const int32_t* rr_res_ = nullptr;
     float rr_margin_ = 0.0f;
     int rr_lo_ = 6, rr_hi_ = 9;

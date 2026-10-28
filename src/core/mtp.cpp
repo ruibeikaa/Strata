@@ -174,6 +174,7 @@ MtpDrafter::~MtpDrafter() {
     }
     if (owns_weights_ && experts_) cudaFree(experts_);
     if (state_arena_) cudaFree(state_arena_);
+    if (cu_buf_) cudaFree(cu_buf_);
     if (arena_) cudaFree(arena_);
     if (head_logits_) cudaFree(head_logits_);
     if (owns_draft_head_ && dhead_) {
@@ -2036,6 +2037,66 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
     chain_open_ = n_q < n_out;
     ms_draft += ms_since(t0);
     ++rounds;
+    return true;
+}
+
+// STRATA_MTP_CATCHUP: see the declaration in include/strata/core/mtp.hpp.
+size_t MtpDrafter::catchup_row_bytes() const {
+    return g_ ? (size_t) g_->hc * (size_t) g_->n_embd * sizeof(float) : 0;
+}
+
+float* MtpDrafter::catchup_buf(int i) {
+    if (i < 0 || i >= kCatchupSlots || g_ == nullptr || max_t_ <= 0) return nullptr;
+    if (cu_buf_ == nullptr) {
+        const OnDevice on_device(device_);
+        const size_t stride = (size_t) g_->hc * (size_t) g_->n_embd * (size_t) max_t_;
+        if (cudaMalloc((void**) &cu_buf_, stride * kCatchupSlots * sizeof(float)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            cu_buf_ = nullptr;
+            return nullptr;
+        }
+        cu_stride_ = stride;
+    }
+    return cu_buf_ + (size_t) i * cu_stride_;
+}
+
+bool MtpDrafter::catchup_run(int T, int a, int64_t p, const int32_t* tokens, int buf, std::string& err) {
+    const OnDevice on_device(device_);
+    if (chain_live_) { err = "mtp catchup: the drafter is not idle"; return false; }
+    if (!force_on_ || ev_chain_ == nullptr) { err = "mtp catchup: chains need prepare_chain"; return false; }
+    if (T < 1 || T > max_t_ || a != T - 1 || tokens == nullptr) { err = "mtp catchup: arguments out of range"; return false; }
+    if (round_exec_[T] == nullptr || window_R_ == nullptr) { err = "mtp catchup: no round graph"; return false; }
+    const float* cu = catchup_buf(buf);
+    if (cu == nullptr) { err = "mtp catchup: no staging slot"; return false; }
+    const Clock::time_point t0 = Clock::now();
+    const int64_t NH = g_->n_head;
+    // chain_launch's staging for the round rows, unchanged
+    auto put = [&](int row, int64_t cell) {
+        h_step_[row * 4 + 0] = (int32_t) cell;
+        h_step_[row * 4 + 1] = (int32_t) (cell + 1);
+        h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
+        h_step_[row * 4 + 3] = (int32_t) (cell + 1);
+        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) cell;
+    };
+    for (int t = 0; t < T; ++t) {
+        h_tok_[t] = tokens[t];
+        put(t, p + t);
+    }
+    put(2 * max_t_ - 1, p + a);   // output 0's cell: row a, as the window's own round has it
+    for (int j = 0; j < 16; ++j) h_force_[j] = -1;
+    h_row_[0] = a;
+    h_row_[1] = 0;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    draft_kv_log("catchup", p, a, T, 1, tokens);
+    if (cudaMemcpyAsync((void*) window_R_, (const void*) cu, (size_t) T * catchup_row_bytes(), cudaMemcpyDeviceToDevice,
+                        cs_) != cudaSuccess ||
+        cudaGraphLaunch(round_exec_[T], cs_) != cudaSuccess || cudaEventRecord(ev_chain_, cs_) != cudaSuccess ||
+        cudaEventSynchronize(ev_chain_) != cudaSuccess) {
+        err = std::string("mtp catchup: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    ms_draft += ms_since(t0);
+    ++catchups_;
     return true;
 }
 

@@ -16182,6 +16182,30 @@ int main(int argc, char** argv) {
                 io.f_lookup_chain_choose = [&](int t_mtp, double p_mtp, int k_av, int match) {
                     return policy.chain(t_mtp, p_mtp, k_av, match);
                 };
+                // STRATA_MTP_CATCHUP=1 (opt-in): a chain's round writes its source window's verified rows into the
+                // drafter's K/V; a window without a chain of its own (a T = 1 window, depth 3's room guard, a request a
+                // later verdict dropped - more of them with STRATA_LKCHAIN) kept what the previous chain's steps wrote
+                // there with guessed tokens, so the drafter's state depended on the windows' shapes and timing.  Each
+                // verdict stages the window's verified rows (R and picks); before a chain launches, every staged window
+                // older than its source gets its round now (MtpDrafter::catchup_run, the drafter idle) and the source's
+                // own entry is dropped (its chain writes it); what is left gets its round after the loop.  Every
+                // committed cell is then written by a round.  Unset: nothing staged, nothing run.
+                static const bool mtp_catchup = [] {
+                    const char* v = std::getenv("STRATA_MTP_CATCHUP");
+                    return v != nullptr && std::atoi(v) != 0;
+                }();
+                struct CuEntry { int seq; int64_t p; int a; int buf; int32_t tok[strata::pl::kMaxRows]; };
+                std::deque<CuEntry> cu_q;
+                std::vector<int> cu_free;
+                int64_t cu_dropped = 0;
+                static cudaStream_t cu_copy = nullptr;   // on the drafter's GPU: the verdict's staging copy
+                if (mtp_catchup)
+                    for (int i = strata::core::MtpDrafter::kCatchupSlots - 1; i >= 0; --i) cu_free.push_back(i);
+                auto cu_run = [&](const CuEntry& e) -> bool {
+                    if (!mtp.catchup_run(e.a + 1, e.a, e.p, e.tok, e.buf, err)) return false;
+                    cu_free.push_back(e.buf);
+                    return true;
+                };
                 io.f_exec = [&](const strata::pl::PlOp& op) -> bool {
                     using strata::pl::Op;
                     switch (op.op) {
@@ -16261,6 +16285,16 @@ int main(int argc, char** argv) {
                                 if (mtp.chain_poll(err) < 0) return false;
                             return true;
                         case Op::ChainLaunch:
+                            if (mtp_catchup) {   // the windows before this chain's source that had none of their own
+                                while (!cu_q.empty() && cu_q.front().seq < op.seq) {
+                                    if (!cu_run(cu_q.front())) return false;
+                                    cu_q.pop_front();
+                                }
+                                if (!cu_q.empty() && cu_q.front().seq == op.seq) {   // this chain's round writes it
+                                    cu_free.push_back(cu_q.front().buf);
+                                    cu_q.pop_front();
+                                }
+                            }
                             mtp.set_source_R(SV(pl_nf, op.slot).final_R(0));
                             return mtp.chain_launch(op.T, op.outp, op.p, op.a, op.n_force > 0 ? op.force : nullptr, op.n_force,
                                                     op.n_out, op.n_early, err, op.n_queue);
@@ -16287,6 +16321,30 @@ int main(int argc, char** argv) {
                 };
                 // the verdict's emission (today's, line for line): the oldest window's picks outp[0..a]
                 io.f_verdict = [&](const strata::pl::PW& w, int a, const int32_t* outp, bool& last) -> bool {
+                    if (mtp_catchup && a >= 0) {   // stage the window's verified rows (its slot is reused after this)
+                        if (cu_free.empty()) {     // (64 windows without a chain in a row: the oldest keeps its cells)
+                            cu_free.push_back(cu_q.front().buf);
+                            cu_q.pop_front();
+                            ++cu_dropped;
+                        }
+                        CuEntry e;
+                        e.seq = w.seq;
+                        e.p = w.p;
+                        e.a = a;
+                        e.buf = cu_free.back();
+                        cu_free.pop_back();
+                        for (int i = 0; i <= a; ++i) e.tok[i] = outp[i];
+                        float* dst = mtp.catchup_buf(e.buf);
+                        const strata::core::OnDevice on(mtp.device());
+                        if (dst == nullptr || (cu_copy == nullptr && cudaStreamCreateWithFlags(&cu_copy, cudaStreamNonBlocking) != cudaSuccess) ||
+                            cudaMemcpyAsync(dst, SV(pl_nf, w.slot).final_R(0), (size_t) (a + 1) * mtp.catchup_row_bytes(),
+                                            cudaMemcpyDeviceToDevice, cu_copy) != cudaSuccess ||
+                            cudaStreamSynchronize(cu_copy) != cudaSuccess) {
+                            err = "STRATA_MTP_CATCHUP: staging a window's rows failed";
+                            return false;
+                        }
+                        cu_q.push_back(e);
+                    }
                     for (int i = 0; i <= a; ++i) consumed.push_back(w.tok[i]);
                     draft_offered += w.T - 1;
                     draft_accepted += a;
@@ -16379,6 +16437,22 @@ int main(int argc, char** argv) {
                     if (r == 0) break;
                 }
                 pl_drain();   // nothing in flight: every stage's commits and the drafter have landed
+                if (mtp_catchup) {   // the windows after the last chain's source
+                    if (!cu_q.empty()) {   // the last chain (landed with the drain) marked done before its rounds
+                        mtp.chain_close();
+                        while (mtp.chain_live())
+                            if (mtp.chain_poll(err) < 0) return die(err);
+                    }
+                    while (!cu_q.empty()) {
+                        if (!cu_run(cu_q.front())) return die(err);
+                        cu_q.pop_front();
+                    }
+                    if (cu_dropped > 0)
+                        std::fprintf(stderr, "strata serve: STRATA_MTP_CATCHUP: %lld windows past the staging slots kept their cells\n",
+                                     (long long) cu_dropped);
+                    if (std::getenv("STRATA_STATE_CLEAN_LOG") != nullptr)
+                        std::fprintf(stderr, "strata serve: STRATA_MTP_CATCHUP: %d catch-up rounds so far\n", mtp.catchups());
+                }
                 // STRATA_PIPELINE_SNAP_RING: each front stage's state back in its session's buffer
                 if (!pl_ring_settle()) return die("the GDN snapshot ring could not be settled");
                 strata::core::diag_pipeline_fn().store(nullptr);
