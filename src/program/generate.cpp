@@ -16194,14 +16194,31 @@ int main(int argc, char** argv) {
                     const char* v = std::getenv("STRATA_MTP_CATCHUP");
                     return v != nullptr && std::atoi(v) != 0;
                 }();
+                // When: a window's cells take no write after its verdict that its round would not overwrite (a later
+                // chain's round and steps start past it), so its round may run any time before the request ends - it
+                // runs then, off the decode path, or before a chain launch once the staging slots run short.  The
+                // staging copy is queued on the last stage's stream right at the verdict, ahead of the next window that
+                // reuses the slot, so nothing waits for it.
                 struct CuEntry { int seq; int64_t p; int a; int buf; int32_t tok[strata::pl::kMaxRows]; };
                 std::deque<CuEntry> cu_q;
                 std::vector<int> cu_free;
                 int64_t cu_dropped = 0;
-                static cudaStream_t cu_copy = nullptr;   // on the drafter's GPU: the verdict's staging copy
-                if (mtp_catchup)
+                static std::vector<cudaEvent_t> cu_ev;   // per staging slot, on the last stage's GPU: its copy landed
+                if (mtp_catchup) {
                     for (int i = strata::core::MtpDrafter::kCatchupSlots - 1; i >= 0; --i) cu_free.push_back(i);
+                    if (cu_ev.empty()) {
+                        const strata::core::OnDevice on(pl_nf > 0 ? stages[(size_t) pl_nf - 1]->dev : ver.device());
+                        cu_ev.assign(strata::core::MtpDrafter::kCatchupSlots, nullptr);
+                        for (cudaEvent_t& e : cu_ev)
+                            if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess)
+                                return die("STRATA_MTP_CATCHUP: event creation failed");
+                    }
+                }
                 auto cu_run = [&](const CuEntry& e) -> bool {
+                    if (cudaEventSynchronize(cu_ev[(size_t) e.buf]) != cudaSuccess) {
+                        err = "STRATA_MTP_CATCHUP: a staging copy failed";
+                        return false;
+                    }
                     if (!mtp.catchup_run(e.a + 1, e.a, e.p, e.tok, e.buf, err)) return false;
                     cu_free.push_back(e.buf);
                     return true;
@@ -16285,15 +16302,19 @@ int main(int argc, char** argv) {
                                 if (mtp.chain_poll(err) < 0) return false;
                             return true;
                         case Op::ChainLaunch:
-                            if (mtp_catchup) {   // the windows before this chain's source that had none of their own
-                                while (!cu_q.empty() && cu_q.front().seq < op.seq) {
-                                    if (!cu_run(cu_q.front())) return false;
-                                    cu_q.pop_front();
-                                }
-                                if (!cu_q.empty() && cu_q.front().seq == op.seq) {   // this chain's round writes it
-                                    cu_free.push_back(cu_q.front().buf);
-                                    cu_q.pop_front();
-                                }
+                            if (mtp_catchup) {
+                                for (auto it = cu_q.begin(); it != cu_q.end(); ++it)
+                                    if (it->seq == op.seq) {   // this chain's round writes the source's rows itself
+                                        cu_free.push_back(it->buf);
+                                        cu_q.erase(it);
+                                        break;
+                                    }
+                                // the slots running short: the older windows' rounds now (the drafter is idle here)
+                                if (cu_free.size() < 8)
+                                    while (!cu_q.empty() && cu_q.front().seq < op.seq) {
+                                        if (!cu_run(cu_q.front())) return false;
+                                        cu_q.pop_front();
+                                    }
                             }
                             mtp.set_source_R(SV(pl_nf, op.slot).final_R(0));
                             return mtp.chain_launch(op.T, op.outp, op.p, op.a, op.n_force > 0 ? op.force : nullptr, op.n_force,
@@ -16335,11 +16356,11 @@ int main(int argc, char** argv) {
                         cu_free.pop_back();
                         for (int i = 0; i <= a; ++i) e.tok[i] = outp[i];
                         float* dst = mtp.catchup_buf(e.buf);
-                        const strata::core::OnDevice on(mtp.device());
-                        if (dst == nullptr || (cu_copy == nullptr && cudaStreamCreateWithFlags(&cu_copy, cudaStreamNonBlocking) != cudaSuccess) ||
+                        const strata::core::OnDevice on(pl_nf > 0 ? stages[(size_t) pl_nf - 1]->dev : ver.device());
+                        if (dst == nullptr ||
                             cudaMemcpyAsync(dst, SV(pl_nf, w.slot).final_R(0), (size_t) (a + 1) * mtp.catchup_row_bytes(),
-                                            cudaMemcpyDeviceToDevice, cu_copy) != cudaSuccess ||
-                            cudaStreamSynchronize(cu_copy) != cudaSuccess) {
+                                            cudaMemcpyDeviceToDevice, pl_stream[(size_t) pl_nf]) != cudaSuccess ||
+                            cudaEventRecord(cu_ev[(size_t) e.buf], pl_stream[(size_t) pl_nf]) != cudaSuccess) {
                             err = "STRATA_MTP_CATCHUP: staging a window's rows failed";
                             return false;
                         }
