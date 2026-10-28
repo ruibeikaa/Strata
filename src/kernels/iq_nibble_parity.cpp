@@ -6,7 +6,8 @@
 //                            [--plans 8] [--synthetic 64] [--no-ggml] [--negative]
 //
 // Each model (any shard of it; its other shards are opened beside it) gives `--layers-per-fmt` layers of each
-// converted format (IQ2_S, IQ3_XXS, IQ3_S; or `--layers`), `--ne` experts each, read from the GGUF tensors into the
+// converted format (IQ2_S, IQ3_XXS, IQ3_S, and IQ2_XS / IQ2_XXS with STRATA_EXPERT_NIBBLE_XS=1 - W47; or `--layers`),
+// `--ne` experts each, read from the GGUF tensors into the
 // blob the pack holds (gate rows, up rows, down rows).  Per layer:
 //   (1) nibble::transcode, 64 blobs a batch as the startup fill runs it: 0 items that do not round-trip;
 //   (2) every gate/up byte of a slot is written (8 slots transcoded again into another pre-fill byte);
@@ -21,7 +22,7 @@
 //       blobs (native_expert_layout): hq and out byte for byte for every entry, and gate / up where the reference
 //       layout writes them - in the card's default layout (a GP100: mode 8, whose gate/up kernel writes hq) and in the
 //       CUDA layout (native_expert_set_mode(0)), each with native_grouped_set_v1 off and on (h too, in mode 0 + v1);
-//       top-10 routing T = 1..6 at 0% and 50% sharing (`--plans` each), one group of T entries (G = 1) per T, plans of
+//       top-10 routing T = 1..8 at 0% and 50% sharing (`--plans` each), one group of T entries (G = 1) per T, plans of
 //       groups with 0..11 entries (more than one GRP_NC pass, empty groups); grid_groups 0 (cap) and 4 (the PCIe
 //       call's stride); the default kernel per format and each skeleton forced (S, P); q8_1 activations random, all
 //       +127, all -127 and alternating +-127 (the sum of x at its extremes, +-4064).
@@ -87,6 +88,8 @@ int header_check() {
     expect(nib::code_off(nib::kNFf, 0) == nib::kUpCodesOff, "up rows' codes");
     expect(nib::slot_bytes_for(921600) % nib::kSlotAlign == 0, "slot alignment");
     round_trip(nib::kIQ2_S, { 8, 25, 43, -8, -25, -43 }, 9);
+    round_trip(nib::kIQ2_XS, { 8, 25, 43, -8, -25, -43 }, 9);    // W47: iq2xs_grid holds the same magnitudes
+    round_trip(nib::kIQ2_XXS, { 8, 25, 43, -8, -25, -43 }, 9);   // ... and iq2xxs_grid too
     round_trip(nib::kIQ3_XXS, { 4, 12, 20, 28, 36, 44, 52, 62, -4, -12, -20, -28, -36, -44, -52, -62 }, 5);
     std::vector<int8_t> s3;
     for (int v = -15; v <= 15; v += 2) s3.push_back((int8_t) v);
@@ -102,8 +105,13 @@ int header_check() {
         expect(std::memcmp(g, back, 32) == 0, "IQ2_S selector decode");
     }
     expect(nib::gu_skeleton(nib::kIQ2_S) == nib::kSkelP && nib::gu_skeleton(nib::kIQ3_XXS) == nib::kSkelS &&
-               nib::gu_skeleton(nib::kIQ3_S) == nib::kSkelS,
+               nib::gu_skeleton(nib::kIQ3_S) == nib::kSkelS && nib::gu_skeleton(nib::kIQ2_XS) == nib::kSkelP &&
+               nib::gu_skeleton(nib::kIQ2_XXS) == nib::kSkelS,
            "kernel table");
+    expect(nib::raw_gu_row(nib::kIQ2_XS) == 740 && nib::raw_gu_row(nib::kIQ2_XXS) == 660, "IQ2_XS / IQ2_XXS row bytes");
+    expect(nib::fmt_built_xs(nib::kIQ2_XS) && nib::fmt_built_xs(nib::kIQ2_XXS) && !nib::fmt_built(nib::kIQ2_XS) &&
+               !nib::fmt_built(nib::kIQ2_XXS),
+           "the XS formats are behind their own predicate");
     {
         const uint8_t b[6] = { 1, 2, 3, 4, 5, 6 };
         const uint64_t h = nib::hash_host(b, 6);
@@ -251,6 +259,11 @@ long long convert(Layer& Y, bool ggml_check) {
     long long bad_total = 0;
     nib::Config c;
     c.on = true;
+    c.xs = std::getenv("STRATA_EXPERT_NIBBLE_XS") != nullptr;   // W47: bench / parity of IQ2_XS / IQ2_XXS too
+    if (c.xs) {
+        c.fmts.push_back(nib::kIQ2_XS);
+        c.fmts.push_back(nib::kIQ2_XXS);
+    }
     Y.V = nib::plan_layer(Y.layer, Y.f, c);
     Y.Lr = K::native_expert_layout(Y.f.gu_type, Y.f.d_type, kEmbd, kFf);
     Y.Ln = K::native_expert_layout_nib(Y.f.gu_type, Y.f.d_type, kEmbd, kFf);
@@ -373,8 +386,13 @@ long long convert(Layer& Y, bool ggml_check) {
                         ggml_fp16_t dh;
                         std::memcpy(&dh, s + nib::d_off(r, k / 8), sizeof dh);
                         const float d = ggml_fp16_to_fp32(dh);
+                        const float ls = (float) sc;   // IQ2_XXS: 1 | ((aux32 >> 28) << 1), odd 1..15
                         for (int j = 0; j < 32; ++j) {
-                            const float db = Y.f.gu_type == nib::kIQ2_S   ? d * (0.5f + ((j < 16 ? sc : sc >> 4) & 0xf)) * 0.25f
+                            // W47: IQ2_XS is IQ2_S's expression; IQ2_XXS's 4-bit code is ls = 2 * ggml's (aux32 >> 28) + 1,
+                            // so ggml's 0.5 + ls4 is the ls / 2 that the slot's own kernel applies as ls / 8.
+                            const float db = Y.f.gu_type == nib::kIQ2_S || Y.f.gu_type == nib::kIQ2_XS
+                                                 ? d * (0.5f + ((j < 16 ? sc : sc >> 4) & 0xf)) * 0.25f
+                                           : Y.f.gu_type == nib::kIQ2_XXS ? d * ls / 8.0f
                                            : Y.f.gu_type == nib::kIQ3_XXS ? d * (0.5f + sc) * 0.5f
                                                                           : d * sc;
                             const int a = gv[j] < 0 ? -(int) gv[j] : (int) gv[j];
@@ -635,7 +653,7 @@ long long grouped_parity(const Layer& Y, std::mt19937& rng, int plans, const voi
         int T;
     };
     std::vector<Case> cases;
-    for (int T = 1; T <= 6; ++T) {
+    for (int T = 1; T <= 8; ++T) {   // W47: the engine's fast path is T <= 4, the 4-bit tiers run to 8 (16/32-token)
         for (int share : { 0, 50 })
             for (int i = 0; i < plans; ++i) {
                 std::vector<int> ids;
@@ -693,7 +711,7 @@ long long grouped_parity(const Layer& Y, std::mt19937& rng, int plans, const voi
         }
     K::native_expert_nib_set_variant(-1);
     K::native_grouped_set_v1(false);
-    std::printf("    plans: %zu (T 1..6 x sharing 0/50%% x %d, G=1 per T, 4 of 0..11 entries); groups by entries:", cases.size(),
+    std::printf("    plans: %zu (T 1..8 x sharing 0/50%% x %d, G=1 per T, 4 of 0..11 entries); groups by entries:", cases.size(),
                 plans);
     for (int n = 0; n <= 12; ++n) std::printf(" %d:%d", n, hist[n]);
     std::printf("\n");
@@ -711,7 +729,11 @@ long long grouped_parity(const Layer& Y, std::mt19937& rng, int plans, const voi
 long long synthesize(Layer& Y, std::mt19937& rng) {
     static const uint16_t kD[] = { 0x0001, 0x8001, 0x7BFF, 0xFBFF, 0x3C00, 0xBC00, 0x0400, 0x1A00, 0x2400 };
     const int gt = Y.f.gu_type;
-    const size_t bb = gt == nib::kIQ2_S ? 82 : gt == nib::kIQ3_XXS ? 98 : 110;   // block_iq2_s / iq3_xxs / iq3_s
+    const size_t bb = gt == nib::kIQ2_S   ? 82
+                      : gt == nib::kIQ2_XS ? 74
+                      : gt == nib::kIQ2_XXS ? 66
+                      : gt == nib::kIQ3_XXS ? 98
+                                            : 110;   // block_iq2_s / iq2_xs / iq2_xxs / iq3_xxs / iq3_s
     const size_t nblk = (size_t) nib::kRows * nib::kSuper;
     std::set<int> grid, sign, scale, dset;
     for (int e = 0; e < Y.ne; ++e) {
@@ -733,6 +755,22 @@ long long synthesize(Layer& Y, std::mt19937& rng) {
                     }
                     scale.insert(sc[ib] & 15);
                     scale.insert(sc[ib] >> 4);
+                } else if (gt == nib::kIQ2_XS) {   // W47: qs[32] = 9-bit grid index | 7 sign bits << 9, scales[8]
+                    const uint8_t* sc = blk + 66;
+                    for (int l = 0; l < 4; ++l) {
+                        uint16_t q2;
+                        std::memcpy(&q2, qs + 2 * (4 * ib + l), 2);
+                        grid.insert(q2 & 0x1FF);
+                        sign.insert((int) ((q2 >> 9) & 127));
+                    }
+                    scale.insert(sc[ib] & 15);
+                    scale.insert(sc[ib] >> 4);
+                } else if (gt == nib::kIQ2_XXS) {   // W47: qs[32] = 4 grid bytes + aux32 (4 x 7 sign bits | scale << 28)
+                    uint32_t aux;
+                    std::memcpy(&aux, qs + 2 * (4 * ib + 2), 4);
+                    for (int l = 0; l < 4; ++l) grid.insert(qs[8 * ib + l]);
+                    for (int l = 0; l < 4; ++l) sign.insert((int) ((aux >> (7 * l)) & 127));
+                    scale.insert((int) (aux >> 28));
                 } else if (gt == nib::kIQ3_XXS) {
                     uint32_t aux;
                     std::memcpy(&aux, blk + 66 + 4 * ib, 4);
@@ -753,8 +791,12 @@ long long synthesize(Layer& Y, std::mt19937& rng) {
             }
         }
     }
-    const size_t want_grid = gt == nib::kIQ2_S ? 1024 : gt == nib::kIQ3_XXS ? 256 : 512;
-    const size_t want_sign = gt == nib::kIQ3_XXS ? 128 : 256;
+    const size_t want_grid = gt == nib::kIQ2_S   ? 1024
+                             : gt == nib::kIQ2_XS ? 512
+                             : gt == nib::kIQ2_XXS ? 256
+                             : gt == nib::kIQ3_XXS ? 256
+                                                   : 512;
+    const size_t want_sign = (gt == nib::kIQ3_XXS || gt == nib::kIQ2_XS || gt == nib::kIQ2_XXS) ? 128 : 256;
     const bool ok = grid.size() == want_grid && sign.size() == want_sign && scale.size() == 16 &&
                     dset.size() == sizeof kD / sizeof kD[0];
     std::printf("synthetic %-7s: %d experts, coverage: grid indices %zu/%zu, sign %s %zu/%zu, scale nibbles %zu/16, d values %zu/%zu"
@@ -825,8 +867,10 @@ int main(int argc, char** argv) {
                      prop.minor);
         return 2;
     }
-    if (!STRATA_EXPERT_NIBBLE_BUILT || nib::prepare(nullptr) != 0) {
-        std::fprintf(stderr, "iq_nibble_parity: no 4-bit kernels in this build, or the GGUF codebooks are not unique\n");
+    const int prep = STRATA_EXPERT_NIBBLE_BUILT ? nib::prepare(nullptr) : -1;
+    if (prep != 0) {
+        std::fprintf(stderr, "iq_nibble_parity: no 4-bit kernels (prepare %d: %s), or the GGUF codebooks are not unique\n",
+                     prep, cudaGetErrorString((cudaError_t) prep));
         return 2;
     }
     std::mt19937 rng(20261019);
@@ -858,7 +902,7 @@ int main(int argc, char** argv) {
         for (int l = 0; l < 256; ++l) {
             int gt = -1, dt = -1;
             if (!layer_fmt(*model, l, gt, dt)) break;
-            if (!nib::fmt_built(gt)) continue;
+            if (!nib::fmt_built(gt) && !(nib::config().xs && nib::fmt_built_xs(gt))) continue;   // W47: XS with the switch
             const bool want = only.empty() ? count[gt]++ < per_fmt : std::find(only.begin(), only.end(), l) != only.end();
             if (want) pick.push_back(l);
         }

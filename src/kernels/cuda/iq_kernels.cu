@@ -4517,6 +4517,39 @@ template<> struct NibLoad<22> {   // IQ2_S: the nibble is the PRMT selector into
         return r;
     }
 };
+template<> struct NibLoad<17> {   // IQ2_XS: IQ2_S's item (Split<17> : SplitLs2), the same PRMT selector
+    using W = Split<17>::W;
+    __device__ static W load(uint4 q, uint32_t sc, __half d) {
+        constexpr uint32_t T0 = 0x002B1908u, T1 = 0x00D5E7F8u;
+        W r;
+        const uint32_t qw[4] = { q.x, q.y, q.z, q.w };
+#pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            r.g[2 * m + 0] = (int) nib_prmt(T0, T1, qw[m]);
+            r.g[2 * m + 1] = (int) nib_prmt(T0, T1, qw[m] >> 16);
+        }
+        r.ls0 = sc & 0x0F;
+        r.ls1 = sc >> 4;
+        r.dw = __half2float(d);
+        return r;
+    }
+};
+template<> struct NibLoad<16> {   // IQ2_XXS: the same selector, one 4-bit scale (Split<16>: ls = byte, sumi * ls / 8)
+    using W = Split<16>::W;
+    __device__ static W load(uint4 q, uint32_t sc, __half d) {
+        constexpr uint32_t T0 = 0x002B1908u, T1 = 0x00D5E7F8u;
+        W r;
+        const uint32_t qw[4] = { q.x, q.y, q.z, q.w };
+#pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            r.g[2 * m + 0] = (int) nib_prmt(T0, T1, qw[m]);
+            r.g[2 * m + 1] = (int) nib_prmt(T0, T1, qw[m] >> 16);
+        }
+        r.ls = (int) sc;
+        r.dw = __half2float(d);
+        return r;
+    }
+};
 template<> struct NibLoad<18> {   // IQ3_XXS: magnitude PRMT into {4..62}, sign-replicated byte masks, (g ^ m) + (m & 1s)
     using W = Split<18>::W;
     __device__ static W load(uint4 q, uint32_t sc, __half d) {
@@ -4625,8 +4658,8 @@ struct NibXQ { int4 a, b; };
 
 template<int TG>
 __device__ __forceinline__ float nib_p_apply(const uint4& q, uint32_t sc, __half dh, const NibXQ& x, float dx, int xsum) {
-    if constexpr (TG == 22) {   // SplitLs2::apply on the registers
-        const typename NibLoad<22>::W w = NibLoad<22>::load(q, sc, dh);
+    if constexpr (TG == 22 || TG == 17) {   // SplitLs2::apply on the registers (IQ2_S, IQ2_XS: the same item)
+        const typename NibLoad<TG>::W w = NibLoad<TG>::load(q, sc, dh);
         int sumi0 = 0, sumi1 = 0;
         sumi0 = ggml_cuda_dp4a(w.g[0], x.a.x, sumi0); sumi0 = ggml_cuda_dp4a(w.g[1], x.a.y, sumi0);
         sumi0 = ggml_cuda_dp4a(w.g[2], x.a.z, sumi0); sumi0 = ggml_cuda_dp4a(w.g[3], x.a.w, sumi0);
@@ -4643,6 +4676,16 @@ __device__ __forceinline__ float nib_p_apply(const uint4& q, uint32_t sc, __half
         sumi = ggml_cuda_dp4a(w.g[4], x.b.x, sumi); sumi = ggml_cuda_dp4a(w.g[5], x.b.y, sumi);
         sumi = ggml_cuda_dp4a(w.g[6], x.b.z, sumi); sumi = ggml_cuda_dp4a(w.g[7], x.b.w, sumi);
         sumi = (w.ls * sumi + sumi / 2) / 2;
+        const float d = w.dw * dx;
+        return d * sumi;
+    } else if constexpr (TG == 16) {   // Split<16>::apply on the registers (IQ2_XXS: one 4-bit scale, sumi * ls / 8)
+        const typename NibLoad<16>::W w = NibLoad<16>::load(q, sc, dh);
+        int sumi = 0;
+        sumi = ggml_cuda_dp4a(w.g[0], x.a.x, sumi); sumi = ggml_cuda_dp4a(w.g[1], x.a.y, sumi);
+        sumi = ggml_cuda_dp4a(w.g[2], x.a.z, sumi); sumi = ggml_cuda_dp4a(w.g[3], x.a.w, sumi);
+        sumi = ggml_cuda_dp4a(w.g[4], x.b.x, sumi); sumi = ggml_cuda_dp4a(w.g[5], x.b.y, sumi);
+        sumi = ggml_cuda_dp4a(w.g[6], x.b.z, sumi); sumi = ggml_cuda_dp4a(w.g[7], x.b.w, sumi);
+        sumi = sumi * w.ls / 8;
         const float d = w.dw * dx;
         return d * sumi;
     } else {   // IQ3_S, offset form: dot(v, x) = 2 dot(u, x) - 15 sum(x), exact (|2 dot(u, x)| < 2^17); then Split<21>'s
@@ -4828,6 +4871,8 @@ void launch_gu_nib(const NativeExpertLayout& L, dim3 grid, cudaStream_t s, const
     case TG * 2 + S: nib_gu_kernel<TG, S><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, gate, up); break;
     switch (L.gu_type * 2 + skel) {
         STRATA_NIB_GU(22, 0) STRATA_NIB_GU(22, 1)
+        STRATA_NIB_GU(17, 0) STRATA_NIB_GU(17, 1)
+        STRATA_NIB_GU(16, 0) STRATA_NIB_GU(16, 1)
         STRATA_NIB_GU(18, 0) STRATA_NIB_GU(18, 1)
         STRATA_NIB_GU(21, 0) STRATA_NIB_GU(21, 1)
         default:
@@ -4849,7 +4894,7 @@ __device__ __forceinline__ uint32_t nib_code(int v, bool& ok) {
         const int i = a == 62 ? 7 : ((a & 7) == 4 && a <= 52) ? (a - 4) >> 3 : -1;
         if (i < 0) { ok = false; return 0; }
         return (uint32_t) i | (v < 0 ? 8u : 0u);
-    } else {   // IQ2_S: index of {8, 25, 43} | sign << 2
+    } else {   // IQ2_S, IQ2_XS, IQ2_XXS: index of {8, 25, 43} | sign << 2 (all three grids hold those magnitudes only)
         const int a = v < 0 ? -v : v;
         const int i = a == 8 ? 0 : a == 25 ? 1 : a == 43 ? 2 : -1;
         if (i < 0) { ok = false; return 0; }
@@ -4860,6 +4905,8 @@ __device__ __forceinline__ uint32_t nib_code(int v, bool& ok) {
 // The GGUF blocks (ggml-common.h): their size and the fp16 d at their start
 template<int TG> struct NibBlk;
 template<> struct NibBlk<22> { using B = block_iq2_s; };
+template<> struct NibBlk<17> { using B = block_iq2_xs; };
+template<> struct NibBlk<16> { using B = block_iq2_xxs; };
 template<> struct NibBlk<18> { using B = block_iq3_xxs; };
 template<> struct NibBlk<21> { using B = block_iq3_s; };
 
@@ -4898,7 +4945,7 @@ __global__ void __launch_bounds__(256) nib_transcode_kernel(const uint8_t* __res
         words[m] = word;
     }
     uint32_t sc;
-    if constexpr (TG == 22) sc = (uint32_t) (w.ls0 | w.ls1 << 4);
+    if constexpr (TG == 22 || TG == 17) sc = (uint32_t) (w.ls0 | w.ls1 << 4);
     else sc = (uint32_t) w.ls;
     ok = ok && sc < 256u;
     uint8_t* slot = (uint8_t*) slots[ex];
@@ -4920,7 +4967,7 @@ __global__ void __launch_bounds__(256) nib_transcode_kernel(const uint8_t* __res
     const typename NibLoad<TG>::W v = NibLoad<TG>::load(qb, sb, dread);
 #pragma unroll
     for (int j = 0; j < 8; ++j) ok = ok && v.g[j] == w.g[j];
-    if constexpr (TG == 22) ok = ok && v.ls0 == w.ls0 && v.ls1 == w.ls1;
+    if constexpr (TG == 22 || TG == 17) ok = ok && v.ls0 == w.ls0 && v.ls1 == w.ls1;
     else ok = ok && v.ls == w.ls;
     ok = ok && __float_as_uint(v.dw) == __float_as_uint(w.dw);
     if constexpr (TG == 21) {   // the P skeleton's u: 2u - 15 per byte is v
@@ -4939,7 +4986,10 @@ __global__ void __launch_bounds__(256) nib_transcode_kernel(const uint8_t* __res
 // The reverse codebooks: a group's magnitude pattern -> its grid index (0xFFFFFFFF: not in the grid).  32-bit
 // entries for atomicCAS, which also counts a pattern two grid entries share (none in ggml's grids; then refused).
 constexpr int kNibRev22 = 6561, kNibRev18 = 4096, kNibRev21 = 4096;   // 3^8 (IQ2_S: 8 weights), 8^4, 8^4 (4 weights)
+constexpr int kNibRevXs = 6561, kNibRevXxs = 6561;   // 3^8 each: IQ2_XS's iq2xs_grid (512 entries), IQ2_XXS's (256)
 __device__ uint32_t g_nib_rev22[kNibRev22];
+__device__ uint32_t g_nib_rev_xs[kNibRevXs];
+__device__ uint32_t g_nib_rev_xxs[kNibRevXxs];
 __device__ uint32_t g_nib_rev18[kNibRev18];
 __device__ uint32_t g_nib_rev21[kNibRev21];
 __device__ unsigned long long g_nib_rev_bad;
@@ -4951,6 +5001,8 @@ __device__ __forceinline__ int nib_mag21(uint32_t b) { return (b & 1) && b <= 15
 __global__ void nib_rev_clear_kernel() {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < kNibRev22) g_nib_rev22[i] = 0xFFFFFFFFu;
+    if (i < kNibRevXs) g_nib_rev_xs[i] = 0xFFFFFFFFu;
+    if (i < kNibRevXxs) g_nib_rev_xxs[i] = 0xFFFFFFFFu;
     if (i < kNibRev18) g_nib_rev18[i] = 0xFFFFFFFFu;
     if (i < kNibRev21) g_nib_rev21[i] = 0xFFFFFFFFu;
     if (i == 0) g_nib_rev_bad = 0;
@@ -4973,6 +5025,14 @@ __global__ void nib_rev_fill_kernel() {
         const uint32_t g = iq3s_grid[i - 1280];
         for (int j = 3; j >= 0; --j) { const int m = nib_mag21((g >> (8 * j)) & 0xFF); ok = ok && m >= 0; key = key * 8 + (m < 0 ? 0 : m); }
         tab = g_nib_rev21; idx = (uint32_t) (i - 1280);
+    } else if (i < 1024 + 256 + 512 + 512) {   // iq2xs_grid: 8 bytes of {8, 25, 43} (IQ2_XS, 512 entries)
+        const uint64_t g = iq2xs_grid[i - 1792];
+        for (int j = 7; j >= 0; --j) { const int m = nib_mag22((uint32_t) (g >> (8 * j)) & 0xFF); ok = ok && m >= 0; key = key * 3 + (m < 0 ? 0 : m); }
+        tab = g_nib_rev_xs; idx = (uint32_t) (i - 1792);
+    } else if (i < 1024 + 256 + 512 + 512 + 256) {   // iq2xxs_grid: the same three magnitudes (IQ2_XXS, 256)
+        const uint64_t g = iq2xxs_grid[i - 2304];
+        for (int j = 7; j >= 0; --j) { const int m = nib_mag22((uint32_t) (g >> (8 * j)) & 0xFF); ok = ok && m >= 0; key = key * 3 + (m < 0 ? 0 : m); }
+        tab = g_nib_rev_xxs; idx = (uint32_t) (i - 2304);
     } else {
         return;
     }
@@ -5012,6 +5072,41 @@ __device__ __forceinline__ void nib_gguf_item(uint8_t* blk, int ib, const uint8_
         }
         blk[66 + ib] = (uint8_t) qh;
         blk[74 + ib] = (uint8_t) sc;
+    } else if constexpr (TG == 17) {   // block_iq2_xs: d, qs[32] (9-bit grid index | 7 sign bits << 9), scales[8]
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            int key = 0;
+            uint32_t sg = 0;
+#pragma unroll
+            for (int j = 7; j >= 0; --j) {
+                const uint32_t c = j < 4 ? (w[l] >> (4 * j)) & 15u : (w[l] >> (16 + 4 * (j - 4))) & 15u;
+                key = key * 3 + (int) (c & 3u);
+                sg |= ((c >> 2) & 1u) << j;
+            }
+            const uint32_t idx = key < kNibRevXs ? g_nib_rev_xs[key] : 0xFFFFFFFFu;
+            const uint32_t q2 = (idx & 0x1FFu) | ((sg & 0x7Fu) << 9);   // the 8th sign is the parity of the other 7
+            blk[2 + 8 * ib + 2 * l + 0] = (uint8_t) q2;
+            blk[2 + 8 * ib + 2 * l + 1] = (uint8_t) (q2 >> 8);
+        }
+        blk[66 + ib] = (uint8_t) sc;
+    } else if constexpr (TG == 16) {   // block_iq2_xxs: d, item = 4 grid bytes then aux32 (4 x 7 sign bits | scale << 28)
+        uint32_t aux = (uint32_t) ((sc >> 1) << 28);   // ls = aux32 >> 27 | 1, the bit 27 is a sign: sc = 1 + 2 (ls >> 1)
+#pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            int key = 0;
+            uint32_t sg = 0;
+#pragma unroll
+            for (int j = 7; j >= 0; --j) {
+                const uint32_t c = j < 4 ? (w[m] >> (4 * j)) & 15u : (w[m] >> (16 + 4 * (j - 4))) & 15u;
+                key = key * 3 + (int) (c & 3u);
+                sg |= ((c >> 2) & 1u) << j;
+            }
+            const uint32_t idx = key < kNibRevXxs ? g_nib_rev_xxs[key] : 0xFFFFFFFFu;
+            blk[2 + 8 * ib + m] = (uint8_t) idx;
+            aux |= (sg & 0x7Fu) << (7 * m);   // bits 7m .. 7m+6; the 8th sign is ksigns' parity (bits 7, 14, 21, 28)
+        }
+#pragma unroll
+        for (int b = 0; b < 4; ++b) blk[2 + 8 * ib + 4 + b] = (uint8_t) (aux >> (8 * b));
     } else if constexpr (TG == 18) {   // block_iq3_xxs: d, qs[64] grid indices, 8 x aux32 (4 x 7 sign bits | scale << 28)
         uint32_t aux = sc << 28;
 #pragma unroll
@@ -5368,7 +5463,7 @@ NativeExpertLayout native_expert_layout_nib(int gu_type, int d_type, int64_t n_e
 bool native_expert_nib_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept {
 #if STRATA_EXPERT_NIBBLE_BUILT
     namespace nb = strata::core::nibble;
-    return nb::fmt_built(gu_type) && n_embd == nb::kNEmbd && n_ff == nb::kNFf && d_type != 40 &&
+    return nb::fmt_on(gu_type) && n_embd == nb::kNEmbd && n_ff == nb::kNFf && d_type != 40 &&
            native_expert_supported(gu_type, d_type, n_embd, n_ff);
 #else
     (void) gu_type; (void) d_type; (void) n_embd; (void) n_ff;
@@ -6361,7 +6456,7 @@ int prepare(void* stream) {
     if (g_rev_ready[dev] == 2) return (int) cudaErrorInvalidValue;
     cudaStream_t s = (cudaStream_t) stream;
     strata::kernels::nib_rev_clear_kernel<<<(strata::kernels::kNibRev22 + 255) / 256, 256, 0, s>>>();
-    strata::kernels::nib_rev_fill_kernel<<<(1024 + 256 + 512 + 255) / 256, 256, 0, s>>>();
+    strata::kernels::nib_rev_fill_kernel<<<(1024 + 256 + 512 + 512 + 256 + 255) / 256, 256, 0, s>>>();
     cudaError_t e = cudaGetLastError();
     unsigned long long bad = 0;
     if (e == cudaSuccess) e = cudaStreamSynchronize(s);
@@ -6379,7 +6474,7 @@ int transcode(const LayerVram& L, const void* staging, int64_t n, const unsigned
               unsigned long long* bad, void* stream) {
 #if STRATA_EXPERT_NIBBLE_BUILT
     if (n <= 0) return 0;
-    if (!L.on || !fmt_built(L.gu_type) || L.raw_gu_row != raw_gu_row(L.gu_type) ||
+    if (!L.on || !fmt_on(L.gu_type) || L.raw_gu_row != raw_gu_row(L.gu_type) ||
         L.raw_up_off != (uint64_t) kNFf * L.raw_gu_row || L.raw_bytes < 2 * L.raw_up_off)
         return (int) cudaErrorInvalidValue;
     const long long nthr = (long long) n * kRows * kItems;
@@ -6390,6 +6485,8 @@ int transcode(const LayerVram& L, const void* staging, int64_t n, const unsigned
     strata::kernels::nib_transcode_kernel<TG><<<grid, 256, 0, s>>>(src, L.raw_bytes, L.raw_gu_row, L.raw_up_off, slot_ptrs, n, bad)
     switch (L.gu_type) {
         case kIQ2_S: STRATA_NIB_TC(22); break;
+        case kIQ2_XS: STRATA_NIB_TC(17); break;
+        case kIQ2_XXS: STRATA_NIB_TC(16); break;
         case kIQ3_XXS: STRATA_NIB_TC(18); break;
         case kIQ3_S: STRATA_NIB_TC(21); break;
         default: return (int) cudaErrorInvalidValue;
@@ -6406,7 +6503,7 @@ int transcode(const LayerVram& L, const void* staging, int64_t n, const unsigned
 namespace {
 int launch_gguf(const LayerVram& L, strata::kernels::NibGgufArgs& a, bool check, cudaStream_t s) {
     namespace K = strata::kernels;
-    if (!L.on || !fmt_built(L.gu_type) || L.raw_gu_row != raw_gu_row(L.gu_type) || L.down_bytes % 16 != 0 ||
+    if (!L.on || !fmt_on(L.gu_type) || L.raw_gu_row != raw_gu_row(L.gu_type) || L.down_bytes % 16 != 0 ||
         L.raw_up_off != (uint64_t) kNFf * L.raw_gu_row || L.raw_down_off != 2 * L.raw_up_off)
         return (int) cudaErrorInvalidValue;
     if (!rev_ready()) return (int) cudaErrorNotReady;   // prepare() was not run on this device
@@ -6420,6 +6517,8 @@ int launch_gguf(const LayerVram& L, strata::kernels::NibGgufArgs& a, bool check,
            : K::nib_gguf_kernel<TG, false><<<grid, K::kNibGgufThreads, 0, s>>>(a))
     switch (L.gu_type) {
         case kIQ2_S: STRATA_NIB_GG(22); break;
+        case kIQ2_XS: STRATA_NIB_GG(17); break;
+        case kIQ2_XXS: STRATA_NIB_GG(16); break;
         case kIQ3_XXS: STRATA_NIB_GG(18); break;
         case kIQ3_S: STRATA_NIB_GG(21); break;
         default: return (int) cudaErrorInvalidValue;

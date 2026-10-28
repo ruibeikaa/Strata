@@ -33,7 +33,7 @@ struct NibxW {
                 r.g[2 * m + 0] = (int) qw[m];
                 r.g[2 * m + 1] = (int) (qw[m] >> 4);
             }
-            if constexpr (TG == 22) { r.ls0 = sc & 0x0F; r.ls1 = sc >> 4; }
+            if constexpr (TG == 22 || TG == 17) { r.ls0 = sc & 0x0F; r.ls1 = sc >> 4; }
             else r.ls = (int) sc;
             r.dw = __half2float(d);
             return r;
@@ -47,7 +47,7 @@ template<int TG, int AB>
 __device__ __forceinline__ float nibx_apply(const typename NibLoad<TG>::W& w, const block_q8_1* xb, int iqs) {
     if constexpr (AB == 3) {   // no math: an xor fold of the unpacked words instead of the dp4a chain
         int a = w.g[0] ^ w.g[1] ^ w.g[2] ^ w.g[3] ^ w.g[4] ^ w.g[5] ^ w.g[6] ^ w.g[7];
-        if constexpr (TG == 22) a ^= w.ls0 ^ w.ls1;
+        if constexpr (TG == 22 || TG == 17) a ^= w.ls0 ^ w.ls1;
         else a ^= w.ls;
         return w.dw * (float) a;
     } else {
@@ -314,6 +314,8 @@ bool nibx_launch(int gu_type, int id, dim3 grid, cudaStream_t s, const unsigned 
                  float* gate, float* up, cudaFuncAttributes* attr = nullptr) {
     switch (gu_type) {
         case 22: return nibx_launch_tg<22>(id, grid, s, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up, attr);
+        case 17: return nibx_launch_tg<17>(id, grid, s, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up, attr);
+        case 16: return nibx_launch_tg<16>(id, grid, s, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up, attr);
         case 18: return nibx_launch_tg<18>(id, grid, s, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up, attr);
         case 21: return nibx_launch_tg<21>(id, grid, s, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up, attr);
         default: return false;

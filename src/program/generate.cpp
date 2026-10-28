@@ -3959,7 +3959,7 @@ int main(int argc, char** argv) {
         if (why.empty()) {
             nib::set_layers(nib::plan_layers(strata::kernels::cpu::expert_layout(), why));
             if (why.empty() && !nib::any_on())
-                why = "no layer of this pack is IQ2_S / IQ3_XXS / IQ3_S at 2560 x 640 among STRATA_EXPERT_NIBBLE_FMTS "
+                why = "no layer of this pack is IQ2_S / IQ3_XXS / IQ3_S / IQ2_XS / IQ2_XXS at 2560 x 640 among STRATA_EXPERT_NIBBLE_FMTS "
                       "and outside STRATA_EXPERT_NIBBLE_SKIP";
             if (why.empty()) (void) strata::prefill::Prefill::nibble_prompt_check(why);
         }
@@ -3970,20 +3970,25 @@ int main(int argc, char** argv) {
         o.adapt_swaps = 0;
         o.peer_adapt_swaps = 0;
         const auto& lay = strata::kernels::cpu::expert_layout();
-        int64_t n_on = 0, by_fmt[3] = {0, 0, 0};
+        int64_t n_on = 0, by_fmt[5] = {0, 0, 0, 0, 0};   // IQ2_S, IQ3_XXS, IQ3_S, IQ2_XS, IQ2_XXS (W47)
         uint64_t more = 0;
         for (int64_t l = 0; l < lay.n_layers; ++l) {
             const nib::LayerVram& v = nib::layer(l);
             if (!v.on) continue;
             ++n_on;
-            ++by_fmt[v.gu_type == nib::kIQ2_S ? 0 : v.gu_type == nib::kIQ3_XXS ? 1 : 2];
+            ++by_fmt[v.gu_type == nib::kIQ2_S    ? 0
+                      : v.gu_type == nib::kIQ3_XXS ? 1
+                      : v.gu_type == nib::kIQ2_XS  ? 3
+                      : v.gu_type == nib::kIQ2_XXS ? 4
+                                                   : 2];
             more += (v.slot_bytes - (v.raw_bytes + 255) / 256 * 256) * (uint64_t) lay.n_expert;
         }
         std::fprintf(stderr, "strata generate: STRATA_EXPERT_NIBBLE: %lld of %lld layers keep their gate/up experts as 4-bit "
-                             "codes in VRAM (IQ2_S %lld, IQ3_XXS %lld, IQ3_S %lld), %.2f GiB more VRAM than their GGUF "
+                             "codes in VRAM (IQ2_S %lld, IQ3_XXS %lld, IQ3_S %lld, IQ2_XS %lld, IQ2_XXS %lld), %.2f GiB more VRAM than their GGUF "
                              "blobs for all %lld experts of each; the adaptive tier is off (--adapt-swaps 0)%s\n",
                      (long long) n_on, (long long) lay.n_layers, (long long) by_fmt[0], (long long) by_fmt[1],
-                     (long long) by_fmt[2], (double) more / 1073741824.0, (long long) lay.n_expert,
+                     (long long) by_fmt[2], (long long) by_fmt[3], (long long) by_fmt[4],
+                     (double) more / 1073741824.0, (long long) lay.n_expert,
                      nib::config().recheck ? "; STRATA_EXPERT_NIBBLE_RECHECK: every slot's hash after each request" : "");
     }
     // STRATA_EARLY_REMOTE_CONTEXTS=1: create EVERY secondary context here, like CUDA1's.  Under WSL2 the driver's
