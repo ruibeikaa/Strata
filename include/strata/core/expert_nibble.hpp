@@ -93,18 +93,31 @@ STRATA_NIB_HD constexpr uint64_t slot_bytes_for(uint64_t down_bytes) {
 
 // ------------------------------------------------------------------------------------------------ the formats
 
+inline constexpr int kIQ2_XXS = 16;
+inline constexpr int kIQ2_XS = 17;
 inline constexpr int kIQ3_XXS = 18;
 inline constexpr int kIQ3_S = 21;
 inline constexpr int kIQ2_S = 22;
 
-/// Whether `gu_type` is converted (the three formats whose weights take at most 16 values).
+/// Whether `gu_type` is converted (the three formats whose weights take at most 16 values; always on with the switch).
 STRATA_NIB_HD constexpr bool fmt_built(int gu_type) { return gu_type == kIQ2_S || gu_type == kIQ3_XXS || gu_type == kIQ3_S; }
+/// IQ2_XS / IQ2_XXS: the same {8, 25, 43} code set (iq2xs_grid / iq2xxs_grid hold those magnitudes only), converted only
+/// with STRATA_EXPERT_NIBBLE_XS=1.  IQ2_XS's item is the IQ2_S one (Split<17> : SplitLs2, two 4-bit scales a 32-weight
+/// item); IQ2_XXS's is that item with one 4-bit scale (Split<16>: ls = aux32 >> 27 | 1, sumi * ls / 8).
+STRATA_NIB_HD constexpr bool fmt_built_xs(int gu_type) { return gu_type == kIQ2_XS || gu_type == kIQ2_XXS; }
 /// The GGUF gate/up row bytes of `gu_type` at kNEmbd (a converted layer's raw blob must agree; 0 = not a format here).
 STRATA_NIB_HD constexpr uint64_t raw_gu_row(int gu_type) {
-    return gu_type == kIQ2_S ? 820 : gu_type == kIQ3_XXS ? 980 : gu_type == kIQ3_S ? 1100 : 0;
+    return gu_type == kIQ2_S  ? 820
+           : gu_type == kIQ2_XS ? 740
+           : gu_type == kIQ2_XXS ? 660
+           : gu_type == kIQ3_XXS ? 980
+           : gu_type == kIQ3_S ? 1100
+                                : 0;
 }
 inline const char* fmt_name(int gu_type) {
     switch (gu_type) {
+        case kIQ2_XXS: return "IQ2_XXS";
+        case kIQ2_XS: return "IQ2_XS";
         case kIQ3_XXS: return "IQ3_XXS";
         case kIQ3_S: return "IQ3_S";
         case kIQ2_S: return "IQ2_S";
@@ -215,6 +228,7 @@ struct Config {
     bool recheck = false;                  ///< STRATA_EXPERT_NIBBLE_RECHECK=1 (debug: every slot's hash per request)
     std::vector<int> fmts{ kIQ2_S, kIQ3_XXS, kIQ3_S };   ///< STRATA_EXPERT_NIBBLE_FMTS (default 22,18,21)
     std::vector<int64_t> skip;             ///< STRATA_EXPERT_NIBBLE_SKIP: layers kept in their GGUF blocks
+    bool xs = false;                       ///< STRATA_EXPERT_NIBBLE_XS=1: also IQ2_XS / IQ2_XXS (fmt_built_xs)
     std::string error;                     ///< non-empty: a malformed value - the start is refused
 };
 
@@ -246,6 +260,8 @@ inline const Config& config() {
         }
         const char* rc = std::getenv("STRATA_EXPERT_NIBBLE_RECHECK");
         r.recheck = rc != nullptr && std::strcmp(rc, "1") == 0;
+        const char* xs = std::getenv("STRATA_EXPERT_NIBBLE_XS");
+        r.xs = xs != nullptr && xs[0] != '\0' && std::strcmp(xs, "0") != 0;
         std::vector<int64_t> v;
         if (const char* f = std::getenv("STRATA_EXPERT_NIBBLE_FMTS"); f != nullptr && f[0] != '\0') {
             if (!detail::parse_list(f, v)) {
@@ -253,12 +269,16 @@ inline const Config& config() {
             } else {
                 r.fmts.clear();
                 for (const int64_t t : v) {
-                    if (!fmt_built((int) t) && r.error.empty())
+                    if (!fmt_built((int) t) && !(r.xs && fmt_built_xs((int) t)) && r.error.empty())
                         r.error = "STRATA_EXPERT_NIBBLE_FMTS: type " + std::to_string(t) +
-                                  " is not converted (22 IQ2_S, 18 IQ3_XXS, 21 IQ3_S)";
+                                  " is not converted (22 IQ2_S, 18 IQ3_XXS, 21 IQ3_S; 16 IQ2_XXS and 17 IQ2_XS with "
+                                  "STRATA_EXPERT_NIBBLE_XS=1)";
                     r.fmts.push_back((int) t);
                 }
             }
+        } else if (r.xs) {   // the default list, plus the two 2.0-2.3 bit formats the switch unlocks
+            r.fmts.push_back(kIQ2_XXS);
+            r.fmts.push_back(kIQ2_XS);
         }
         if (const char* k = std::getenv("STRATA_EXPERT_NIBBLE_SKIP"); k != nullptr && k[0] != '\0') {
             if (!detail::parse_list(k, r.skip) && r.error.empty())
@@ -268,6 +288,10 @@ inline const Config& config() {
     }();
     return c;
 }
+
+/// fmt_built, plus the XS formats when STRATA_EXPERT_NIBBLE_XS=1: the loader's, the transcoder's and the GGUF
+/// rebuild's gate for a layer (`plan_layer` below applies the same pair).
+inline bool fmt_on(int gu_type) { return fmt_built(gu_type) || (config().xs && fmt_built_xs(gu_type)); }
 
 /// With the switch on, the first environment setting it refuses, as a message (empty = none): the paths that would
 /// read a converted slot as GGUF blocks, write GGUF bytes into one, or run other kernels for the converted layers
@@ -331,7 +355,8 @@ inline LayerVram plan_layer(int64_t l, const strata::kernels::cpu::NativeFmt& f,
     const bool shape = f.n_embd == kNEmbd && f.n_ff == kNFf && f.gu_row == raw_gu_row(f.gu_type) &&
                        f.up_off == (uint64_t) kNFf * f.gu_row && f.down_off == 2 * f.up_off && f.bytes > f.down_off &&
                        f.tail_off == 0 && (f.bytes - f.down_off) % 16 == 0;
-    if (c.on && c.error.empty() && listed && !skipped && fmt_built(f.gu_type) && shape) {
+    if (c.on && c.error.empty() && listed && !skipped && (fmt_built(f.gu_type) || (c.xs && fmt_built_xs(f.gu_type))) &&
+        shape) {
         v.on = true;
         v.down_off = kDownOff;
         v.hashed = kGuBytes + v.down_bytes;
@@ -413,10 +438,13 @@ inline void guard_raw(int64_t l, const char* where) {
 // for bit the production gate/up: S stages the entries' q8_1 blocks in shared memory and decodes each item where it
 // is used (IQ3_S: v = 2u - 15 restored per byte, then the production apply); P loads the lane's codes, scales and d
 // before staging the qs words as 16-byte rows (IQ3_S: sum = 2 dot(u, x) - 15 sum(x), the same int32).  Per format the
-// faster one on 4x GP100 at T = 1..6 (native_expert_bench --nibble): IQ2_S P, IQ3_XXS S, IQ3_S S.
+// faster one on 4x GP100 at T = 1..6 (native_expert_bench --nibble): IQ2_S P, IQ2_XS P (its item is IQ2_S's),
+// IQ3_XXS S, IQ3_S S, IQ2_XXS S (one 4-bit scale an item, as IQ3_XXS's sign masks: P's early load buys nothing).
 
 inline constexpr int kSkelS = 0, kSkelP = 1;
-STRATA_NIB_HD constexpr int gu_skeleton(int gu_type) { return gu_type == kIQ2_S ? kSkelP : kSkelS; }
+STRATA_NIB_HD constexpr int gu_skeleton(int gu_type) {
+    return gu_type == kIQ2_S || gu_type == kIQ2_XS ? kSkelP : kSkelS;
+}
 
 // ------------------------------------------------------------------------------------------------ iq_kernels.cu
 //

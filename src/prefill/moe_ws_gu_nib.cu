@@ -70,6 +70,20 @@ template <> struct Dec<nb::kIQ2_S> {
     }
     __device__ static __forceinline__ void dx(const int ls, const int dbits, float& d0, float& d1) { scales16(ls, dbits, d0, d1); }
 };
+template <> struct Dec<nb::kIQ2_XS> : Dec<nb::kIQ2_S> {};   // the same item code and the same scales16 dx
+template <> struct Dec<nb::kIQ2_XXS> {   // IQ2_S's PRMT code set, one 4-bit scale an item: d * ls / 8 (xxs2)
+    __device__ static __forceinline__ void wv(const uint32_t (&q)[4], int (&w)[16]) {
+#pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            split2((int) __byte_perm(PX, PY, q[m]), w[4 * m + 0], w[4 * m + 1]);
+            split2((int) __byte_perm(PX, PY, q[m] >> 16), w[4 * m + 2], w[4 * m + 3]);
+        }
+    }
+    __device__ static __forceinline__ float dx(const int ls, const int dbits) {
+        const float d = __ushort_as_half((unsigned short) (dbits & 0xFFFF));
+        return d * ls / 8;   // moe_ws_gu_iq2.cu xxs2 (MMQ: (d * scale + d / 2) / 4), verbatim
+    }
+};
 template <> struct Dec<nb::kIQ3_XXS> {
     static constexpr uint32_t T0 = 0x1C140C04u, T1 = 0x3E342C24u;   // {4, 12, 20, 28} {36, 44, 52, 62}
     static constexpr uint32_t N0 = 0xE4ECF4FCu, N1 = 0xC2CCD4DCu;   // their negatives: (g ^ s) + (s & 1) for s = 0xFF
@@ -182,7 +196,7 @@ __global__ void __launch_bounds__(NT, 1) gu_kernel(const Chunk* __restrict__ chu
                 const int ls = (int) ((scv >> (8 * s)) & 0xFF);
                 int wv[16];
                 Dec<FMT>::wv(q, wv);
-                if constexpr (FMT == nb::kIQ2_S) {
+                if constexpr (FMT == nb::kIQ2_S || FMT == nb::kIQ2_XS) {
                     float dx0, dx1;
                     Dec<FMT>::dx(ls, dv, dx0, dx1);
                     mac16<TPP, CVT, TG>(wv, dx0, dx1, s, act_s, dy_s, nt, acc);
@@ -436,7 +450,7 @@ __global__ void __launch_bounds__(NT, 1) gu_kernel(const Chunk* __restrict__ chu
                 int wv[16];
                 if constexpr (DECF_) DecF<FMT>::wv(q, wv);
                 else Dec<FMT>::wv(q, wv);
-                if constexpr (FMT == nb::kIQ2_S) {
+                if constexpr (FMT == nb::kIQ2_S || FMT == nb::kIQ2_XS) {
                     float dx0, dx1;
                     Dec<FMT>::dx(ls, dv, dx0, dx1);
                     const auto one = [&](const int t, const float dy, const float a) {
@@ -507,6 +521,18 @@ void gu_nib(const Layer& L, double u, cudaStream_t s, bool fast_on, bool v2_on, 
                 else if (u < 17.0) go(gu_kernel<16, 0, 2, nb::kIQ2_S>, L, s);
                 else go_v2<1, nb::kIQ2_S, v2::DUFF | v2::CD | v2::LB3>(L, s);
                 break;
+            case nb::kIQ2_XS:   // IQ2_S's item, IQ2_S's tiers (no v2 kernel for these two: gu_kernel / fast)
+                if (u < 6.0) go(gu_kernel<8, 1, 2, nb::kIQ2_XS>, L, s);
+                else if (u < 25.0) go(fast::gu_kernel<16, 0, 2, nb::kIQ2_XS, fast::TAIL | fast::DUFF | fast::DYT>, L, s);
+                else if (f) go(fast::gu_kernel<32, 1, 4, nb::kIQ2_XS, fast::DUFF>, L, s);
+                else go(gu_kernel<32, 1, 4, nb::kIQ2_XS>, L, s);
+                break;
+            case nb::kIQ2_XXS:   // one scale an item (mac32): IQ3_XXS's tiers
+                if (u < 4.0) go(gu_kernel<8, 2, 2, nb::kIQ2_XXS>, L, s);
+                else if (u < 18.0) go(fast::gu_kernel<16, 1, 2, nb::kIQ2_XXS, fast::TAIL | fast::DUFF | fast::DYT>, L, s);
+                else if (f) go(fast::gu_kernel<32, 1, 4, nb::kIQ2_XXS, fast::TAIL | fast::DYT>, L, s);
+                else go(gu_kernel<32, 1, 4, nb::kIQ2_XXS>, L, s);
+                break;
             case nb::kIQ3_XXS:
                 if (u < 4.0) go(gu_kernel<8, 2, 2, nb::kIQ3_XXS>, L, s);
                 else if (u < 9.0) go(gu_kernel<16, 1, 2, nb::kIQ3_XXS>, L, s);
@@ -532,6 +558,18 @@ void gu_nib(const Layer& L, double u, cudaStream_t s, bool fast_on, bool v2_on, 
                 else if (u < 25.0) go(fast::gu_kernel<16, 0, 2, nb::kIQ2_S, fast::TAIL | fast::DUFF | fast::DYT>, L, s);
                 else if (f) go(fast::gu_kernel<32, 1, 4, nb::kIQ2_S, fast::DUFF>, L, s);
                 else go(gu_kernel<32, 1, 4, nb::kIQ2_S>, L, s);
+                break;
+            case nb::kIQ2_XS:   // IQ2_S's item, IQ2_S's tiers
+                if (u < 6.0) go(gu_kernel<8, 1, 2, nb::kIQ2_XS>, L, s);
+                else if (u < 25.0) go(fast::gu_kernel<16, 0, 2, nb::kIQ2_XS, fast::TAIL | fast::DUFF | fast::DYT>, L, s);
+                else if (f) go(fast::gu_kernel<32, 1, 4, nb::kIQ2_XS, fast::DUFF>, L, s);
+                else go(gu_kernel<32, 1, 4, nb::kIQ2_XS>, L, s);
+                break;
+            case nb::kIQ2_XXS:   // one scale an item (mac32): IQ3_XXS's tiers
+                if (u < 4.0) go(gu_kernel<8, 2, 2, nb::kIQ2_XXS>, L, s);
+                else if (u < 18.0) go(fast::gu_kernel<16, 1, 2, nb::kIQ2_XXS, fast::TAIL | fast::DUFF | fast::DYT>, L, s);
+                else if (f) go(fast::gu_kernel<32, 1, 4, nb::kIQ2_XXS, fast::TAIL | fast::DYT>, L, s);
+                else go(gu_kernel<32, 1, 4, nb::kIQ2_XXS>, L, s);
                 break;
             case nb::kIQ3_XXS:
                 if (u < 4.0) go(gu_kernel<8, 2, 2, nb::kIQ3_XXS>, L, s);
@@ -560,6 +598,18 @@ void gu_nib(const Layer& L, double u, cudaStream_t s, bool fast_on, bool v2_on, 
             else if (u < 25.0) go(gu_kernel<16, 0, 2, nb::kIQ2_S>, L, s);
             else if (f) go(fast::gu_kernel<32, 1, 4, nb::kIQ2_S, fast::DUFF>, L, s);
             else go(gu_kernel<32, 1, 4, nb::kIQ2_S>, L, s);
+            break;
+        case nb::kIQ2_XS:
+            if (u < 6.0) go(gu_kernel<8, 1, 2, nb::kIQ2_XS>, L, s);
+            else if (u < 25.0) go(gu_kernel<16, 0, 2, nb::kIQ2_XS>, L, s);
+            else if (f) go(fast::gu_kernel<32, 1, 4, nb::kIQ2_XS, fast::DUFF>, L, s);
+            else go(gu_kernel<32, 1, 4, nb::kIQ2_XS>, L, s);
+            break;
+        case nb::kIQ2_XXS:
+            if (u < 4.0) go(gu_kernel<8, 2, 2, nb::kIQ2_XXS>, L, s);
+            else if (u < 18.0) go(gu_kernel<16, 1, 2, nb::kIQ2_XXS>, L, s);
+            else if (f) go(fast::gu_kernel<32, 1, 4, nb::kIQ2_XXS, fast::TAIL | fast::DYT>, L, s);
+            else go(gu_kernel<32, 1, 4, nb::kIQ2_XXS>, L, s);
             break;
         case nb::kIQ3_XXS:
             if (u < 4.0) go(gu_kernel<8, 2, 2, nb::kIQ3_XXS>, L, s);

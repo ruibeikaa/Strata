@@ -376,6 +376,11 @@ int nibble_main(int argc, char** argv) {
         }
         nib::Config c;
         c.on = true;
+        c.xs = std::getenv("STRATA_EXPERT_NIBBLE_XS") != nullptr;   // W47: IQ2_XS / IQ2_XXS layers too
+        if (c.xs) {
+            c.fmts.push_back(nib::kIQ2_XS);
+            c.fmts.push_back(nib::kIQ2_XXS);
+        }
         const nib::LayerVram V = nib::plan_layer(l, f, c);
         if (!V.on) {
             std::printf("layer %d: %s is not converted\n", l, ggml_type_name((ggml_type) f.gu_type));
