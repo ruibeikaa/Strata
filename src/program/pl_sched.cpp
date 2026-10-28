@@ -4,8 +4,19 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 
 namespace strata::pl {
+
+// W43: STRATA_STATE_CLEAN=1 (default off) - a request's session must not depend on how much speculation ran.
+static bool state_clean_env() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_STATE_CLEAN");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return v;
+}
+
 
 const char* mode_name(Mode m) {
     switch (m) {
@@ -1046,7 +1057,12 @@ bool Sched::verdict(PlIo& io) {
     // reused that phantom prefix: campaign/dsw17-work/REPORT.md 2).  Row k of the window sits at p + k and pick k is
     // the token at p + k + 1, so covering the reply's last token takes ec + 1 rows: keep = min(a + 1, ec + 1).
     const int ec = std::max(io.emit_count(W, a, outp_), 0);   // how many of the a + 1 picks the reply emits
-    if (const int keep = std::min(a + 1, ec + 1); keep < a + 1) {
+    // W43 (STRATA_STATE_CLEAN=1): the commit also ends at the reply's last token when the accepted window ended
+    // exactly on it (keep was a + 1 there, which left the last emitted token out of the session: L = prompt +
+    // reply - 1 for a reply stopped by max_new, and so a different session for the same reply at depth 2 / 3)
+    int keep = std::min(a + 1, ec + 1);
+    if (state_clean_env() && ec > 0) keep = std::min(keep, ec);
+    if (keep < a + 1) {
         ++st_.trim_commit;
         a = keep - 1;
     }
