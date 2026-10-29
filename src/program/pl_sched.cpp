@@ -427,8 +427,11 @@ bool Sched::lkc_tail_ok(int match) {
     if (ok && c_.lkc_adapt_acc > 0 && st_.lkc_tokens >= c_.lkc_adapt_warm &&
         st_.lkc_ok * 100 < (int64_t) c_.lkc_adapt_acc * st_.lkc_tokens)
         ok = false;
-    if (ok && c_.lkc_rate > 0 && st_.lkc_probe_n >= c_.lkc_rate_warm &&
-        st_.lkc_probe_hit * 100 < (int64_t) c_.lkc_rate * st_.lkc_probe_n) {
+    // the copy-rate test also holds the tails back until it has seen lkc_rate_warm windows: a request's first tails,
+    // taken before anything says it copies, cost a 141K real turn 4% (lkc_rate's own tails, 5 of them, 9 of 14 tokens
+    // accepted, then more rolled-back guesses for the rest of the reply - lkt-work\t3, review 10-29)
+    if (ok && c_.lkc_rate > 0 && (st_.lkc_probe_n < c_.lkc_rate_warm ||
+                                  st_.lkc_probe_hit * 100 < (int64_t) c_.lkc_rate * st_.lkc_probe_n)) {
         ok = false;
         ++st_.lkc_rate_stop;
     }
