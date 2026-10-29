@@ -136,7 +136,8 @@ private:
         DefaultInit() = default;
         template<class U> DefaultInit(const DefaultInit<U>&) noexcept {}
         template<class U> void construct(U* p) { ::new ((void*) p) U; }
-        template<class U, class... A> void construct(U* p, A&&... a) { ::new ((void*) p) U(std::forward<A>(a)...); }
+        // (no construct(p, args...): allocator_traits places those itself, and only an allocator without one keeps
+        // MSVC's fill and copy on memset / memmove - with it, a park's fill and a buffer copy go byte by byte)
     };
     using Segment = std::vector<uint8_t, DefaultInit<uint8_t>>;
     // A fresh capture allocates exactly its payload. Later appends reserve

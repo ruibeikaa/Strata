@@ -357,8 +357,9 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         const bool staged = a.active && src[i] != nullptr && sizes[i] > keep && a.used + (sizes[i] - keep) <= a.cap &&
                             (st.kv_mode == 0 || on_device(src[i]));
         const auto t1 = tick();
-        if (staged) dst[i]->resize_for_overwrite(sizes[i]);
-        else dst[i]->resize(sizes[i]);
+        // no zero fill either way: the bytes it adds start past the kept prefix (keep <= size, checked above), and the
+        // copy below writes all of [keep, sizes[i]) - or fails, and `image` is a capture the caller then drops
+        dst[i]->resize_for_overwrite(sizes[i]);
         const auto t2 = tick();
         const bool copied = dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
                 const uint8_t* s = src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr;
