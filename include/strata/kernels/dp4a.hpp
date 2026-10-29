@@ -29,12 +29,14 @@ __device__ __forceinline__ int strata_dp4a(const int a, const int b, const int c
     // PTX vmad with byte selectors: compiles to four VMAD.S8.S8 (cuobjdump -sass), no byte extraction.
     // Bit-exact with the byte-wise form it replaces: 1.07e9 cases (edge bytes, every per-lane byte pair, random),
     // 0 mismatches, ~2.2x faster in isolation on a Tesla P100 (tools/sm60_dp4a_check.cu).
+    // "+&r" (early clobber): the first vmad writes %0 before the other three read %1 and %2, so the accumulator must
+    // not share a register with a or b (upstream #4274: a probe forcing that alias got ~62K of 65,536 dots wrong)
     int r = c;
     asm("vmad.s32.s32.s32 %0, %1.b0, %2.b0, %0;\n\t"
         "vmad.s32.s32.s32 %0, %1.b1, %2.b1, %0;\n\t"
         "vmad.s32.s32.s32 %0, %1.b2, %2.b2, %0;\n\t"
         "vmad.s32.s32.s32 %0, %1.b3, %2.b3, %0;"
-        : "+r"(r) : "r"(a), "r"(b));
+        : "+&r"(r) : "r"(a), "r"(b));
     return r;
 }
 #define STRATA_DP4A(a, b, c) strata_dp4a((a), (b), (c))
