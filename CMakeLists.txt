@@ -1002,6 +1002,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       foreach(_t strata_dsv41_kernels strata-dsv41)
         target_compile_options(${_t} PRIVATE "$<$<COMPILE_LANGUAGE:HIP,CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/dsv41/hip_extra.h>")
       endforeach()
+    endif()
+  endif()
+
   # mtp_chain_parity: the draft chain at up to 11 outputs (MtpDrafter::kChainMax) checked against the code it replaced:
   # src/core/mtp.cpp and include/strata/core/mtp.hpp as they were at STRATA_MTP_PARITY_BASE (the commit before the
   # 11-output chain), copied out of git into the build directory with the class renamed (MtpDrafterBase), so one

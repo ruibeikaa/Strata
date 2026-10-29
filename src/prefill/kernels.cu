@@ -3062,6 +3062,7 @@ void moe_scatter_add(const float* Dm, const int32_t* u_tok, const int32_t* u_off
     const dim3 grid((unsigned) n_u, (unsigned) ((N + 255) / 256));
     moe_scatter_add_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(Dm, u_tok, u_off, u_rows, u_w, acc);
     check("moe_scatter_add");
+}
 bool moe_combine_write_norm_rs(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg,
                                float* R, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps, float* rs,
                                uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo, int64_t ldx, bool f16img) {
