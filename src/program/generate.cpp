@@ -9635,8 +9635,15 @@ int main(int argc, char** argv) {
             // --prefill N, and no host-aware plan of smaller chunks).  Otherwise refused, never a quietly different reply.
             std::string why;
             const int64_t expect = o.prefill_auto ? auto_ceiling : nib_chunk_asked;
-            if (any_loan) why = "the prompt path borrows expert-cache slots (a loan is refilled with GGUF blobs)";
-            else if (o.prefill_chunk != expect)
+            if (any_loan) {
+                why = "the prompt path borrows expert-cache slots (a loan is refilled with GGUF blobs)";
+                // a layer split's stages keep their own prompt buffers when their cards have room (#340): the trim
+                // gives each card back the dense weights of the other stages' layers (2x PH402 = four GP100, split
+                // 12,24,36, Swift 1.5 IQ3_S: the last stage's loan of 1667 slots is gone with it)
+                if (multi_gpu && !trim_asked)
+                    why += "; with a layer split, STRATA_STAGE_TRIM=1 (each GPU loads only its own layers' dense weights) "
+                           "may leave the room for the prompt path's own buffers";
+            } else if (o.prefill_chunk != expect)
                 why = "the prompt chunk is " + std::to_string(o.prefill_chunk) + " tokens, not the " + std::to_string(expect) +
                       " it is without the switch when nothing limits it (that would change the replies' bits; an explicit "
                       "--prefill N that fits keeps N)";
