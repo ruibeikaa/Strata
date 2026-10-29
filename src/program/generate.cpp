@@ -16409,7 +16409,10 @@ int main(int argc, char** argv) {
                     return emit_keep(a, outp);
                 };
                 io.f_observe = [&](const strata::pl::PW& w, int a, double ms) {
-                    if (w.lkc > 0) policy.observe_chain(w.T - w.lkc, w.lkc, a, w.lkc_match, ms);
+                    // a window with a lookup tail leaves the size costs alone (round time 0): its tails come in copy
+                    // stretches whose windows overlap, so they priced the wide sizes low and the plain lookup windows
+                    // grew past what they get accepted (10-29 split: a 27K write's lookup drafts 19 of 23 -> 9 of 22)
+                    if (w.lkc > 0) policy.observe_chain(w.T - w.lkc, w.lkc, a, w.lkc_match, 0.0);
                     else policy.observe(w.sfx, w.T, a, w.sfx_match, ms);
                 };
                 io.f_now = [&]() { return ms_now(); };
