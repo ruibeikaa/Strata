@@ -16050,6 +16050,10 @@ int main(int argc, char** argv) {
                 // queued, US one stage's undo queued, SW a window waiting for a slot; L0's x1 = 10 k + st)
                 static const char* pl_trace_path = pipe_dbg_env("STRATA_PIPELINE_TRACE");
                 std::string pl_trace;
+                // STRATA_POLICY_LOG=<file> (debug): every lookup choice the draft policy made (what it weighed) and every
+                // window it was told about, appended per request
+                static const char* pol_log_path = pipe_dbg_env("STRATA_POLICY_LOG");
+                std::string pol_log;
                 const Clock::time_point pl_tr0 = Clock::now();
                 auto tre = [&](const char* ev, int seq, int x0, int x1) {
                     if (pl_trace_path == nullptr) return;
@@ -16170,6 +16174,11 @@ int main(int argc, char** argv) {
                 };
                 io.f_lookup_choose = [&](int T, int k, int match, int& t) {
                     const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, match);
+                    if (pol_log_path != nullptr) {
+                        char b[64];
+                        std::snprintf(b, sizeof b, "C %d %d %d -> %d %d | ", T, k, match, pk.lookup ? 1 : 0, pk.t);
+                        pol_log += b + policy.debug(T, k, match) + "\n";
+                    }
                     t = pk.t;
                     return pk.lookup;
                 };
@@ -16409,10 +16418,23 @@ int main(int argc, char** argv) {
                     return emit_keep(a, outp);
                 };
                 io.f_observe = [&](const strata::pl::PW& w, int a, double ms) {
-                    // a window with a lookup tail leaves the size costs alone (round time 0): its tails come in copy
-                    // stretches whose windows overlap, so they priced the wide sizes low and the plain lookup windows
-                    // grew past what they get accepted (10-29 split: a 27K write's lookup drafts 19 of 23 -> 9 of 22)
-                    if (w.lkc > 0) policy.observe_chain(w.T - w.lkc, w.lkc, a, w.lkc_match, 0.0);
+                    if (pol_log_path != nullptr) {
+                        char b[96];
+                        std::snprintf(b, sizeof b, "O sfx %d lkc %d T %d a %d match %d/%d ms %.2f\n", w.sfx ? 1 : 0, w.lkc,
+                                      w.T, a, w.sfx_match, w.lkc_match, ms);
+                        pol_log += b;
+                    }
+                    // a window with a lookup tail is priced as its MTP part, its time scaled down by the prior shape:
+                    // the size costs mix the window's place in the pipeline (an overlapped window ~20-30 ms, a fresh one
+                    // ~40-60), and the tails ride on the overlapped windows of a copy stretch.  Priced at T they made the
+                    // wide sizes cheap; left out, the MTP's own sizes kept mostly fresh windows (a 27K write after a 25K
+                    // edit: 4 rows 38.3 ms from 11 samples against 27.4 from 130 without the chain); at the MTP's size
+                    // unscaled they made the small sizes dear.  Each way the plain lookup took 6-row windows that missed
+                    // (STRATA_POLICY_LOG, 10-29).  Scaled: a 4 + 2 window's 40.7 ms -> 29.3, the plain 4-row 30.6.
+                    if (w.lkc > 0) {
+                        policy.observe_chain(w.T - w.lkc, w.lkc, a, w.lkc_match, 0.0);
+                        policy.observe_cost(w.T - w.lkc, w.T, ms);
+                    }
                     else policy.observe(w.sfx, w.T, a, w.sfx_match, ms);
                 };
                 io.f_now = [&]() { return ms_now(); };
@@ -16489,6 +16511,13 @@ int main(int argc, char** argv) {
                 a_pl_settle();
                 for (cudaEvent_t ev : fence_ev) if (ev) cudaEventDestroy(ev);
                 for (cudaEvent_t ev : exch_ev) if (ev) cudaEventDestroy(ev);
+                if (pol_log_path != nullptr && !pol_log.empty()) {
+                    if (std::FILE* f = std::fopen(pol_log_path, "a")) {
+                        std::fprintf(f, "# request p0=%lld\n", (long long) (n - 1));
+                        std::fwrite(pol_log.data(), 1, pol_log.size(), f);
+                        std::fclose(f);
+                    }
+                }
                 if (pl_trace_path != nullptr && !pl_trace.empty()) {
                     if (std::FILE* f = std::fopen(pl_trace_path, "a")) {
                         std::fprintf(f, "# request p0=%lld\n# mode=%s\n", (long long) (n - 1), strata::pl::mode_name(pl_m));

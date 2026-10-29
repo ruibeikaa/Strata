@@ -16,6 +16,7 @@
 #pragma once
 
 #include <array>
+#include <string>
 
 namespace strata::spec {
 
@@ -42,9 +43,14 @@ public:
     int chain(int t_mtp, double p_mtp, int k_avail, int match) const;
     /// After a chained round: the MTP window's size, the chained tokens, the window's accepted drafts, its time.
     void observe_chain(int t_mtp, int k, int accepted, int match, double round_ms);
+    /// STRATA_LKCHAIN (the pipelined loop): the time of a round of `t_window` tokens recorded for a window of `t`
+    /// tokens (its MTP part), scaled down by the prior shape of a round's cost by size; nothing else
+    void observe_cost(int t, int t_window, double round_ms);
     double chain_rate(int match) const;
     double lookup_rate(int match) const;   // current q for a match length
     double cost_ms(int t) const;           // measured or scaled round time of a window of t tokens
+    /// STRATA_POLICY_LOG: what choose() weighed for these arguments (rate, MTP base, each size's cost / count / staleness)
+    std::string debug(int t_mtp, int lookup_k, int match) const;
 
 private:
     static int bucket(int match);

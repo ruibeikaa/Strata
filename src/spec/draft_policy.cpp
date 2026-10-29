@@ -2,6 +2,7 @@
 #include "strata/spec/draft_policy.hpp"
 
 #include <algorithm>
+#include <cstdio>
 
 namespace strata::spec {
 namespace {
@@ -156,6 +157,28 @@ void DraftPolicy::observe_chain(int t_mtp, int k, int accepted, int match, doubl
     const int b = bucket(match), ok = accepted - (t_mtp - 1);
     cok_[b] = kDecay * cok_[b] + ok;
     cbad_[b] = kDecay * cbad_[b] + (ok < k ? 1.0 : 0.0);
+}
+
+void DraftPolicy::observe_cost(int t, int t_window, double round_ms) {
+    t = std::clamp(t, 1, kMaxT);
+    t_window = std::clamp(t_window, t, kMaxT);
+    if (round_ms <= 0) return;
+    round_ms *= kShape[t] / kShape[t_window];
+    cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
+    cost_n_[t] += 1.0;
+    last_[t] = rounds_;
+}
+
+std::string DraftPolicy::debug(int t_mtp, int lookup_k, int match) const {
+    const int t0 = std::clamp(t_mtp, 1, max_t_);
+    char b[96];
+    std::snprintf(b, sizeof b, "q %.3f base %.4f r %.0f", lookup_rate(match), mtp_tokens(t0) / cost_ms(t0), rounds_);
+    std::string s = b;
+    for (int t = 1; t <= std::min(std::max(lookup_k, 0), max_t_ - 1) + 1; ++t) {
+        std::snprintf(b, sizeof b, " | %d:%.2f/%.0f%s", t, cost_ms(t), cost_n_[t], stale(t) ? "S" : "");
+        s += b;
+    }
+    return s;
 }
 
 }  // namespace strata::spec
