@@ -54,13 +54,16 @@
 namespace strata::prefill::mmq {
 
 // A second net behind the configure fingerprint: the upstream templates this copy calls keep their signatures.
-static_assert(std::is_same<decltype(&mul_mat_q_process_tile<GGML_TYPE_Q8_0, 8, false, false>),
-                           void (*)(const char*, int, const int*, const int*, float*, float*, const float*, int, int, int,
-                                    int, int, int, int)>::value,
+// is_convertible, not is_same: with MSVC as the host compiler, nvcc keeps a parameter's __restrict__ in the function
+// type, so decltype(&f) never equals a spelled-out pointer type there (with or without __restrict__), while a pointer
+// of another signature still does not convert.
+static_assert(std::is_convertible<decltype(&mul_mat_q_process_tile<GGML_TYPE_Q8_0, 8, false, false>),
+                                  void (*)(const char*, int, const int*, const int*, float*, float*, const float*, int,
+                                           int, int, int, int, int, int)>::value,
               "mmq.cuh: mul_mat_q_process_tile changed - re-sync src/prefill/moe_mmq_tab.cuh");
-static_assert(std::is_same<decltype(&mul_mat_q_stream_k_fixup<GGML_TYPE_Q8_0, 8, false>),
-                           void (*)(const int32_t*, const int32_t*, float*, float*, uint3, int, int, int, uint3, int,
-                                    uint3, int, uint3)>::value,
+static_assert(std::is_convertible<decltype(&mul_mat_q_stream_k_fixup<GGML_TYPE_Q8_0, 8, false>),
+                                  void (*)(const int32_t*, const int32_t*, float*, float*, uint3, int, int, int, uint3,
+                                           int, uint3, int, uint3)>::value,
               "mmq.cuh: mul_mat_q_stream_k_fixup changed - re-sync src/prefill/moe_mmq_tab.cuh");
 
 // The table reaches the kernel as 16 separate `const char * __restrict__` parameters, like upstream's `x`, and an
