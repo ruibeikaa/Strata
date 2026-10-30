@@ -42,6 +42,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import traceback
 import time
 import urllib.request
 import uuid
@@ -889,15 +890,15 @@ class StrataEngine:
         except Exception as e:                          # never let it block the unload
             print(f"[strata] parked conversations not saved: {e}", flush=True)
             return
+        if self.PARK_RAMLIKE:
+            self._park_keep_bounded(r["tokens"])
+            return
         blob = None
         if self.echo is not None:
             try:
                 blob = self.echo.export()
             except Exception as e:
                 print(f"[strata] prompt echo: entries not exported: {e}", flush=True)
-        if self.PARK_RAMLIKE:
-            self._park_keep(r["tokens"], blob)
-            return
         path = os.path.join(self.PARK_DIR, self.ECHO_FILE)
         try:
             if blob and r["tokens"]:
@@ -909,12 +910,38 @@ class StrataEngine:
         except OSError as e:
             print(f"[strata] prompt echo: entries not saved: {e}", flush=True)
 
-    def _park_keep(self, conversations: int, blob) -> None:
+    def _park_keep_bounded(self, conversations: int) -> None:
+        """The echo's export and the keeper hand-over, in a thread the unload waits for at most so long.  The unload holds
+        the service's FIFO and the engine open, and the stop script gives up on POST /unload after 120 s and kills the
+        serve: a step that blocked here (2026-10-30 16:00: the line "parked conversations saved" was the last one, 120 s
+        before the forced stop) used to take the whole stop with it, and left nothing in the log about where it was."""
+        def work():
+            blob = None
+            t_export = time.monotonic()
+            if self.echo is not None:
+                try:
+                    blob = self.echo.export()
+                except Exception as e:
+                    print(f"[strata] prompt echo: entries not exported: {e}", flush=True)
+            self._park_keep(conversations, blob, time.monotonic() - t_export)
+
+        limit = park_keeper.spawn_wait_s() + 15.0
+        th = threading.Thread(target=work, name="park-keep", daemon=True)
+        th.start()
+        th.join(limit)
+        if th.is_alive():
+            frame = sys._current_frames().get(th.ident)
+            where = "".join(traceback.format_stack(frame)[-5:]).rstrip() if frame is not None else "(no frame)"
+            print(f"[strata] parked conversations not kept in RAM: the hand-over to the keeper is still running after "
+                  f"{limit:.0f} s; the unload goes on.  It was in:\n{where}", flush=True)
+
+    def _park_keep(self, conversations: int, blob, export_s: float = 0.0) -> None:
         """RAM-like: a keeper process takes the sections the engine still holds, before the engine is closed."""
         if not conversations:
             park_keeper.release(self.PARK_DIR)          # nothing kept: an older keeper ends too
             return
         echo_sec, echo_name = None, ""
+        t0 = time.monotonic()
         try:
             if blob:
                 echo_sec, echo_name = park_keeper.put_echo(blob)
@@ -923,11 +950,12 @@ class StrataEngine:
             missing = doc.get("missing") or []
             print(f"[strata] parked conversations kept in RAM by keeper PID {doc['pid']}: {doc['sections']} sections, "
                   f"{doc['bytes'] / 1e9:.2f} GB{' + the prompt echo' if doc.get('echo') else ''} "
-                  f"({time.monotonic() - t0:.1f} s; released at the next start or after "
+                  f"({time.monotonic() - t0:.1f} s, the echo's export {export_s:.1f} s; released at the next start or after "
                   f"{self._park_max_age_s() / 3600:.0f} h){'; MISSING ' + ', '.join(missing) if missing else ''}",
                   flush=True)
         except Exception as e:
-            print(f"[strata] parked conversations not kept in RAM: {e}", flush=True)
+            print(f"[strata] parked conversations not kept in RAM: {e} (the echo's export {export_s:.1f} s, "
+                  f"the keeper's wait {time.monotonic() - t0:.1f} s)", flush=True)
         finally:
             if echo_sec is not None:
                 echo_sec.close()                        # the keeper holds its own handle now (or nobody does)
