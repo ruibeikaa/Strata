@@ -45,7 +45,7 @@ CUDA 12.9, Visual Studio 2022 Build Tools (the device code needs C++20), Ninja, 
 
 ## How it is served
 
-Serve from the `strata-serve` tree (0.1.41 serve with the graceful-exit and reasoning-close-retry patches). Engine
+Serve from the branch `ph402-serve-0141` of this fork (f75d6a826: the 0.1.41 serve with the graceful-exit, prompt-echo, reasoning-close-retry and RAM-parking patches). Engine
 arguments on top of the setup template (both routes; 8110 at 1M context with yarn rope scale 4):
 
     --layer-split 12,24,36 --trim-stage-weights --kv int8 --spec 4 --spec-min-p 0.85 --mtp-window 8192
@@ -75,5 +75,9 @@ Against the 2026-10-24 baseline (`ph402-stack-main` era, same 16 requests, same 
 Board-internal TP2 / two-stage pairs (-15% in the real pipeline); second-candidate speculation (the pipeline windows
 share the K/V); head split across dies; moving the draft chain; changing the split points (reads -7%); persistent / grid-barrier
 kernels; HC prefetch; FP16 prompt GEMMs (not bit-exact); per-row draft gates (seesaw); multi-stream batch (-23..43% single
-stream). Instruction-cache cold starts exist only on single-block kernels (route, block_topk, the draft-step graph); the
+stream); launching `resident_plan` / `group_resident` with only the warps that hold an entry (bit-identical, no speed change). Instruction-cache cold starts exist only on single-block kernels (route, block_topk, the draft-step graph); the
 multi-block kernels run at their bench speed in the graph.
+
+## Conversations over a restart (2026-10-30)
+
+With `STRATA_PARK_RAMLIKE=1` a graceful stop keeps conversations of 50K tokens or more in RAM for one hour. Checked on the route with two real sessions, a read in flight and the client gone: the stop took 23 s, the keeper was ready in 2.0 s (5.97 GB), and after the restart a 202K-token session went on in 1.9 s (175.5 s from zero) and a 141K-token one in 1.3 s (123.7 s from zero). A stop that hung for 120 s on 2026-10-30 was not reproduced, so its cause is not known; the hand-over is now bounded at 45 s and logs the stack where it blocked.
