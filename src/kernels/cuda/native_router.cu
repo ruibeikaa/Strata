@@ -26,6 +26,7 @@
 #include <cfloat>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace strata::kernels {
@@ -205,6 +206,15 @@ __global__ void route_topk(const float* __restrict__ logits, int32_t* __restrict
     const float inverse_selected_sum = 1.0f / selected_sum;
     if (lane < K) weights[lane] = selected * inverse_selected_sum;
 }
+// S2 (campaign, opt-in STRATA_S2_ROUTE_SMALL=1): route / route_multi launched with only the warps that work (1 warp for one
+// token, n_tok warps for a window) instead of the pinned 32x8 block whose other warps return at once.  The kernels are not
+// touched - the same instructions on the same lanes, so the same bits - but a 256-thread block needs 256 thread slots and
+// 53 x 256 registers on one SM before it can start, and beside the expert kernels (64 registers x 256 threads, four to an SM)
+// a 32-thread block fits where a 256-thread one does not.
+bool s2_route_small() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_S2_ROUTE_SMALL"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
 bool valid(const void* p, size_t bytes) {
     const auto address = reinterpret_cast<uintptr_t>(p);
     return p && address % 4 == 0 && bytes <= UINTPTR_MAX - address;
@@ -221,7 +231,7 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
         || overlap(logits, 512 * 4, ids, 10 * 4) || overlap(logits, 512 * 4, weights, 10 * 4)
         || overlap(ids, 10 * 4, weights, 10 * 4))
         throw std::invalid_argument("native router requires a stream, aligned spans, and disjoint outputs");
-    route<<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
+    route<<<1, dim3(32, s2_route_small() ? 1 : 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
@@ -229,7 +239,8 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
     if (!stream || n_tok < 1 || !valid(logits, (size_t) n_tok * 512 * 4) || !valid(ids, (size_t) n_tok * 10 * 4) ||
         !valid(weights, (size_t) n_tok * 10 * 4))
         throw std::invalid_argument("native router (multi) requires a stream and aligned [n,512]/[n,10] buffers");
-    route_multi<<<(unsigned) ((n_tok + 7) / 8), dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, n_tok);
+    route_multi<<<(unsigned) ((n_tok + 7) / 8), dim3(32, s2_route_small() ? (unsigned) (n_tok < 8 ? n_tok : 8) : 8u), 0,
+                  static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, n_tok);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

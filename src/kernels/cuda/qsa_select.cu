@@ -853,13 +853,22 @@ __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __res
 // reach > fit, i.e. the deep contexts where the ref radix was the only option on AMD).
 constexpr int TS_MAXQ = 4096;
 __device__ int g_tk_fail[TS_MAXQ];   // block_topk_sample_kernel: 1 = the query is block_topk_wide_kernel<true>'s
-template <bool ONLY_FAILED = false>
+// S2 (campaign, opt-in): STRATA_S2_TOPK_PSCAN=1 launches block_topk_wide_kernel with the parallel digit search (below)
+static bool s2_topk_pscan() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_S2_TOPK_PSCAN"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+// S2 (campaign, STRATA_S2_TOPK_PSCAN=1): PSCAN = the digit of each radix pass found by the register kernel's parallel
+// prefix sum over the 256 bins (threads 0-255) instead of thread 0 walking the bins from 255 down (up to 256 dependent
+// shared loads a pass, four passes).  Integer counts only: the same digit and the same count above, so the same ids.
+template <bool ONLY_FAILED = false, bool PSCAN = false>
 __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __restrict__ scores,
                                                                const int32_t* __restrict__ steps, int64_t max_blocks,
                                                                int64_t cap, int32_t* __restrict__ ids) {
     if (ONLY_FAILED && !g_tk_fail[blockIdx.x]) return;
     __shared__ int hist[TK_T / 32][256];
     __shared__ int s_gt[TK_T / 32], s_eq[TK_T / 32];
+    __shared__ int s_warp_ps[PSCAN ? 33 : 1];
     __shared__ int s_digit, s_above;
     const int64_t qi = blockIdx.x;
     const int32_t* st = steps + qi * kStepCount;
@@ -893,6 +902,29 @@ __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __re
             hist[0][t] = sum;
         }
         __syncthreads();
+        if (PSCAN) {
+            int v = 0, x = 0;
+            if (t < 256) {
+                v = hist[0][255 - t];
+                x = v;
+#pragma unroll
+                for (int o = 1; o < 32; o <<= 1) {
+                    const int y = __shfl_up_sync(0xffffffffu, x, o);
+                    if (lane >= o) x += y;
+                }
+                if (lane == 31) s_warp_ps[warp] = x;
+            }
+            __syncthreads();
+            if (t < 256) {
+                int inc = x;
+                for (int w2 = 0; w2 < warp; ++w2) inc += s_warp_ps[w2];
+                const int before = above + inc - v;
+                if (before < width && (above + inc >= width || t == 255)) {
+                    s_digit = 255 - t;
+                    s_above = before;
+                }
+            }
+        } else
         if (t == 0) {
             int cum = above, d = 255;
             for (; d > 0; --d) {
@@ -2950,9 +2982,15 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
 #if !defined(__HIPCC__)
         if (counted && nq <= TS_MAXQ && reach > 28672 && topk_sample_on()) {   // one read of the scores (below ~115K cells the wide kernel is as fast)
             block_topk_sample_kernel<<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+            if (s2_topk_pscan())
+                block_topk_wide_kernel<true, true><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+            else
             block_topk_wide_kernel<true><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
         } else
 #endif
+        if (s2_topk_pscan())
+            block_topk_wide_kernel<false, true><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+        else
         block_topk_wide_kernel<false><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
     } else
     if (reach <= (int64_t) TK_T * TK_PER)
