@@ -149,6 +149,73 @@ __global__ void route_multi(const float* __restrict__ logits, int32_t* __restric
     const float inverse_selected_sum = 1.0f / selected_sum;
     if (lane < 10) weights[lane] = selected * inverse_selected_sum;
 }
+// S2 (campaign, opt-in STRATA_S2_ROUTE_SMALL&2): route / route_multi with the rank loop NOT unrolled.  The pinned kernels compile to
+// 1,518 SASS instructions (~12 KB of straight-line code: ten copies of the scan + butterfly), and in the decode graph this 1-warp
+// kernel runs alone on the die at ~35 us against ~11 us when the same node is replayed back to back (route_chain_bench): the
+// instructions are fetched cold from L2 every launch.  Here one copy of the round is executed ten times (from the instruction
+// cache after the first).  The same operations on the same values in the same order: the selection, the winner lane's
+// accumulation order (by winning expert lane, in selection order) and the final division are the pinned kernel's.
+template <bool MULTI>
+__launch_bounds__(256, 1)
+__global__ void route_loop(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights, int n_tok) {
+    int tk;
+    if (MULTI) {
+        tk = (int) blockIdx.x * 8 + (int) threadIdx.y;
+        if (tk >= n_tok) return;
+    } else {
+        if (threadIdx.y != 0) return;
+        tk = (int) blockIdx.x;
+    }
+    logits += (size_t) tk * 512; ids += (size_t) tk * 10; weights += (size_t) tk * 10;
+    const int lane = threadIdx.x;
+    float values[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
+    __syncwarp();
+    float maximum = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) maximum = max(maximum, values[i]);
+    maximum = warp_max(maximum);
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        values[i] = expf(values[i] - maximum);
+        sum += values[i];
+    }
+    const float reciprocal = 1.0f / warp_sum(sum);
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        values[i] *= reciprocal;
+        if (__isnanf(values[i])) values[i] = -FLT_MAX;
+    }
+    float selected = 0.0f, selected_sum = 0.0f;
+#pragma unroll 1
+    for (int rank = 0; rank < 10; ++rank) {
+        float best = values[0];
+        int expert = lane;
+#pragma unroll
+        for (int i = 1; i < 16; ++i) {
+            if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
+        }
+#pragma unroll
+        for (int mask = 16; mask; mask >>= 1) {
+            const float other = __shfl_xor_sync(0xffffffffu, best, mask, 32);
+            const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
+            if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
+        }
+        if ((expert & 31) == lane) {
+            const int slot = expert >> 5;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) if (i == slot) values[i] = -INFINITY;
+            ids[rank] = expert;
+            selected_sum += best;
+        }
+        if (rank == lane) selected = best;
+    }
+    selected_sum = max(warp_sum(selected_sum), 6.103515625e-5f);
+    const float inverse_selected_sum = 1.0f / selected_sum;
+    if (lane < 10) weights[lane] = selected * inverse_selected_sum;
+}
 // The same contract for other (experts, top-k) shapes - Qwen3.6-35B-A3B's 256 / 8 - one warp per token, n_tok tokens
 // (8 per block).  The 512 / 10 path keeps its own kernels above (the Flash-Next bits), this template is only used
 // for the other shapes.
@@ -211,9 +278,9 @@ __global__ void route_topk(const float* __restrict__ logits, int32_t* __restrict
 // touched - the same instructions on the same lanes, so the same bits - but a 256-thread block needs 256 thread slots and
 // 53 x 256 registers on one SM before it can start, and beside the expert kernels (64 registers x 256 threads, four to an SM)
 // a 32-thread block fits where a 256-thread one does not.
-bool s2_route_small() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_S2_ROUTE_SMALL"); return v != nullptr && std::atoi(v) != 0; }();
-    return on;
+int s2_route_small() {   // bit 1 = small block, bit 2 = route_loop (below)
+    static const int v = [] { const char* e = std::getenv("STRATA_S2_ROUTE_SMALL"); return e != nullptr ? std::atoi(e) : 0; }();
+    return v;
 }
 bool valid(const void* p, size_t bytes) {
     const auto address = reinterpret_cast<uintptr_t>(p);
@@ -231,7 +298,9 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
         || overlap(logits, 512 * 4, ids, 10 * 4) || overlap(logits, 512 * 4, weights, 10 * 4)
         || overlap(ids, 10 * 4, weights, 10 * 4))
         throw std::invalid_argument("native router requires a stream, aligned spans, and disjoint outputs");
-    route<<<1, dim3(32, s2_route_small() ? 1 : 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
+    if (s2_route_small() & 2) route_loop<false><<<1, dim3(32, 1), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, 1);
+    else
+    route<<<1, dim3(32, (s2_route_small() & 1) ? 1 : 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
@@ -239,7 +308,11 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
     if (!stream || n_tok < 1 || !valid(logits, (size_t) n_tok * 512 * 4) || !valid(ids, (size_t) n_tok * 10 * 4) ||
         !valid(weights, (size_t) n_tok * 10 * 4))
         throw std::invalid_argument("native router (multi) requires a stream and aligned [n,512]/[n,10] buffers");
-    route_multi<<<(unsigned) ((n_tok + 7) / 8), dim3(32, s2_route_small() ? (unsigned) (n_tok < 8 ? n_tok : 8) : 8u), 0,
+    if (s2_route_small() & 2)
+        route_loop<true><<<(unsigned) ((n_tok + 7) / 8), dim3(32, (unsigned) (n_tok < 8 ? n_tok : 8)), 0,
+                           static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, n_tok);
+    else
+    route_multi<<<(unsigned) ((n_tok + 7) / 8), dim3(32, (s2_route_small() & 1) ? (unsigned) (n_tok < 8 ? n_tok : 8) : 8u), 0,
                   static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, n_tok);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));

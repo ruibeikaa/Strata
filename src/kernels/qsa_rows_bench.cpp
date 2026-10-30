@@ -225,6 +225,13 @@ int main(int argc, char** argv) {
     ck(cudaDeviceSynchronize(), "selection");
     {
         const std::vector<int32_t> hid = download(ids, (size_t) (MAXT * cap));
+        {   // S2: the ids of every row's selection (width cells), FNV-1a: compare across env switches (STRATA_S2_TOPK_PSCAN)
+            unsigned long long h = 1469598103934665603ull;
+            for (int t = 0; t < MAXT; ++t)
+                for (int j = 0; j < hst[(size_t) t * k::kStepCount + k::kStepWidth]; ++j)
+                    for (int b = 0; b < 4; ++b) h = (h ^ (unsigned char) ((hid[(size_t) t * cap + j] >> (8 * b)) & 0xff)) * 1099511628211ull;
+            std::printf("  selection ids hash %016llx;", h);
+        }
         std::printf("  selections: width %d a row;", hst[k::kStepWidth]);
         for (int T = 2; T <= MAXT; ++T) {
             std::set<int32_t> u;
