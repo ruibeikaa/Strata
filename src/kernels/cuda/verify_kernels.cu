@@ -768,6 +768,21 @@ __global__ void map_ids_kernel(int32_t* ids, const int32_t* __restrict__ table, 
     if (i < n) ids[i] = table[ids[i]];
 }
 
+__global__ void svocab_select_kernel(const float* __restrict__ a, int nv, int k, int32_t* __restrict__ cand) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= k) return;
+    int best = c;
+    float top = a[c];
+    for (int i = c + k; i < nv; i += k)
+        if (a[i] > top) { top = a[i]; best = i; }
+    cand[c] = best;
+}
+
+__global__ void svocab_scatter_kernel(float* __restrict__ a, const int32_t* __restrict__ cand, const float* __restrict__ lg, int k) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < k) a[cand[i]] = lg[i];
+}
+
 __global__ void row_top_prob_kernel(const float* __restrict__ logits, int n_vocab, const int32_t* __restrict__ ids,
                                     float* __restrict__ probs) {
     __shared__ float part[32];
@@ -894,6 +909,16 @@ void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int6
 void map_ids(int32_t* ids, const int32_t* table, int n, void* stream) {
     map_ids_kernel<<<1, 64, 0, (cudaStream_t) stream>>>(ids, table, n);
     check("map_ids");
+}
+
+void svocab_select(const float* a, int nv, int k, int32_t* cand, void* stream) {
+    svocab_select_kernel<<<(k + 255) / 256, 256, 0, (cudaStream_t) stream>>>(a, nv, k, cand);
+    check("svocab_select");
+}
+
+void svocab_scatter(float* a, const int32_t* cand, const float* lg, int k, void* stream) {
+    svocab_scatter_kernel<<<(k + 255) / 256, 256, 0, (cudaStream_t) stream>>>(a, cand, lg, k);
+    check("svocab_scatter");
 }
 
 void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void* stream) {

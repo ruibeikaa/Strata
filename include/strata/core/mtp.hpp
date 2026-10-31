@@ -393,6 +393,14 @@ private:
     float* sh_scratch_ = nullptr;
     uint16_t* x_bf16_ = nullptr;
     float* head_logits_ = nullptr;
+    /// STRATA_SVOCAB=FILE (opt-in): the draft head reads a few candidate rows instead of every row (mtp.cpp load_svocab)
+    bool load_svocab(int64_t row_bytes, std::string& err);
+    uint8_t *sv_v_ = nullptr, *sv_hv_ = nullptr, *sv_yq_ = nullptr, *sv_rows_ = nullptr;
+    float *sv_y_ = nullptr, *sv_lg_ = nullptr;
+    int32_t* sv_cand_ = nullptr;
+    int sv_d_ = 0, sv_k_ = 0;
+    bool sv_mass_ = false;
+    int64_t sv_row_bytes_ = 0;
     float* dummy_inj_ = nullptr;
     int64_t cap_ = 0, attn_scratch_floats_ = 0;
 };

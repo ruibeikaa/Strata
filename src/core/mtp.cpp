@@ -172,6 +172,13 @@ MtpDrafter::~MtpDrafter() {
     if (state_arena_) cudaFree(state_arena_);
     if (arena_) cudaFree(arena_);
     if (head_logits_) cudaFree(head_logits_);
+    if (sv_v_) { strata::kernels::native_q8_0_sm60_release(sv_v_); cudaFree(sv_v_); }
+    if (sv_hv_) { strata::kernels::native_q8_0_sm60_release(sv_hv_); cudaFree(sv_hv_); }
+    if (sv_yq_) cudaFree(sv_yq_);
+    if (sv_rows_) cudaFree(sv_rows_);
+    if (sv_y_) cudaFree(sv_y_);
+    if (sv_lg_) cudaFree(sv_lg_);
+    if (sv_cand_) cudaFree(sv_cand_);
     if (owns_draft_head_ && dhead_) {
         strata::kernels::native_q6_k_unpack(dhead_);
         strata::kernels::native_q8_0_sm60_release(dhead_);
@@ -702,6 +709,56 @@ void draft_head_hint(int64_t n_tokens, int64_t row_bytes) {
 }
 }  // namespace
 
+// STRATA_SVOCAB=FILE (opt-in, think-work\g3\mk_svocab.py; arXiv 2602.13836's idea): a draft step reads a small sketch of the
+// head instead of all its rows.  y = V s (d rows), a = HV y (one d-wide row per token), the best row of each of k stride
+// classes of the vocabulary, then the exact logits of those k rows only.  Drafts only: the replies do not depend on them.
+// File: "SVC1", u32 d, u32 nv, u32 N, V (Q8_0, d rows of N), HV (Q8_0, nv rows of d).  STRATA_SVOCAB_K: candidates (2048).
+bool MtpDrafter::load_svocab(int64_t row_bytes, std::string& err) {
+    const char* path = std::getenv("STRATA_SVOCAB");
+    const int64_t N = g_->n_embd;
+    std::FILE* f = std::fopen(path, "rb");
+    if (f == nullptr) { err = std::string("mtp: STRATA_SVOCAB: cannot open ") + path; return false; }
+    char magic[4] = {};
+    uint32_t h[3] = {};
+    const bool head_ok = std::fread(magic, 1, 4, f) == 4 && std::fread(h, 4, 3, f) == 3 && std::memcmp(magic, "SVC1", 4) == 0;
+    const int64_t d = h[0], nv = h[1];
+    const int64_t kv = std::getenv("STRATA_SVOCAB_K") != nullptr ? std::atoll(std::getenv("STRATA_SVOCAB_K")) : 2048;
+    if (!head_ok || d < 128 || d % 32 != 0 || nv != n_dvocab_ || (int64_t) h[2] != N || row_bytes != N / 32 * 34 ||
+        kv < 256 || kv > nv) {
+        std::fclose(f);
+        err = std::string("mtp: STRATA_SVOCAB: ") + path + " does not fit this draft head";
+        return false;
+    }
+    const size_t v_bytes = (size_t) d * (size_t) (N / 32) * 34, hv_bytes = (size_t) nv * (size_t) (d / 32) * 34;
+    std::vector<uint8_t> raw(v_bytes + hv_bytes);
+    const bool read_ok = std::fread(raw.data(), 1, raw.size(), f) == raw.size();
+    std::fclose(f);
+    if (!read_ok) { err = std::string("mtp: STRATA_SVOCAB: ") + path + " is short"; return false; }
+    sv_d_ = (int) d;
+    sv_k_ = (int) kv;
+    sv_row_bytes_ = row_bytes;
+    sv_mass_ = std::getenv("STRATA_SVOCAB_MASS") != nullptr && std::getenv("STRATA_SVOCAB_MASS")[0] == '1';
+    const size_t yq_bytes = strata::kernels::native_q8_1_bytes((int) d, 1);
+    if (cudaMalloc((void**) &sv_v_, v_bytes) != cudaSuccess || cudaMalloc((void**) &sv_hv_, hv_bytes) != cudaSuccess ||
+        cudaMalloc((void**) &sv_yq_, yq_bytes) != cudaSuccess || cudaMalloc((void**) &sv_y_, (size_t) d * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void**) &sv_rows_, (size_t) kv * (size_t) row_bytes) != cudaSuccess ||
+        cudaMalloc((void**) &sv_lg_, (size_t) kv * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void**) &sv_cand_, (size_t) kv * sizeof(int32_t)) != cudaSuccess) {
+        err = "mtp: STRATA_SVOCAB: buffers do not fit";
+        return false;
+    }
+    cudaMemcpy(sv_v_, raw.data(), v_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(sv_hv_, raw.data() + v_bytes, hv_bytes, cudaMemcpyHostToDevice);
+    if (mtp_q8_sm60()) {
+        strata::kernels::native_q8_0_sm60_pack_in_place(sv_v_, (int) N, (int) d, "SVOCAB V");
+        strata::kernels::native_q8_0_sm60_pack_in_place(sv_hv_, (int) d, (int) nv, "SVOCAB HV");
+    }
+    vram_ += v_bytes + hv_bytes + (size_t) kv * (size_t) row_bytes;
+    std::fprintf(stderr, "strata mtp: STRATA_SVOCAB: sketch of %lld dims over %lld tokens, %lld candidates a step (%.1f MiB)\n",
+                 (long long) d, (long long) nv, (long long) kv, (double) (v_bytes + hv_bytes) / 1048576.0);
+    return true;
+}
+
 bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err,
                       const MtpDrafter* shared) {
 #if defined(STRATA_GPU_METAL)
@@ -785,9 +842,14 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             if (dhead_type_ == 14 && strata::kernels::native_q6_k_packed_enabled())   // STRATA_Q6_PACKED=1
                 strata::kernels::native_q6_k_pack(dhead_, (int) (row_bytes / 210) * 256, (int) n_dvocab_,
                                                   "MTP draft head");
+            if (std::getenv("STRATA_SVOCAB") != nullptr && owns_draft_head_ && dhead_type_ == GGML_Q8_0 &&
+                !load_svocab(row_bytes, err))
+                return false;
             // STRATA_MTP_Q8_SM60=1: the subset on the Pascal GEMV like the main head, but packed in place - nothing but
             // record_rest's native_mmvq reads it (the prompt path never does), and a copy would cost its size again
-            if (dhead_type_ == GGML_Q8_0 && owns_draft_head_ && mtp_q8_sm60() && row_bytes == g_->n_embd / 32 * 34 &&
+            // (STRATA_SVOCAB gathers GGUF-layout rows out of it, so it stays as it is)
+            if (sv_v_ == nullptr && dhead_type_ == GGML_Q8_0 && owns_draft_head_ && mtp_q8_sm60() &&
+                row_bytes == g_->n_embd / 32 * 34 &&
                 strata::kernels::native_q8_0_sm60_pack_in_place(dhead_, (int) g_->n_embd, (int) n_dvocab_,
                                                                 "MTP draft head"))
                 std::fprintf(stderr, "strata mtp: the draft head on the Pascal Q8_0 GEMV (STRATA_MTP_Q8_SM60=1)\n");
@@ -1243,6 +1305,31 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         }
         g_mp.stamp(13, cs);
         native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
+        if (sv_v_ != nullptr && !coupled_rec_) {
+            native_mmvq(GGML_Q8_0, sv_v_, xq_, sv_y_, (int) N, sv_d_, 1, cs);
+            native_quantize_q8_1(sv_y_, sv_yq_, sv_d_, 1, cs);
+            native_mmvq(GGML_Q8_0, sv_hv_, sv_yq_, head_logits_, sv_d_, (int) n_dvocab_, 1, cs);
+            svocab_select(head_logits_, (int) n_dvocab_, sv_k_, sv_cand_, cs);
+            gather_rows((const uint8_t*) dhead_, sv_row_bytes_, sv_cand_, sv_k_, sv_rows_, cs);
+            native_mmvq(GGML_Q8_0, sv_rows_, xq_, sv_lg_, (int) N, sv_k_, 1, cs);
+            g_mp.stamp(14, cs);
+            argmax_rows(sv_lg_, 1, sv_k_, arg_scratch_, out_ids_, cs);
+            if (sv_mass_) {
+                // STRATA_SVOCAB_MASS=1: the floor sees the whole vocabulary's mass, the sketch standing in for the rows
+                // that were not read.  A softmax over the candidates alone overstates p where many tokens are close.
+                svocab_scatter(head_logits_, sv_cand_, sv_lg_, sv_k_, cs);
+                map_ids(out_ids_, sv_cand_, 1, cs);
+                if (multi_block_head_ops()) row_top_prob_split(head_logits_, 1, (int) n_dvocab_, out_ids_, probs_, top_scratch_, cs);
+                else row_top_prob(head_logits_, 1, (int) n_dvocab_, out_ids_, probs_, cs);
+            } else {
+                if (multi_block_head_ops()) row_top_prob_split(sv_lg_, 1, sv_k_, out_ids_, probs_, top_scratch_, cs);
+                else row_top_prob(sv_lg_, 1, sv_k_, out_ids_, probs_, cs);
+                map_ids(out_ids_, sv_cand_, 1, cs);
+            }
+            map_ids(out_ids_, dvocab_, 1, cs);
+            g_mp.stamp(15, cs);
+            return true;
+        }
         const bool sub = dhead_ != nullptr;
         const int64_t nv = sub ? n_dvocab_ : n_vocab_;
         native_mmvq(sub ? dhead_type_ : head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N,

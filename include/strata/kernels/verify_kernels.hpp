@@ -185,6 +185,11 @@ void copy_row_to_first(const int32_t* row_dev, float* a, int64_t a_n, float* b, 
 void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int64_t n, uint8_t* dst, void* stream);
 /// ids[t] = table[ids[t]] for n entries (a subset index back to a token id).
 void map_ids(int32_t* ids, const int32_t* table, int n, void* stream);
+/// cand[c] = the index of the highest of a[c], a[c + k], a[c + 2k], ... for c < k (ties to the lowest index): k candidates
+/// with no sort, a fixed count and a fixed order.  Graph-capturable.
+void svocab_select(const float* a, int nv, int k, int32_t* cand, void* stream);
+/// a[cand[i]] = lg[i] for i < k: the exact logits of the candidates over the sketch's.  Graph-capturable.
+void svocab_scatter(float* a, const int32_t* cand, const float* lg, int k, void* stream);
 /// probs[t] = softmax(logits[t])[ids[t]] for n_rows rows of n_vocab (the probability of each row's argmax).
 void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void* stream);
 /// out[t] = the argmax of row t (n floats a row; ties to the lowest index, NaN never picked, 0 when no value is above
