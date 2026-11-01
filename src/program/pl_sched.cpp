@@ -630,7 +630,7 @@ bool Sched::decide_next(PlIo& io, int k, bool done) {
         y.seq = pred->seq + 1;
         y.p = pred->p + pred->T;
         y.tok[0] = oc[base];
-        hi_run_ = op[base] >= 0.95f ? hi_run_ + 1 : 0;
+        hi_run_ = op[base] >= (float) c_.late_p ? std::min(hi_run_ + 1, 8) : (c_.late_d ? hi_run_ / 2 : 0);
         y.T = row0_low ? 1 : t_rule(op, base + 1, k, floor);
         for (int i = 1; i < y.T; ++i) {
             y.tok[i] = oc[base + i];

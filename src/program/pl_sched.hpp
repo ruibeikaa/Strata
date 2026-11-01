@@ -50,6 +50,8 @@ struct Config {
     // STRATA_SPEC_LATE_T: a window is sized when its stage 0 can take it, from the outputs landed by then
     bool late_t = false;
     int late_m = 0;                // STRATA_SPEC_LATE_M: late_t only until this many row 0 guesses in a row were sure (0: always)
+    double late_p = 0.95;          // STRATA_SPEC_LATE_P: what counts as sure
+    bool late_d = false;           // STRATA_SPEC_LATE_D: an unsure guess halves the run instead of ending it (the run stops at 8)
     // STRATA_SPEC_ROW0: a held window whose row 0 is a guess below this stays one row and does not wait for more outputs:
     // what follows an unsure token is worth little.  Sure text keeps today's rows
     double row0 = 0.0;
