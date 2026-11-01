@@ -1240,9 +1240,16 @@ void gemm_hfma_report(int64_t tokens) {
             left += n;
             by += (by.empty() ? " (" : ", ") + what + " x" + std::to_string(n);
         }
+        int copies = 0;
+        double copy_mib = 0.0;
+        {
+            std::lock_guard<std::mutex> sk(g_shadow_mu);
+            copies = g_shadow_h_count[d];
+            copy_mib = g_shadow_h_bytes[d] / 1048576.0;
+        }
         std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA: read of %lld tokens, CUDA%d: %lld dense products on the HFMA2 "
-                             "kernel, %lld left to the old route%s%s\n", (long long) tokens, d, (long long) taken, (long long) left,
-                     by.c_str(), by.empty() ? "" : ")");
+                             "kernel, %lld left to the old route%s%s; %d FP16 weight copies kept, %.0f MiB\n", (long long) tokens, d,
+                     (long long) taken, (long long) left, by.c_str(), by.empty() ? "" : ")", copies, copy_mib);
         g_hf_left[d].clear();
     }
 }

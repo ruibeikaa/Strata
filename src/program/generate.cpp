@@ -207,26 +207,28 @@ static void emit_lp_line(const strata::core::Verifier& ver, int t, int32_t token
     std::printf("\n");
 }
 
-// STRATA_LOGITS_DUMP=<file> (diagnostic, default off): for each request, appends the head logits of the window row that
-// gives its first token - the real next-token distribution, before sampling, penalties and temperature - as raw FP32
+// STRATA_FIRST_LOGITS_DUMP=<file> (diagnostic, default off): for each request, appends the head logits of the window row
+// that gives its first token - the real next-token distribution, before sampling, penalties and temperature - as raw FP32
 // behind a header of three int32 (the request's index in this process, its prompt length, the vocabulary size), so two
 // arms of an A/B can be compared by KL.  Read-only: one copy of a row the window has finished with, after the window's
 // own sync; the pick it prints beside the top-1 is the window's.
+// (Not STRATA_LOGITS_DUMP, which is verify.cpp's tap of every Verifier::run window: the pipelined loops decode through
+// pl_finish and never reach it, and the tail window of a read that it does see is not the first token's.)
 static void dump_first_logits(const strata::core::Verifier& ver, int row, int64_t prompt_len, int32_t picked, int T) {
-    static const char* path = std::getenv("STRATA_LOGITS_DUMP");
+    static const char* path = std::getenv("STRATA_FIRST_LOGITS_DUMP");
     static int32_t req = 0;
     if (path == nullptr || path[0] == '\0') return;
     std::vector<float> logits((size_t) ver.vocab());
     std::FILE* f = ver.copy_logits(row, logits.data()) ? std::fopen(path, "ab") : nullptr;
     const int32_t head[3] = {req, (int32_t) prompt_len, (int32_t) logits.size()};
     if (f == nullptr || std::fwrite(head, sizeof head[0], 3, f) != 3 || std::fwrite(logits.data(), sizeof(float), logits.size(), f) != logits.size()) {
-        std::fprintf(stderr, "strata serve: STRATA_LOGITS_DUMP: cannot write %s\n", path);
+        std::fprintf(stderr, "strata serve: STRATA_FIRST_LOGITS_DUMP: cannot write %s\n", path);
         if (f) std::fclose(f);
         return;
     }
     std::fclose(f);
     const size_t top = (size_t) (std::max_element(logits.begin(), logits.end()) - logits.begin());
-    std::fprintf(stderr, "strata serve: STRATA_LOGITS_DUMP: request %d, %lld prompt tokens, first window T=%d row %d: top-1 %zu "
+    std::fprintf(stderr, "strata serve: STRATA_FIRST_LOGITS_DUMP: request %d, %lld prompt tokens, first window T=%d row %d: top-1 %zu "
                          "(%.4f), picked %d\n", (int) req, (long long) prompt_len, T, row, top, (double) logits[top], (int) picked);
     ++req;
 }
@@ -17554,7 +17556,7 @@ int main(int argc, char** argv) {
                     ++dec_windows;
                     dec_T += w.T;
                     const bool nf = nonfinite_hit(SV(pl_nf, w.slot), "decode");   // #879: none of its tokens goes out
-                    if (produced_n == 0 && w.p == n - 1) dump_first_logits(SV(pl_nf, w.slot), 0, n, outp[0], w.T);   // STRATA_LOGITS_DUMP
+                    if (produced_n == 0 && w.p == n - 1) dump_first_logits(SV(pl_nf, w.slot), 0, n, outp[0], w.T);   // STRATA_FIRST_LOGITS_DUMP
                     bool eos = false;
                     for (int i = 0; !nf && i <= a && produced_n < max_new && !eos; ++i) {
                         std::printf("T %d\n", (int) outp[i]);
@@ -18267,7 +18269,7 @@ int main(int argc, char** argv) {
                     ++dec_windows;
                     dec_T += A.T;
                     const bool nf = nonfinite_hit(V1(A), "decode");   // #879: none of its tokens goes out
-                    if (produced_n == 0 && A.p == n - 1) dump_first_logits(V1(A), 0, n, outp[0], A.T);   // STRATA_LOGITS_DUMP
+                    if (produced_n == 0 && A.p == n - 1) dump_first_logits(V1(A), 0, n, outp[0], A.T);   // STRATA_FIRST_LOGITS_DUMP
                     bool eos = false;
                     for (int i = 0; !nf && i <= a && produced_n < max_new && !eos; ++i) {
                         std::printf("T %d\n", (int) outp[(size_t) i]);
@@ -18681,7 +18683,7 @@ int main(int argc, char** argv) {
                 // Diagnostics (as in generate): STRATA_DUMP_FIRST_LOGITS=<path> writes the logits of each request's first
                 // window to <path>.<n>, so the prompt paths (a peer card's share, a split) can be compared by KL
                 if (first_window) {
-                    dump_first_logits(ver, merged ? T - 1 : 0, n, outv[(size_t) (merged ? T - 1 : 0)], T);   // STRATA_LOGITS_DUMP
+                    dump_first_logits(ver, merged ? T - 1 : 0, n, outv[(size_t) (merged ? T - 1 : 0)], T);   // STRATA_FIRST_LOGITS_DUMP
                     static const char* fl = std::getenv("STRATA_DUMP_FIRST_LOGITS");
                     static int fl_n = 0;
                     if (fl != nullptr) {
