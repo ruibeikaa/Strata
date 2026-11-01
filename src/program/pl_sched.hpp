@@ -49,6 +49,12 @@ struct Config {
     double floor_c = -1.0;         // the window two guesses deep (STRATA_SPEC_FLOOR_C, < 0: floor_held)
     // STRATA_SPEC_LATE_T: a window is sized when its stage 0 can take it, from the outputs landed by then
     bool late_t = false;
+    // STRATA_SPEC_ROW0: a held window whose row 0 is a guess below this stays one row and does not wait for more outputs:
+    // what follows an unsure token is worth little.  Sure text keeps today's rows
+    double row0 = 0.0;
+    // STRATA_SPEC_FRESH_A: floor_fresh only after a window that accepted fewer tokens than this (> 0); after a longer one
+    // spec_min_p, and the fresh window waits for the chain as it does today
+    int fresh_a = 0;
     double ff() const { return floor_fresh >= 0.0 ? floor_fresh : spec_min_p; }
     double fh() const { return floor_held >= 0.0 ? floor_held : spec_min_p; }
     double fc() const { return floor_c >= 0.0 ? floor_c : fh(); }
@@ -372,6 +378,7 @@ private:
     int alloc_slot(PlIo& io, PW& w, bool& waited);
     void free_slot(int q, uint64_t uid);
     int t_rule(const float* pr, int from, int avail, double floor) const;
+    double fresh_floor() const { return c_.fresh_a > 0 && last_a_ >= c_.fresh_a ? c_.spec_min_p : c_.ff(); }
     void ple_adv(int32_t ple[2], const int32_t* tok, int n) const;
     PW* find(uint64_t uid);
 
@@ -383,6 +390,7 @@ private:
     PW doom_[kMaxWin];
     int ndoom_ = 0;
     UndoJob undo_;
+    int last_a_ = 0;               // the tokens the last verified window accepted
     Held held_[4];
     int nheld_ = 0;
     ChainState ch_;

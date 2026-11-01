@@ -544,7 +544,7 @@ bool Sched::lkc_lk_window(PlIo& io, PW& pred) {
 
 // a fresh window's size from the chain's first outputs (today: A once a draft below spec_min_p ends it)
 bool Sched::decide_fresh(PlIo& io, PW& A, const int32_t* oc, const float* op, int avail, bool early, int k_landed) {
-    A.T = t_rule(op, 0, avail, c_.ff());
+    A.T = t_rule(op, 0, avail, fresh_floor());
     for (int i = 1; i < A.T; ++i) {
         A.tok[i] = oc[i - 1];
         A.prob[i - 1] = op[i - 1];
@@ -574,7 +574,8 @@ bool Sched::decide_next(PlIo& io, int k, bool done) {
     const float* op = io.chain_prob();
     bool decided = done || k >= base + c_.S_mtp;
     const double floor = nwin_ >= 2 ? c_.fc() : c_.fh();
-    if (!decided && k > base && (floor >= 1.0 || (c_.late_t && pred->fr > 0))) decided = true;
+    const bool row0_low = c_.row0 > 0.0 && k > base && op[base] < (float) c_.row0;
+    if (!decided && k > base && (row0_low || floor >= 1.0 || (c_.late_t && pred->fr > 0))) decided = true;
     if (!decided && k > base + 1 && floor > 0.0)
         for (int j = base + 1; j < k; ++j)
             if (op[j] < (float) floor) { decided = true; break; }
@@ -628,7 +629,7 @@ bool Sched::decide_next(PlIo& io, int k, bool done) {
         y.seq = pred->seq + 1;
         y.p = pred->p + pred->T;
         y.tok[0] = oc[base];
-        y.T = t_rule(op, base + 1, k, floor);
+        y.T = row0_low ? 1 : t_rule(op, base + 1, k, floor);
         for (int i = 1; i < y.T; ++i) {
             y.tok[i] = oc[base + i];
             y.prob[i - 1] = op[base + i];
@@ -712,10 +713,11 @@ bool Sched::chain_round(PlIo& io) {
     if (ch_.kind == 2 && !ch_.early_used) {
         const int k = k_ready;
         const bool s0_free = c_.per_stage() ? !(undo_.active && (undo_.pending & 1u) != 0) : !undo_.active;
-        bool decided = k >= c_.S_mtp - 1 || c_.ff() >= 1.0 || (c_.late_t && s0_free);
-        if (!decided && c_.ff() > 0.0)
+        const double ff = fresh_floor();
+        bool decided = k >= c_.S_mtp - 1 || ff >= 1.0 || (c_.late_t && s0_free);
+        if (!decided && ff > 0.0)
             for (int j = 0; j < k; ++j)
-                if (io.chain_prob()[j] < (float) c_.ff()) { decided = true; break; }
+                if (io.chain_prob()[j] < (float) ff) { decided = true; break; }
         if (decided && !decide_fresh(io, *A, io.chain_tok(), io.chain_prob(), std::min(k, c_.S_mtp - 1), true, k))
             return false;
     }
@@ -1084,6 +1086,7 @@ bool Sched::verdict(PlIo& io) {
     if (!io.verdict(W, a, outp_, last)) return fail("pipelined decode: the verdict failed");
     ++st_.windows;
     end_ = W.p + a + 1;
+    last_a_ = a + 1;
     PW* X = nwin_ >= 2 ? &win_[1] : nullptr;
     const bool on = X != nullptr && X->launched && a == W.T - 1 && X->tok[0] == outp_[W.T - 1];
     if (X != nullptr && X->made) {   // the gate's calibration: would X have been on the path, by its estimate p_on
