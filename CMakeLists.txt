@@ -166,8 +166,8 @@ endif()
 # state machine, against a symbolic GPU: a recorded decode trace, random worlds, every small world with every ending,
 # and the pw-2 loop operation for operation.  CPU only (no CUDA); built on request (--target pl_sched_test); exits 0
 # when every check passes.
-add_executable(pl_sched_test EXCLUDE_FROM_ALL src/program/pl_sched_test.cpp src/program/pl_sched.cpp)
-target_include_directories(pl_sched_test PRIVATE src/program)
+add_executable(pl_sched_test EXCLUDE_FROM_ALL src/program/pl_sched_test.cpp src/program/pl_sched.cpp src/spec/draft_policy.cpp)
+target_include_directories(pl_sched_test PRIVATE src/program include)
 target_link_libraries(pl_sched_test PRIVATE strata_warnings)
 
 if(STRATA_HIP_GFX906)

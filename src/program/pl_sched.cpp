@@ -240,6 +240,16 @@ static std::FILE* chain_dump() {
     return f;
 }
 
+bool dump_on() { return chain_dump() != nullptr; }
+
+void dump_lookup(int64_t q, const Lookup& L) {
+    std::FILE* f = chain_dump();
+    if (f == nullptr || L.k <= 0) return;
+    std::fprintf(f, "L %lld %d %d", (long long) q, L.match, L.k);
+    for (int i = 0; i < L.k; ++i) std::fprintf(f, " %d", L.tok[i]);
+    std::fprintf(f, "\n");
+}
+
 bool Sched::begin(const Config& c, int64_t p, int32_t x, const int32_t ple_prev[2], double t0_ms, std::string& err) {
     if (!check(c, err)) return false;
     if (std::FILE* f = chain_dump()) std::fprintf(f, "R %lld %d\n", (long long) p, x);
@@ -440,6 +450,7 @@ bool Sched::pick_lookup(PlIo& io, PW& w, const int32_t* chain0) {
         against = true;
     }
     int t = 0;
+    if (c_.cls_on) io.set_cls(cls_);
     if (!io.lookup_choose(w.T, std::min(k, s_sfx - 1), L.match, t)) return true;
     if (t < 1 || t > s_sfx) return fail("pl_sched: the lookup's window size is out of range");
     if (against && w.p + t > c_.max_context) return true;   // (never where the MTP's own window would have fitted)
@@ -1200,7 +1211,10 @@ bool Sched::verdict(PlIo& io) {
     {
         const double now = io.now_ms();
         const int c = W.spec ? 1 : 0;
-        if (W.seq > 0 && !last) io.observe(W, a, now - last_verdict_);
+        if (W.seq > 0 && !last) {
+            if (c_.cls_on) io.set_cls(cls_);
+            io.observe(W, a, now - last_verdict_);
+        }
         st_.cls_ms[c] += now - last_verdict_;
         st_.cls_tok[c] += a + 1;
         st_.cls_n[c] += 1;

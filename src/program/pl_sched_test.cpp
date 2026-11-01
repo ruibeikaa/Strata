@@ -38,6 +38,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "strata/spec/draft_policy.hpp"
+
 using namespace strata::pl;
 
 namespace {
@@ -84,6 +86,12 @@ struct World {
     std::vector<int32_t> tr, tab_tok;
     std::vector<float> tab_p;
     std::vector<uint8_t> tab_set;
+    // --replay: what the lookup proposed past each position, and the engine's own policy
+    static constexpr int kLk = 16;
+    std::vector<int32_t> rl_tok;
+    std::vector<int16_t> rl_k, rl_m;
+    strata::spec::DraftPolicy* policy = nullptr;
+    strata::spec::DraftPolicy* policy2 = nullptr;   // the thinking class's own (--cfg sp=1)
     int32_t pre = -1;                    // the token at p0 - 2 (the prompt's <think>)
 
     int32_t truth(int64_t q) const {
@@ -299,6 +307,14 @@ public:
     }
     int lookup_propose(int max_k, Lookup& out) override {
         out = Lookup{};
+        if (W_.policy != nullptr) {
+            const int64_t q = emit_end - 1 - W_.p0;
+            if (q < 0 || q >= (int64_t) W_.rl_k.size() || W_.rl_k[(size_t) q] == 0) return 0;
+            out.k = std::min(max_k, (int) W_.rl_k[(size_t) q]);
+            out.match = W_.rl_m[(size_t) q];
+            for (int i = 0; i < out.k; ++i) out.tok[i] = W_.rl_tok[(size_t) q * World::kLk + (size_t) i];
+            return out.k;
+        }
         if (W_.lookup_t <= 0) return 0;
         const int64_t q0 = emit_end;   // the window's row 0 sits at q0 - 1
         if (!W_.g_lk(q0 - 1)) return 0;
@@ -309,6 +325,11 @@ public:
         return k;
     }
     bool lookup_choose(int T, int k, int match, int& tt) override {
+        if (W_.policy != nullptr) {
+            const strata::spec::DraftPolicy::Pick pk = (pol_ != nullptr ? pol_ : W_.policy)->choose(T, k, match);
+            tt = pk.t;
+            return pk.lookup;
+        }
         (void) T;
         (void) match;
         tt = std::min(W_.g_lk_t(emit_end - 1), k + 1);
@@ -345,7 +366,10 @@ public:
         }
         events.push_back(Ev{ev, seq, x0, x1});
     }
+    void set_cls(int cl) override { pol_ = cl == Config::kClsThink && W_.policy2 != nullptr ? W_.policy2 : W_.policy; }
+    strata::spec::DraftPolicy* pol_ = nullptr;
     void observe(const PW& w, int a, double ms) override {
+        if (W_.policy != nullptr) (pol_ != nullptr ? pol_ : W_.policy)->observe(w.sfx, w.T, a, w.sfx_match, ms);
         (void) w;
         (void) a;
         (void) ms;
@@ -3349,6 +3373,9 @@ bool load_replay(const char* path, std::vector<ReplayReq>& out) {
             r.w.tab_tok.assign((size_t) (n + 64) * World::kTab, -1);
             r.w.tab_p.assign((size_t) (n + 64) * World::kTab, 0.0f);
             r.w.tab_set.assign((size_t) (n + 64), 0);
+            r.w.rl_tok.assign((size_t) (n + 64) * World::kLk, 0);
+            r.w.rl_k.assign((size_t) (n + 64), 0);
+            r.w.rl_m.assign((size_t) (n + 64), 0);
         } else if (line[0] == 'T' && !out.empty()) {
             char* s = line + 1;
             for (;;) {
@@ -3358,6 +3385,25 @@ bool load_replay(const char* path, std::vector<ReplayReq>& out) {
                 out.back().w.tr.push_back(v == kEos ? kEos + 1 : (int32_t) v);
                 s = e;
             }
+        } else if (line[0] == 'L' && !out.empty()) {
+            World& w = out.back().w;
+            char* s = line + 1;
+            char* e = nullptr;
+            const long long q = std::strtoll(s, &e, 10);
+            s = e;
+            const int m = (int) std::strtol(s, &e, 10);
+            s = e;
+            const int k = (int) std::strtol(s, &e, 10);
+            s = e;
+            if (q < w.p0 || q >= w.p0 + w.max_new + 64 || k <= 0 || k > World::kLk) continue;
+            const size_t b = (size_t) (q - w.p0);
+            w.rl_k[b] = (int16_t) k;
+            w.rl_m[b] = (int16_t) std::min(m, 32767);
+            for (int j = 0; j < k; ++j) {
+                w.rl_tok[b * World::kLk + (size_t) j] = (int32_t) std::strtol(s, &e, 10);
+                s = e;
+            }
+            w.lookup_t = 1;
         } else if (line[0] == 'C' && !out.empty()) {
             World& w = out.back().w;
             char* s = line + 1;
@@ -3390,6 +3436,8 @@ int replay_main(int argc, char** argv) {
     tm.jitter = 0.0;
     std::vector<double> scales;
     const char* cls_spec = nullptr;
+    bool two_policies = false;
+    int passes = 1;   // every request again, the policy kept: what the screens print is their later passes
     static double fr[9], la[9];
     for (int i = 0; i < 9; ++i) {
         fr[i] = kFront[i];
@@ -3442,6 +3490,8 @@ int replay_main(int argc, char** argv) {
                 else if (k == "gap") tm.gap = v;
                 else if (k == "chain_st") tm.chain_st = (int) v;
                 else if (k == "d4") c.depth4 = v != 0.0;
+                else if (k == "sp") two_policies = v != 0.0;
+                else if (k == "passes") passes = (int) v;
                 else {
                     std::fprintf(stderr, "unknown key %s\n", k.c_str());
                     return 2;
@@ -3461,8 +3511,15 @@ int replay_main(int argc, char** argv) {
         std::fprintf(stderr, "--replay: cannot read the file\n");
         return 2;
     }
+    strata::spec::DraftPolicy policy(c.S), policy2(c.S);   // learned over the whole process, as the engine's
+    for (int pass = 0; pass < passes; ++pass)
     for (size_t i = 0; i < reqs.size(); ++i) {
         World& w = reqs[i].w;
+        if (w.lookup_t > 0) {
+            w.policy = &policy;
+            if (two_policies) w.policy2 = &policy2;
+            c.suffix = true;
+        }
         c.max_context = w.max_context;
         Timing t = tm;
         t.stage_scale = i < scales.size() ? scales[i] : 1.0;
@@ -3472,6 +3529,7 @@ int replay_main(int argc, char** argv) {
             continue;
         }
         const Stats& s = r.st;
+        if (pass + 1 == passes)
         std::printf("%s gen %lld win %lld ms %.2f fresh %.0f %.2f %.2f held %.0f %.2f %.2f steps %lld c_launched %lld c_on %lld\n",
                     reqs[i].name.c_str(), (long long) r.produced, (long long) r.verdicts, r.t_end, s.cls_n[0], s.cls_ms[0],
                     s.cls_tok[0], s.cls_n[1], s.cls_ms[1], s.cls_tok[1], (long long) s.chain_steps,

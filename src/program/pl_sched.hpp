@@ -240,6 +240,9 @@ public:
     virtual void ple_prev(int32_t out[2]) = 0;   // ss.ple_prev now
     virtual int lookup_propose(int max_k, Lookup& out) = 0;   // sfx.propose (k), sfx.last_match
     virtual bool lookup_choose(int T, int k, int match, int& t) = 0;   // policy.choose: true = take the lookup (t rows)
+    // STRATA_SPEC_CLASS: the policy calls that follow are about this class of text (it learns from what it sees, and the
+    // thinking class's windows are not the others')
+    virtual void set_cls(int cl) { (void) cl; }
     // Lookup chaining: sfx.propose_after(pend, n) - the lookup over the committed text followed by `n` pending tokens
     // (the drafts of the windows not verified, the oldest one's row 0 excluded: it is committed text already)
     virtual int lookup_after(const int32_t* pend, int n, int max_k, Lookup& out) {
@@ -434,5 +437,9 @@ private:
     int32_t undo_ple_[2] = {-1, -1};   // N2: today's undo_ple (checked against the verified window's ple_in)
     double slot_wait_t0_ = -1.0;
 };
+
+// STRATA_CHAIN_DUMP: is it on; what the lookup proposes once position q is committed text
+bool dump_on();
+void dump_lookup(int64_t q, const Lookup& L);
 
 }  // namespace strata::pl

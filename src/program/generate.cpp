@@ -1590,6 +1590,7 @@ struct PlIoFns final : strata::pl::PlIo {
     std::function<void(int32_t*)> f_ple_prev;
     std::function<int(int, strata::pl::Lookup&)> f_lookup_propose;
     std::function<bool(int, int, int, int&)> f_lookup_choose;
+    std::function<void(int)> f_set_cls;
     std::function<int(const int32_t*, int, int, strata::pl::Lookup&)> f_lookup_after;
     std::function<int(int, double, int, int)> f_lookup_chain_choose;
     std::function<bool(const strata::pl::PlOp&)> f_exec;
@@ -1610,6 +1611,7 @@ struct PlIoFns final : strata::pl::PlIo {
     void ple_prev(int32_t out[2]) override { f_ple_prev(out); }
     int lookup_propose(int max_k, strata::pl::Lookup& out) override { return f_lookup_propose(max_k, out); }
     bool lookup_choose(int T, int k, int match, int& t) override { return f_lookup_choose(T, k, match, t); }
+    void set_cls(int cl) override { if (f_set_cls) f_set_cls(cl); }
     int lookup_after(const int32_t* pend, int n, int max_k, strata::pl::Lookup& out) override {
         if (!f_lookup_after) { out = strata::pl::Lookup{}; return 0; }
         return f_lookup_after(pend, n, max_k, out);
@@ -13088,6 +13090,8 @@ int main(int argc, char** argv) {
         else if (use_mtp && mtp.max_t() > S_mtp) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
+        strata::spec::DraftPolicy policy_think(S);   // STRATA_SPEC_POLICY: what the thinking class's windows teach stays there
+        strata::spec::DraftPolicy* pl_policy = &policy;
         const bool spec_cost = [] { const char* v = std::getenv("STRATA_SPEC_COST"); return v != nullptr && v[0] == '1'; }();   // cost-aware MTP window (A/B arm)
         strata::spec::DraftPolicy::ChainState chain_st;
         int chain_rows = 1;   // the window the cost-aware rule kept in the MTP chain just drafted
@@ -17392,8 +17396,13 @@ int main(int argc, char** argv) {
                     L.match = sfx.last_match();
                     return L.k;
                 };
+                io.f_set_cls = [&](int cl) {
+                    static const bool on = [] { const char* v = std::getenv("STRATA_SPEC_POLICY"); return v != nullptr && v[0] == '1'; }();
+                    pl_policy = on && cl == strata::pl::Config::kClsThink ? &policy_think : &policy;
+                };
+                pl_policy = &policy;
                 io.f_lookup_choose = [&](int T, int k, int match, int& t) {
-                    const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, match);
+                    const strata::spec::DraftPolicy::Pick pk = pl_policy->choose(T, k, match);
                     t = pk.t;
                     return pk.lookup;
                 };
@@ -17525,6 +17534,12 @@ int main(int argc, char** argv) {
                         strata::core::progress_beat();
                         ++produced_n;
                         if (o.suffix_draft > 0) sfx.append(outp[i]);
+                        if (o.suffix_draft > 0 && strata::pl::dump_on()) {
+                            strata::pl::Lookup L;
+                            L.k = sfx.propose((int) (sizeof L.tok / sizeof L.tok[0]), L.tok);
+                            L.match = sfx.last_match();
+                            strata::pl::dump_lookup(w.p + 1 + i, L);
+                        }
                         eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outp[i]) != o.eos_ids.end();
                     }
                     std::fflush(stdout);
@@ -17554,8 +17569,8 @@ int main(int argc, char** argv) {
                     return emit_keep(a, outp);
                 };
                 io.f_observe = [&](const strata::pl::PW& w, int a, double ms) {
-                    if (w.lkc > 0) policy.observe_chain(w.T - w.lkc, w.lkc, a, w.lkc_match, ms);
-                    else policy.observe(w.sfx, w.T, a, w.sfx_match, ms);
+                    if (w.lkc > 0) pl_policy->observe_chain(w.T - w.lkc, w.lkc, a, w.lkc_match, ms);
+                    else pl_policy->observe(w.sfx, w.T, a, w.sfx_match, ms);
                 };
                 io.f_now = [&]() { return ms_now(); };
                 io.f_trace = [&](const char* ev, int seq, int x0, int x1) { tre(ev, seq, x0, x1); };
