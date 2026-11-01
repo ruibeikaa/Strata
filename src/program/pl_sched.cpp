@@ -575,7 +575,8 @@ bool Sched::decide_next(PlIo& io, int k, bool done) {
     bool decided = done || k >= base + c_.S_mtp;
     const double floor = nwin_ >= 2 ? c_.fc() : c_.fh();
     const bool row0_low = c_.row0 > 0.0 && k > base && op[base] < (float) c_.row0;
-    if (!decided && k > base && (row0_low || floor >= 1.0 || (c_.late_t && pred->fr > 0))) decided = true;
+    const bool late = c_.late_t && pred->fr > 0 && (c_.late_m <= 0 || hi_run_ < c_.late_m);
+    if (!decided && k > base && (row0_low || floor >= 1.0 || late)) decided = true;
     if (!decided && k > base + 1 && floor > 0.0)
         for (int j = base + 1; j < k; ++j)
             if (op[j] < (float) floor) { decided = true; break; }
@@ -629,6 +630,7 @@ bool Sched::decide_next(PlIo& io, int k, bool done) {
         y.seq = pred->seq + 1;
         y.p = pred->p + pred->T;
         y.tok[0] = oc[base];
+        hi_run_ = op[base] >= 0.95f ? hi_run_ + 1 : 0;
         y.T = row0_low ? 1 : t_rule(op, base + 1, k, floor);
         for (int i = 1; i < y.T; ++i) {
             y.tok[i] = oc[base + i];

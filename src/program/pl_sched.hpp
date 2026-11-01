@@ -49,6 +49,7 @@ struct Config {
     double floor_c = -1.0;         // the window two guesses deep (STRATA_SPEC_FLOOR_C, < 0: floor_held)
     // STRATA_SPEC_LATE_T: a window is sized when its stage 0 can take it, from the outputs landed by then
     bool late_t = false;
+    int late_m = 0;                // STRATA_SPEC_LATE_M: late_t only until this many row 0 guesses in a row were sure (0: always)
     // STRATA_SPEC_ROW0: a held window whose row 0 is a guess below this stays one row and does not wait for more outputs:
     // what follows an unsure token is worth little.  Sure text keeps today's rows
     double row0 = 0.0;
@@ -391,6 +392,7 @@ private:
     int ndoom_ = 0;
     UndoJob undo_;
     int last_a_ = 0;               // the tokens the last verified window accepted
+    int hi_run_ = 0;               // the row 0 guesses in a row at 0.95 or more
     Held held_[4];
     int nheld_ = 0;
     ChainState ch_;

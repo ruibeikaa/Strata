@@ -17165,6 +17165,7 @@ int main(int argc, char** argv) {
                 if (const char* v = std::getenv("STRATA_SPEC_FLOOR_C")) cfg.floor_c = std::atof(v);
                 if (const char* v = std::getenv("STRATA_SPEC_LATE_T")) cfg.late_t = std::atoi(v) != 0;
                 if (const char* v = std::getenv("STRATA_SPEC_ROW0")) cfg.row0 = std::atof(v);
+                if (const char* v = std::getenv("STRATA_SPEC_LATE_M")) cfg.late_m = std::atoi(v);
                 if (const char* v = std::getenv("STRATA_SPEC_FRESH_A")) cfg.fresh_a = std::atoi(v);
                 cfg.theta = pl_theta;
                 cfg.theta3 = pl_theta3;
