@@ -17160,6 +17160,8 @@ int main(int argc, char** argv) {
                 cfg.S = S;
                 cfg.S_mtp = S_mtp;
                 cfg.spec_min_p = req_spec_min_p;
+                if (const char* v = std::getenv("STRATA_SPEC_FLOOR_FRESH")) cfg.floor_fresh = std::atof(v);
+                if (const char* v = std::getenv("STRATA_SPEC_FLOOR_HELD")) cfg.floor_held = std::atof(v);
                 cfg.theta = pl_theta;
                 cfg.theta3 = pl_theta3;
                 cfg.max_context = o.max_context;

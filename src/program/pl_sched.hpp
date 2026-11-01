@@ -43,6 +43,11 @@ struct Config {
     int S = 6;                     // the verifier's rows (a lookup window up to S)
     int S_mtp = 4;                 // the drafter's windows
     double spec_min_p = 0.0;       // req_spec_min_p (<= 0: windows of S_mtp rows)
+    // a row's floor by the window's class (STRATA_SPEC_FLOOR_FRESH / _HELD, < 0: spec_min_p).  A row costs a fresh window
+    // about 8 ms and a held one 3-5.  A fresh floor >= 1: one row, sized at once, so stage 0 does not wait for the chain
+    double floor_fresh = -1.0, floor_held = -1.0;
+    double ff() const { return floor_fresh >= 0.0 ? floor_fresh : spec_min_p; }
+    double fh() const { return floor_held >= 0.0 ? floor_held : spec_min_p; }
     float theta = 0.2f;            // the gate of a window behind one guess (STRATA_PIPELINE_THETA)
     float theta3 = -1.0f;          // ... behind two guesses (STRATA_PIPELINE_THETA3; < 0: theta)
     int64_t max_context = 0;
@@ -362,7 +367,7 @@ private:
     void drop_from(int k);
     int alloc_slot(PlIo& io, PW& w, bool& waited);
     void free_slot(int q, uint64_t uid);
-    int t_rule(const float* pr, int from, int avail) const;
+    int t_rule(const float* pr, int from, int avail, double floor) const;
     void ple_adv(int32_t ple[2], const int32_t* tok, int n) const;
     PW* find(uint64_t uid);
 

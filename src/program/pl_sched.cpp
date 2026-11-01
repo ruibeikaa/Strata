@@ -139,11 +139,11 @@ std::string Sched::dump() const {
 }
 
 // the serial loop's window size over the chain's outputs from index `from` (`avail` of them) - today's t_rule
-int Sched::t_rule(const float* pr, int from, int avail) const {
+int Sched::t_rule(const float* pr, int from, int avail, double floor) const {
     int T = c_.S_mtp;
-    if (c_.spec_min_p > 0.0) {
+    if (floor > 0.0) {
         T = 1;
-        while (T < c_.S_mtp && from + T - 1 < avail && pr[from + T - 1] >= (float) c_.spec_min_p) ++T;
+        while (T < c_.S_mtp && from + T - 1 < avail && pr[from + T - 1] >= (float) floor) ++T;
     }
     return std::max(1, std::min(T, 1 + avail - from));
 }
@@ -544,7 +544,7 @@ bool Sched::lkc_lk_window(PlIo& io, PW& pred) {
 
 // a fresh window's size from the chain's first outputs (today: A once a draft below spec_min_p ends it)
 bool Sched::decide_fresh(PlIo& io, PW& A, const int32_t* oc, const float* op, int avail, bool early, int k_landed) {
-    A.T = t_rule(op, 0, avail);
+    A.T = t_rule(op, 0, avail, c_.ff());
     for (int i = 1; i < A.T; ++i) {
         A.tok[i] = oc[i - 1];
         A.prob[i - 1] = op[i - 1];
@@ -573,9 +573,9 @@ bool Sched::decide_next(PlIo& io, int k, bool done) {
     const int32_t* oc = io.chain_tok();
     const float* op = io.chain_prob();
     bool decided = done || k >= base + c_.S_mtp;
-    if (!decided && k > base + 1 && c_.spec_min_p > 0.0)
+    if (!decided && k > base + 1 && c_.fh() > 0.0)
         for (int j = base + 1; j < k; ++j)
-            if (op[j] < (float) c_.spec_min_p) { decided = true; break; }
+            if (op[j] < (float) c_.fh()) { decided = true; break; }
     if (!decided) return false;
     if (done && k < base + c_.S_mtp) ++st_.case_hits[kCase8];   // the chain ended before the window's size said so
     // lookup chaining: pred's lookup tail sits at chain outputs [base - lkc, base).  Where the chain's own outputs there
@@ -626,7 +626,7 @@ bool Sched::decide_next(PlIo& io, int k, bool done) {
         y.seq = pred->seq + 1;
         y.p = pred->p + pred->T;
         y.tok[0] = oc[base];
-        y.T = t_rule(op, base + 1, k);
+        y.T = t_rule(op, base + 1, k, c_.fh());
         for (int i = 1; i < y.T; ++i) {
             y.tok[i] = oc[base + i];
             y.prob[i - 1] = op[base + i];
@@ -709,10 +709,10 @@ bool Sched::chain_round(PlIo& io) {
     if (ch_.kind == 2 && !ch_.early_used && A == nullptr) return fail("pl_sched: the fresh window of the chain is gone");
     if (ch_.kind == 2 && !ch_.early_used) {
         const int k = k_ready;
-        bool decided = k >= c_.S_mtp - 1;
-        if (!decided && c_.spec_min_p > 0.0)
+        bool decided = k >= c_.S_mtp - 1 || c_.ff() >= 1.0;
+        if (!decided && c_.ff() > 0.0)
             for (int j = 0; j < k; ++j)
-                if (io.chain_prob()[j] < (float) c_.spec_min_p) { decided = true; break; }
+                if (io.chain_prob()[j] < (float) c_.ff()) { decided = true; break; }
         if (decided && !decide_fresh(io, *A, io.chain_tok(), io.chain_prob(), std::min(k, c_.S_mtp - 1), true, k))
             return false;
     }
