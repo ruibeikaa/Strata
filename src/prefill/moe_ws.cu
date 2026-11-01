@@ -152,11 +152,23 @@ size_t chunks(const int32_t* order, size_t n, const int32_t* cnt, const int32_t*
     return k;
 }
 
+#if STRATA_EXPERT_NIBBLE_BUILT
+namespace detail {
+void gu_hf(const Layer& L, cudaStream_t s);   // moe_ws_gu_hf.cu: STRATA_PF_HFMA_EXP's FP16 kernels
+}
+#endif
+
 bool gate_up(const Layer& L, void* stream) {
     if (L.n <= 0 || L.nchunks <= 0) return true;
     const double u = (double) L.rows / L.n;
     if (mode() != 1 || !faster(L.gu_type, u)) return false;
     const cudaStream_t s = (cudaStream_t) stream;
+#if STRATA_EXPERT_NIBBLE_BUILT
+    if (L.hf_tier != 0) {   // STRATA_PF_HFMA_EXP: hfma_exp_plan took this layer's gate/up (set only with the switch on)
+        detail::gu_hf(L, s);
+        return true;
+    }
+#endif
     const bool f = fast() == 1;
     if (f) {   // once per process: the switch is on and the WS path runs
         static const bool said = [] {

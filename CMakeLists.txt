@@ -2160,7 +2160,9 @@ if(STRATA_NATIVE_EXPERTS)
       target_sources(strata_mmq PRIVATE src/prefill/moe_ws.cu src/prefill/moe_ws_gu_iq2.cu src/prefill/moe_ws_gu_iq3.cu
                      src/prefill/moe_ws_down.cu
                      # STRATA_EXPERT_NIBBLE: the gate/up product on 4-bit slots (strata/core/expert_nibble.hpp)
-                     src/prefill/moe_ws_gu_nib.cu)
+                     src/prefill/moe_ws_gu_nib.cu
+                     # STRATA_PF_HFMA_EXP: the same gate/up on FP16 HFMA2 (moe_ws_hf.cuh)
+                     src/prefill/moe_ws_gu_hf.cu)
     endif()
     # q8_0: the drafter's matrices (E-9); STRATA_ORCA_Q4KS_MMQ adds q5_0 (#296, in _strata_mmq_types), and
     # STRATA_MMQ_KQUANTS q4_k q5_k q5_1 q6_k, the experts of Unsloth's UD-Q4/Q5/Q6_K_XL (docs/QUANTS.md; the dispatch

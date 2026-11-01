@@ -1,0 +1,299 @@
+// src/prefill/moe_ws_gu_hf.cu - STRATA_PF_HFMA_EXP (moe_ws.hpp): the host side of moe_ws_hf.cuh's gate/up kernels - the
+// switch, the per-layer decision (format, tier, why not), the launches, and the once-per-read report with what ran, what
+// fell back and why, the range of the input and the weights' shifts.  Opt-in; with the switch off nothing here is called.
+#include "moe_ws_hf.cuh"
+#include "strata/core/expert_nibble.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
+
+#if STRATA_EXPERT_NIBBLE_BUILT
+namespace strata::prefill::ws {
+namespace {
+
+namespace nb = strata::core::nibble;
+
+// tokens a pass by rows an expert u (moe_ws_hf.cuh's microbenchmark, lognormal counts: tier 16 wins to u ~ 15, tier 32 from
+// ~ 20; below ~ 7 rows an expert the int8 8-token kernels are faster)
+constexpr double kU16 = 7.0, kU32 = 20.0;
+constexpr double kMacsPerRow = 1280.0 * 2560.0;
+
+struct Dev {
+    bool seen = false;
+    int64_t taken[32][2] = {};        // [type & 31][tier 16 / 32] launches
+    uint64_t layers[32] = {};         // [type & 31] bit (layer & 63)
+    double macs_taken[32] = {}, macs_left[32] = {};
+    int64_t left_n[32] = {};
+    std::map<std::string, int64_t> left;   // "FMT: reason" -> launches
+};
+std::mutex g_mu;
+Dev g_dev[64];
+void* g_state_ptr[64] = {};
+
+// STRATA_PREFILL_TIMING: an event pair round each launch (per device, reused), summed by format and tier in the report - the
+// kernels' own time and so their real G MAC/s
+struct Tm {
+    cudaEvent_t a = nullptr, b = nullptr;
+    int type = 0, tier = 0;
+    double macs = 0.0;
+};
+std::vector<Tm> g_tm[64];
+size_t g_tm_n[64] = {};
+bool timing_on() {
+    static const bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
+    return on;
+}
+
+int cur_dev() {
+    int d = 0;
+    if (cudaGetDevice(&d) != cudaSuccess || d < 0 || d >= 64) { cudaGetLastError(); return 0; }
+    return d;
+}
+void* state_ptr(int dev) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (g_state_ptr[dev] == nullptr) {
+        void* p = nullptr;
+        if (cudaGetSymbolAddress(&p, hf::g_hf) != cudaSuccess) {
+            std::fprintf(stderr, "prefill ws: STRATA_PF_HFMA_EXP: the device state symbol is missing on GPU %d\n", dev);
+            std::exit(1);
+        }
+        g_state_ptr[dev] = p;
+    }
+    return g_state_ptr[dev];
+}
+void ck(cudaError_t e, const char* what) {
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "prefill ws: %s: %s\n", what, cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
+const char* fname(int t) { return nb::fmt_name(t); }
+int popcount64(uint64_t v) {
+    int n = 0;
+    for (; v != 0; v &= v - 1) ++n;
+    return n;
+}
+
+void note_left(int dev, int gu_type, int64_t rows, const char* why) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    Dev& d = g_dev[dev];
+    d.seen = true;
+    d.macs_left[gu_type & 31] += (double) rows * kMacsPerRow;
+    ++d.left_n[gu_type & 31];
+    ++d.left[std::string(fname(gu_type)) + ": " + why];
+}
+
+}  // namespace
+
+int hfma_exp() {
+    static const int on = [] {
+        const char* e = std::getenv("STRATA_PF_HFMA_EXP");
+        if (e == nullptr || std::atoi(e) == 0) return 0;
+        if (mode() == 0) {
+            std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_EXP=1 needs STRATA_MMQ_WS=1 on compute capability 6.0: ignored\n");
+            return 0;
+        }
+        std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_EXP=1: the 4-bit gate/up of the prompt on FP16 HFMA2 (FP16 input rows, weights "
+                             "decoded in the kernel, FP16 sums of 64 products widened to FP32 every 128 values, the weights' shift "
+                             "picked per launch from the layer's max |x|; not bitwise the int8 kernels' GU)\n");
+        return 1;
+    }();
+    return on;
+}
+
+bool hfma_exp_plan(Layer& L) {
+    L.hf_tier = 0;
+    const int dev = cur_dev();
+    const double rows = (double) L.rows, u = L.n > 0 ? rows / (double) L.n : 0.0;
+    const char* why = nullptr;
+    if (!L.gu_nib) why = "GGUF-block slot (not 4-bit codes)";
+    else if (hf::family(L.gu_type) < 0) why = "no FP16 kernel for the format";
+    else if (L.hf_xh == nullptr || L.hf_src == nullptr || ((uintptr_t) L.hf_xh & 15) != 0 || L.hf_tokens <= 0)
+        why = "FP16 input missing or misaligned";
+    else if (u < kU16) why = "u below 7 rows an expert (the int8 8-token tier is faster)";
+    if (why != nullptr) {
+        note_left(dev, L.gu_type, L.rows, why);
+        return false;
+    }
+    L.hf_tier = u >= kU32 ? 32 : 16;
+    std::lock_guard<std::mutex> lk(g_mu);
+    Dev& d = g_dev[dev];
+    d.seen = true;
+    ++d.taken[L.gu_type & 31][L.hf_tier == 32 ? 1 : 0];
+    d.macs_taken[L.gu_type & 31] += rows * kMacsPerRow;
+    if (L.hf_layer >= 0) d.layers[L.gu_type & 31] |= 1ull << (L.hf_layer & 63);
+    return true;
+}
+
+void hfma_exp_left(int gu_type, bool nibble, int64_t rows, const char* why) {
+    (void) nibble;
+    note_left(cur_dev(), gu_type, rows, why);
+}
+
+void hfma_exp_prepass(const Layer& L, void* stream) {
+    const cudaStream_t s = (cudaStream_t) stream;
+    void* st = state_ptr(cur_dev());
+    ck(cudaMemsetAsync(st, 0, sizeof(unsigned), s), "hfma_exp: memset");   // HfState::cur is its first member
+    const int64_t n16 = L.hf_tokens * hf::XROW16;
+    const unsigned blocks = (unsigned) std::max<int64_t>(1, std::min<int64_t>(2048, (n16 + 1023) / 1024));
+    hf::xmax_kernel<<<blocks, 256, 0, s>>>((const uint4*) L.hf_xh, n16);
+    ck(cudaGetLastError(), "hfma_exp: max-reduce");
+}
+
+namespace detail {
+void gu_hf(const Layer& L, cudaStream_t s) {
+    if (L.nchunks <= 0) return;
+    static const bool said = [] {
+        std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_EXP: a 4-bit layer's gate/up runs the FP16 HFMA2 kernels\n");
+        return true;
+    }();
+    (void) said;
+    const unsigned grid = (unsigned) (L.nchunks * hf::PIECES);
+    const uint4* xh = (const uint4*) L.hf_xh;
+    const char* w = (const char*) L.w;
+    cudaEvent_t ev_b = nullptr;
+    if (timing_on()) {
+        const int dev = cur_dev();
+        cudaEvent_t ev_a = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_mu);
+            auto& v = g_tm[dev];
+            if (g_tm_n[dev] == v.size()) {
+                Tm t;
+                ck(cudaEventCreate(&t.a), "hfma_exp: event");
+                ck(cudaEventCreate(&t.b), "hfma_exp: event");
+                v.push_back(t);
+            }
+            Tm& t = v[g_tm_n[dev]++];
+            t.type = L.gu_type;
+            t.tier = L.hf_tier;
+            t.macs = (double) L.rows * kMacsPerRow;
+            ev_a = t.a;
+            ev_b = t.b;
+        }
+        cudaEventRecord(ev_a, s);
+    }
+#define STRATA_HF_LAUNCH(TPP)                                                                                          \
+    switch (hf::family(L.gu_type)) {                                                                                   \
+        case 0: hf::gu_kernel<TPP, 0><<<grid, hf::NT, 0, s>>>(L.chunks, w, L.xoff, xh, L.hf_src, L.gu, L.hf_layer); break; \
+        case 1: hf::gu_kernel<TPP, 1><<<grid, hf::NT, 0, s>>>(L.chunks, w, L.xoff, xh, L.hf_src, L.gu, L.hf_layer); break; \
+        case 2: hf::gu_kernel<TPP, 2><<<grid, hf::NT, 0, s>>>(L.chunks, w, L.xoff, xh, L.hf_src, L.gu, L.hf_layer); break; \
+        case 3: hf::gu_kernel<TPP, 3><<<grid, hf::NT, 0, s>>>(L.chunks, w, L.xoff, xh, L.hf_src, L.gu, L.hf_layer); break; \
+        default: std::fprintf(stderr, "prefill ws: 4-bit gate/up type %d has no FP16 kernel\n", L.gu_type); std::exit(1); \
+    }
+    if (L.hf_tier == 32) { STRATA_HF_LAUNCH(32) }
+    else { STRATA_HF_LAUNCH(16) }
+#undef STRATA_HF_LAUNCH
+    ck(cudaGetLastError(), "gate/up 4-bit FP16");
+    if (ev_b != nullptr) cudaEventRecord(ev_b, s);
+}
+}  // namespace detail
+
+void hfma_exp_report(int64_t tokens) {
+    if (hfma_exp() == 0) return;
+    std::lock_guard<std::mutex> lk(g_mu);
+    const int back = cur_dev();
+    for (int dev = 0; dev < 64; ++dev) {
+        Dev& d = g_dev[dev];
+        if (!d.seen) continue;
+        hf::HfState st{};
+        const bool have_state = g_state_ptr[dev] != nullptr;
+        if (have_state) {
+            cudaSetDevice(dev);
+            if (cudaMemcpyFromSymbol(&st, hf::g_hf, sizeof st) != cudaSuccess) { cudaGetLastError(); std::memset(&st, 0, sizeof st); }
+            hf::HfState zero{};
+            if (cudaMemcpyToSymbol(hf::g_hf, &zero, sizeof zero) != cudaSuccess) cudaGetLastError();
+        }
+        // the kernels' own time by format and tier (STRATA_PREFILL_TIMING)
+        std::string kt;
+        if (g_tm_n[dev] > 0) {
+            struct Acc { double ms = 0.0, macs = 0.0; int64_t n = 0; };
+            std::map<std::pair<int, int>, Acc> acc;
+            double ms_all = 0.0, macs_all = 0.0;
+            cudaSetDevice(dev);
+            for (size_t i = 0; i < g_tm_n[dev]; ++i) {
+                float ms = 0.0f;
+                if (cudaEventSynchronize(g_tm[dev][i].b) == cudaSuccess && cudaEventElapsedTime(&ms, g_tm[dev][i].a, g_tm[dev][i].b) == cudaSuccess) {
+                    Acc& a = acc[{g_tm[dev][i].type, g_tm[dev][i].tier}];
+                    a.ms += ms; a.macs += g_tm[dev][i].macs; ++a.n;
+                    ms_all += ms; macs_all += g_tm[dev][i].macs;
+                } else {
+                    cudaGetLastError();
+                }
+            }
+            g_tm_n[dev] = 0;
+            for (const auto& [key, a] : acc) {
+                char b[160];
+                std::snprintf(b, sizeof b, "%s%s t%d x%lld %.1f ms %.0f GMAC/s", kt.empty() ? "" : "; ", fname(key.first), key.second, (long long) a.n, a.ms,
+                              a.ms > 0 ? a.macs / a.ms * 1e-6 : 0.0);
+                kt += b;
+            }
+            char b[120];
+            std::snprintf(b, sizeof b, "; all %.1f ms %.0f GMAC/s", ms_all, ms_all > 0 ? macs_all / ms_all * 1e-6 : 0.0);
+            kt += b;
+        }
+        int64_t n_taken = 0, n_left = 0;
+        double m_taken = 0.0, m_left = 0.0;
+        std::string by;
+        for (int t = 0; t < 32; ++t) {
+            const int64_t tk = d.taken[t][0] + d.taken[t][1];
+            n_taken += tk;
+            n_left += d.left_n[t];
+            m_taken += d.macs_taken[t];
+            m_left += d.macs_left[t];
+            if (tk == 0 && d.left_n[t] == 0) continue;
+            char b[200];
+            std::snprintf(b, sizeof b, "%s%s %lld launches on HFMA2 (%d layers; tier 16 x%lld, tier 32 x%lld; %.1f%% of its %lld launches' MACs)",
+                          by.empty() ? "" : "; ", fname(t), (long long) tk, popcount64(d.layers[t]),(long long) d.taken[t][0],
+                          (long long) d.taken[t][1], d.macs_taken[t] + d.macs_left[t] > 0 ? 100.0 * d.macs_taken[t] / (d.macs_taken[t] + d.macs_left[t]) : 0.0,
+                          (long long) (tk + d.left_n[t]));
+            by += b;
+        }
+        std::string lft;
+        for (const auto& [what, n] : d.left) lft += (lft.empty() ? "" : ", ") + what + " x" + std::to_string((long long) n);
+        auto h2f = [](unsigned bits) { return __half2float(__ushort_as_half((unsigned short) bits)); };
+        std::string lm;
+        for (int l = 0; l < 64; ++l)
+            if (st.layer_max[l] != 0) {
+                char b[40];
+                std::snprintf(b, sizeof b, "%sL%d %.1f", lm.empty() ? "" : ", ", l, h2f(st.layer_max[l]));
+                lm += b;
+            }
+        std::string kh;
+        for (int i = 0; i <= hf::KMAX - hf::KMIN; ++i)
+            if (st.khist[i] != 0) {
+                char b[40];
+                std::snprintf(b, sizeof b, "%s%d x%u", kh.empty() ? "" : ", ", i + hf::KMIN, st.khist[i]);
+                kh += b;
+            }
+        std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_EXP: read of %lld tokens, CUDA%d: gate/up %lld launches on HFMA2, %lld left to the int8 kernels "
+                             "(%.1f%% of %.3g MACs on HFMA2); by format: %s; left: %s; input max |x| %.2f (per layer: %s); weights' shift k "
+                             "(2^-k) per launch: %s; non-finite: input in %u launches, output %u values; kernel time: %s\n",
+                     (long long) tokens, dev, (long long) n_taken, (long long) n_left,
+                     m_taken + m_left > 0 ? 100.0 * m_taken / (m_taken + m_left) : 0.0, m_taken + m_left, by.empty() ? "-" : by.c_str(),
+                     lft.empty() ? "nothing" : lft.c_str(), h2f(st.all_max), lm.empty() ? "-" : lm.c_str(), kh.empty() ? "-" : kh.c_str(), st.bad_x,
+                     st.bad_y, kt.empty() ? "-" : kt.c_str());
+        d = Dev{};
+    }
+    cudaSetDevice(back);
+}
+
+}  // namespace strata::prefill::ws
+#else  // STRATA_EXPERT_NIBBLE_BUILT is 0 (a build without the 4-bit kernels): the switch does not exist
+namespace strata::prefill::ws {
+int hfma_exp() { return 0; }
+bool hfma_exp_plan(Layer& L) { L.hf_tier = 0; return false; }
+void hfma_exp_left(int, bool, int64_t, const char*) {}
+void hfma_exp_prepass(const Layer&, void*) {}
+void hfma_exp_report(int64_t) {}
+}  // namespace strata::prefill::ws
+#endif

@@ -76,6 +76,7 @@
 #include "strata/core/draft_cap.hpp"
 #endif
 #include "strata/prefill/gemm.hpp"
+#include "strata/prefill/moe_ws.hpp"
 #include "strata/prefill/kva.hpp"
 #include "strata/prefill/kva_floor.hpp"
 #include "strata/prefill/prefill.hpp"
@@ -17049,6 +17050,7 @@ int main(int argc, char** argv) {
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
             std::fflush(stdout);
             strata::prefill::gemm_hfma_report(n - (int64_t) resume);   // STRATA_PF_HFMA: what the read's dense products ran on (nothing printed without it)
+            strata::prefill::ws::hfma_exp_report(n - (int64_t) resume);   // STRATA_PF_HFMA_EXP: what the read's 4-bit gate/up ran on (nothing printed without it)
             // the verify windows: the first holds the last prompt token alone (STRATA_ADMIT_MERGE_FIRST: the prompt
             // tokens from merge_at on, the last one's output its first token)
             const int merge_T = merge_at >= 0 && !cancelled ? (int) (n - merge_at) : 0;

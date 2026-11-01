@@ -137,6 +137,11 @@ bool faster(int, double) { return false; }
 size_t chunks(const int32_t*, size_t, const int32_t*, const int32_t*, Chunk*) { return 0; }
 bool gate_up(const Layer&, void*) { return false; }
 void down(const Layer&, void*) {}
+int hfma_exp() { return 0; }
+bool hfma_exp_plan(Layer&) { return false; }
+void hfma_exp_left(int, bool, int64_t, const char*) {}
+void hfma_exp_prepass(const Layer&, void*) {}
+void hfma_exp_report(int64_t) {}
 }  // namespace strata::prefill::ws
 #endif
 
@@ -2773,11 +2778,12 @@ namespace {
 // are folded at every MoE layer's host sync, after which all of them have completed.
 enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn, kPfRouter, kPfHostGroup, kPfGather,
                kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfKvStage, kPfGdnConv, kPfGdnRec, kPfGdnOut, kPfHcWrite,
+               kPfHfPre,   // STRATA_PF_HFMA_EXP's max-reduce of the layer input (no mark without the switch: never printed)
                kPfCount };
 const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa select",
                                         "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
                                         "gemm gate/up", "gemm down", "combine", "ple", "kv stage", "gdn conv+gates",
-                                        "gdn recurrence", "gdn out proj", "hc write"};
+                                        "gdn recurrence", "gdn out proj", "hc write", "hfma pre-pass"};
 struct PfTimer {
     bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
     std::vector<cudaEvent_t> ev;
@@ -4702,6 +4708,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
                         bool ws_layer = false;   // STRATA_MMQ_WS: this layer's products weight-stationary (below)
                         ws::Layer wl;
+                        // STRATA_PF_HFMA_EXP=1: a 4-bit layer's q8_1 rows are quantized only once it is known that its gate/up does
+                        // not take the FP16 route (below); with the switch off hf_defer is false and nothing here changes
+                        const bool hf_defer = ws::hfma_exp() != 0 && use_mmq && lay.native && nib_l.on && !had_gu && !wmma_l;
+                        bool xq_pending = false;
                         pt.mark(kPfGather, cs);
                         // the routed experts' input: `mixed`, or (APR) its rotated copy, which the peer / the layer
                         // split's helper also take (one rotation for both cards; `mixed` itself feeds the shared expert)
@@ -4721,6 +4731,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 }
                                 if (mmq::fp4_activations(mmq_gt))
                                     mmq::quantize(xsrc, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs, m.Xscale);
+                                else if (hf_defer)
+                                    xq_pending = true;
                                 else
                                     mmq::quantize_scatter(xsrc, m.slot_dev, m.src_dev, m.Xq, mmq_gt, N, N, T, (int) K, m.cs);
                             }
@@ -4807,6 +4819,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     wl.gu_type = mmq_gt; wl.d_type = mmq_dt; wl.w = ip_base; wl.xoff = m.xoff_dev;
                                     wl.down_off = (int64_t) ws_down_off; wl.chunks = m.ws_chunks; wl.gu_nib = nib_l.on;
                                     wl.rows = T * K; wl.n = (int) n; wl.xq = m.Xq; wl.gu = m.GU; wl.hq = m.Hq; wl.dm = m.Dm;
+                                }
+                            }
+                            if (xq_pending) {
+                                // STRATA_PF_HFMA_EXP=1 (moe_ws.hpp): a 4-bit layer on the weight-stationary route may run its gate/up on
+                                // the FP16 image of its input (`mixed_h`, one row a token, read through src_dev: no q8_1 rows, no routed
+                                // copy), after a max-reduce that sets the weights' shift; any other layer quantizes here, as it did above
+                                bool hf = false;
+                                if (ws_layer) {
+                                    wl.hf_xh = m.mixed_h; wl.hf_src = m.src_dev; wl.hf_tokens = (int64_t) T; wl.hf_layer = (int) l;
+                                    hf = ws::hfma_exp_plan(wl);
+                                } else {
+                                    ws::hfma_exp_left(mmq_gt, nib_l.on, (int64_t) (T * K), "the layer is not on the weight-stationary route");
+                                }
+                                if (hf) {
+                                    pt.mark(kPfHfPre, cs);
+                                    ws::hfma_exp_prepass(wl, m.cs);
+                                } else {
+                                    mmq::quantize_scatter(xsrc, m.slot_dev, m.src_dev, m.Xq, mmq_gt, N, N, T, (int) K, m.cs);
                                 }
                             }
                         } else {
