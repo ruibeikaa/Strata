@@ -2724,6 +2724,13 @@ bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y
                  std::string& err, int64_t ldy = 0, int64_t ldx = 0) {
     if (!w->native_data) { err = "prefill: " + name + " has no native GGUF blocks (run with --native)"; return false; }
     const bool ct = g_cold.begin();
+    // STRATA_PF_HFMA=1 (gemm.cu, GP100 only): the product on FP16 HFMA2 pairs and the weight's resident FP16 copy; a call
+    // the kernel cannot take is counted under `name` and runs below
+    static const bool hfma = [] { const char* e = std::getenv("STRATA_PF_HFMA"); return e != nullptr && std::atoi(e) != 0; }();
+    if (hfma && gm.native_hfma(X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy, ldx, name.c_str())) {
+        if (ct) g_cold.end("hfma", name, T, w->ne1, w->ne0);
+        return true;
+    }
     gm.native(X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy, 0.0f, ldx);
     if (ct) g_cold.end("native", name, T, w->ne1, w->ne0);
     return true;
@@ -5840,8 +5847,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             std::snprintf(b, sizeof b, " %s %.0f (%.1f%%)", kPfNames[i], pt.ms[i], total > 0 ? 100.0 * pt.ms[i] / total : 0.0);
             line += b;
         }
-        std::fprintf(stderr, "strata prefill timing: %lld tokens, GPU timeline %.0f ms, wall %.0f ms, host staging %.0f ms:%s\n",
-                     (long long) n, total, ms_since(t_start), stats_.ms_experts_host, line.c_str());
+        int stage_dev = -1;   // (which stage's line it is: a layer split prints one per stage and chunk)
+        cudaGetDevice(&stage_dev);
+        std::fprintf(stderr, "strata prefill timing: %lld tokens, GPU timeline %.0f ms, wall %.0f ms, host staging %.0f ms:%s (CUDA%d)\n",
+                     (long long) n, total, ms_since(t_start), stats_.ms_experts_host, line.c_str(), stage_dev);
         std::fprintf(stderr, "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
                              "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);

@@ -59,6 +59,12 @@ public:
     /// the card's shared memory runs through llama.cpp's int8 MMQ instead (opt-in: STRATA_DENSE_MMQ=1).
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0, float beta = 0.0f, int64_t ldx = 0);
+    /// STRATA_PF_HFMA=1, Pascal GP100 only: native()'s product (beta = 0) with the weight's FP16 copy kept resident and the
+    /// sums done in FP16 pairs (gemm_hfma.cuh; FP16 groups of 64 products widened to FP32, so not bitwise the FP32 routes').
+    /// `name`: the weight's name, for the counts.  False = nothing launched (a shape, alignment or the copy's room the kernel
+    /// cannot take, counted under `name` with its reason): the caller runs native().
+    bool native_hfma(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
+                     int64_t ldy, int64_t ldx, const char* name);
 
     /// HIP gfx103x (prompt_f16()): bf16() takes X as the FP16 image the prompt path's kernels write (set_act_f16),
     /// and bf16() / f16() / native() run the GEMM with FP16 out (rocBLAS's tuned kernels there), widened in place in
@@ -147,6 +153,10 @@ private:
 /// (STRATA_DENSE_F32=1 on compute capability 6.x, else off).  For gemm_f32_parity; a no-op outside the experimental
 /// CUDA 12 build.
 void gemm_set_dense_f32(int mode);
+
+/// STRATA_PF_HFMA: one line per device with what the HFMA2 kernel ran since the last call and, by weight and reason, what it
+/// left to the old route; called when a prompt read of `tokens` tokens has ended.  Prints nothing when no call was made.
+void gemm_hfma_report(int64_t tokens);
 
 /// HIP on gfx103x (RDNA2), for the current device: rocBLAS's tuned GEMMs there are FP16 in -> FP16 out only (FP16 or
 /// BF16 in -> FP32 out runs ~6x slower), so the prompt path's 16-bit GEMMs run in FP16 (Gemm::set_f16_io,

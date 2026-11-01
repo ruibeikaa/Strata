@@ -36,6 +36,13 @@
 #include <mutex>
 #include <unordered_map>
 
+#if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
+#include "gemm_hfma.cuh"   // STRATA_PF_HFMA
+#include <cctype>
+#include <map>
+#include <string>
+#endif
+
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
 #include "hipblaslt_tuning.hpp"
 #if defined(_WIN32)
@@ -1051,6 +1058,71 @@ bool grow_f32(float*& p, int64_t& have, int64_t want) {   // `have`, `want`: 4-b
     have = want;
     return true;
 }
+
+// ---- GP100, opt-in (STRATA_PF_HFMA=1): the prompt's dense projections on FP16 HFMA2 -------------------------------------
+// GP100 issues FP16 pairs (fma.rn.f16x2) at twice the FP32 rate and cuBLAS has no kernel that uses it here: its
+// FP16-operand GEMMs sum in FP32 (the cublasSgemm route above is the fastest of them).  gemm_hfma.cuh multiplies in FP16
+// pairs, sums 64 products a lane in FP16 and widens that into an FP32 accumulator; the weight's FP16 copy is kept resident
+// - the FP16 values dequant_f16 gives the other routes, made once on first use - so there is no dequantization or widening
+// per chunk at all.  The sums are rounded in FP16, so the outputs are not bitwise those of any FP32 route; decode does not
+// run through here.
+//   Compute capability 6.0 only (6.1 issues FP16 at 1/64 of the FP32 rate).  A call the kernel cannot take - a K that is not
+// a multiple of 32, a misaligned or short-strided X, a weight whose FP16 copy did not fit (the copies are budgeted like the
+// FP32 ones: STRATA_F32_RESIDENT_RESERVE_MIB stays free after each) - launches nothing, runs the route it replaces, and is
+// counted by weight and reason; gemm_hfma_report prints the counts once per read.
+std::unordered_map<const void*, uint16_t*> g_shadow_h;   // weight address -> its FP16 copy (nullptr: did not fit, not retried)
+uint64_t g_shadow_h_bytes[64] = {};
+int g_shadow_h_count[64] = {}, g_shadow_h_refused[64] = {};
+// shadow_get_in's twin for the FP16 copies (the same lock and reserve, their own books)
+template <class Make>
+const uint16_t* shadow_get_h(const void* key, int64_t elems, cudaStream_t st, Make make) {
+    std::lock_guard<std::mutex> lk(g_shadow_mu);
+    if (const auto it = g_shadow_h.find(key); it != g_shadow_h.end()) return it->second;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return nullptr; }
+    const size_t bytes = (size_t) elems * 2;
+    size_t free_b = 0, total_b = 0;
+    uint16_t* p = nullptr;
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b >= bytes + f32_resident_reserve() &&
+        cudaMalloc((void**) &p, bytes) == cudaSuccess) {
+        make(p);
+        if (cudaStreamSynchronize(st) != cudaSuccess) {
+            std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA: making a copy failed on GPU %d\n", dev);
+            std::exit(1);
+        }
+        const uint64_t before = g_shadow_h_bytes[dev];
+        g_shadow_h_bytes[dev] += bytes;
+        ++g_shadow_h_count[dev];
+        if (before == 0 || (before >> 28) != (g_shadow_h_bytes[dev] >> 28))   // the first, then every 256 MiB
+            std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA: GPU %d keeps %d FP16 weight copies, %.0f MiB "
+                                 "(%.0f MiB free)\n", dev, g_shadow_h_count[dev], g_shadow_h_bytes[dev] / 1048576.0,
+                         (free_b - bytes) / 1048576.0);
+    } else {
+        cudaGetLastError();
+        p = nullptr;
+        if (g_shadow_h_refused[dev]++ < 4)
+            std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA: GPU %d: no room for a %.1f MiB FP16 copy (%.0f MiB "
+                                 "free, reserve %.0f MiB; %d copies, %.0f MiB kept): this weight keeps its old route\n",
+                         dev, bytes / 1048576.0, free_b / 1048576.0, f32_resident_reserve() / 1048576.0,
+                         g_shadow_h_count[dev], g_shadow_h_bytes[dev] / 1048576.0);
+    }
+    g_shadow_h.emplace(key, p);
+    return p;
+}
+// what the kernel ran and what it left to the old route, per device since the last report
+std::atomic<int64_t> g_hf_taken[64];
+std::mutex g_hf_mu;
+std::map<std::string, int64_t> g_hf_left[64];   // "weight: reason" -> calls (the weight without its layer: blk.12.attn_qkv.weight -> attn_qkv.weight)
+void hfma_left(int dev, const char* name, const char* why) {
+    std::string w = name != nullptr ? name : "?";
+    if (w.compare(0, 4, "blk.") == 0) {
+        size_t i = 4;
+        while (i < w.size() && std::isdigit((unsigned char) w[i])) ++i;
+        if (i < w.size() && w[i] == '.') w.erase(0, i + 1);
+    }
+    std::lock_guard<std::mutex> lk(g_hf_mu);
+    ++g_hf_left[dev][w + ": " + why];
+}
 #endif
 }  // namespace
 #endif
@@ -1121,8 +1193,65 @@ bool Gemm::sgemm_nt(const uint16_t* X, const float* wt, float* Y, int64_t T, int
     }
     return true;
 }
+// STRATA_PF_HFMA=1's product (see the block above): false = nothing launched, native() runs; the call is counted under `name`
+bool Gemm::native_hfma(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
+                       int64_t ldy, int64_t ldx, const char* name) {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
+    if (T <= 0 || N <= 0) return true;
+    if (ldx <= 0) ldx = K;
+    if (ldy <= 0) ldy = N;
+    const char* why = nullptr;
+    if (current_cc() != 60) why = "not a GP100";
+    else if (K <= 0 || K % 32 != 0) why = "K is not a multiple of 32";
+    else if (T > INT_MAX || N > INT_MAX || K > INT_MAX || ldx > INT_MAX) why = "a size past 2^31";
+    else if (ldx < K || ldx % 8 != 0) why = "X row stride";
+    else if (ldy < N) why = "Y row stride";
+    else if (((uintptr_t) X & 15) != 0) why = "X not 16-byte aligned";
+    const uint16_t* wh = nullptr;
+    if (why == nullptr) {
+        wh = shadow_get_h(W_blocks, N * K, (cudaStream_t) stream_, [&](uint16_t* dst) {
+            strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, dst, stream_);
+        });
+        if (wh == nullptr) why = "no room for its FP16 copy";
+    }
+    if (why != nullptr) {
+        hfma_left(dev, name, why);
+        return false;
+    }
+    static bool said = false;
+    if (!said) {
+        said = true;
+        std::fprintf(stderr, "prefill gemm: the dense projections run as FP16 HFMA2 GEMMs on resident FP16 copies "
+                             "(STRATA_PF_HFMA=1; FP16 sums of 64 products widened to FP32, not bitwise the FP32 routes')\n");
+    }
+    strata::prefill::hfma::gemm(X, ldx, wh, Y, T, N, K, ldy, (cudaStream_t) stream_);
+    g_hf_taken[dev].fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+void gemm_hfma_report(int64_t tokens) {
+    std::lock_guard<std::mutex> lk(g_hf_mu);
+    for (int d = 0; d < 64; ++d) {
+        const int64_t taken = g_hf_taken[d].exchange(0);
+        if (taken == 0 && g_hf_left[d].empty()) continue;
+        int64_t left = 0;
+        std::string by;
+        for (const auto& [what, n] : g_hf_left[d]) {
+            left += n;
+            by += (by.empty() ? " (" : ", ") + what + " x" + std::to_string(n);
+        }
+        std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA: read of %lld tokens, CUDA%d: %lld dense products on the HFMA2 "
+                             "kernel, %lld left to the old route%s%s\n", (long long) tokens, d, (long long) taken, (long long) left,
+                     by.c_str(), by.empty() ? "" : ")");
+        g_hf_left[d].clear();
+    }
+}
 #else
 void gemm_set_dense_f32(int) {}
+bool Gemm::native_hfma(const uint16_t*, int, const void*, float*, int64_t, int64_t, int64_t, int64_t, int64_t, const char*) {
+    return false;   // not the experimental sm_60 CUDA build: native() runs
+}
+void gemm_hfma_report(int64_t) {}
 #endif
 bool Gemm::bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K) {
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
