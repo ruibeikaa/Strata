@@ -58,6 +58,25 @@ struct Config {
     // STRATA_SPEC_FRESH_A: floor_fresh only after a window that accepted fewer tokens than this (> 0); after a longer one
     // spec_min_p, and the fresh window waits for the chain as it does today
     int fresh_a = 0;
+    // STRATA_SPEC_FRESH_H: the same once this many row 0 guesses in a row were sure (> 0; the run outlives a miss): sure text
+    // pays for a wide fresh window, and its lookup needs the chain's first output
+    int fresh_h = 0;
+    // STRATA_SPEC_LK_WAIT: a fresh window of one row still waits for the chain's first output when the lookup has a match of
+    // this many tokens (> 0): pick_lookup needs it to take the lookup
+    int lk_wait = 0;
+    // STRATA_SPEC_CLASS: settings by what is being written, read off the verified tokens: thinking up to </think>, a tool
+    // call, other text.  Only windows' shapes change: every token is still the main model's
+    struct Tun {
+        double spec_min_p = 0, floor_fresh = -1, floor_held = -1, floor_c = -1, late_p = 0.95, row0 = 0;
+        float theta = 0, theta3 = -1;
+        int S_mtp = 0, fresh_a = 0, fresh_h = 0, late_m = 0, lk_wait = 0;
+        bool late_t = false, late_d = false;
+    };
+    enum { kClsThink = 0, kClsTool = 1, kClsText = 2 };
+    bool cls_on = false;
+    Tun cls[3];
+    int32_t tok_think = 248068, tok_think_end = 248069, tok_tool = 248058, tok_tool_end = 248059;
+    bool set_class(const char* spec, std::string& err);
     double ff() const { return floor_fresh >= 0.0 ? floor_fresh : spec_min_p; }
     double fh() const { return floor_held >= 0.0 ? floor_held : spec_min_p; }
     double fc() const { return floor_c >= 0.0 ? floor_c : fh(); }
@@ -383,7 +402,9 @@ private:
     int alloc_slot(PlIo& io, PW& w, bool& waited);
     void free_slot(int q, uint64_t uid);
     int t_rule(const float* pr, int from, int avail, double floor) const;
-    double fresh_floor() const { return c_.fresh_a > 0 && last_a_ >= c_.fresh_a ? c_.spec_min_p : c_.ff(); }
+    double fresh_floor() const {
+        return (c_.fresh_a > 0 && last_a_ >= c_.fresh_a) || (c_.fresh_h > 0 && hi_run_ >= c_.fresh_h) ? c_.spec_min_p : c_.ff();
+    }
     void ple_adv(int32_t ple[2], const int32_t* tok, int n) const;
     PW* find(uint64_t uid);
 
@@ -396,6 +417,7 @@ private:
     int ndoom_ = 0;
     UndoJob undo_;
     int last_a_ = 0;               // the tokens the last verified window accepted
+    int cls_ = 0;                  // STRATA_SPEC_CLASS: what the verified text is writing now
     int hi_run_ = 0;               // the row 0 guesses in a row at 0.95 or more
     Held held_[kMaxSlots + 1];
     int nheld_ = 0;

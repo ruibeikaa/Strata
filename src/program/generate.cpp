@@ -17170,6 +17170,8 @@ int main(int argc, char** argv) {
                 if (const char* v = std::getenv("STRATA_SPEC_LATE_P")) cfg.late_p = std::atof(v);
                 if (const char* v = std::getenv("STRATA_SPEC_LATE_D")) cfg.late_d = std::atoi(v) != 0;
                 if (const char* v = std::getenv("STRATA_SPEC_FRESH_A")) cfg.fresh_a = std::atoi(v);
+                if (const char* v = std::getenv("STRATA_SPEC_FRESH_H")) cfg.fresh_h = std::atoi(v);
+                if (const char* v = std::getenv("STRATA_SPEC_LK_WAIT")) cfg.lk_wait = std::atoi(v);
                 cfg.theta = pl_theta;
                 cfg.theta3 = pl_theta3;
                 cfg.max_context = o.max_context;
@@ -17560,6 +17562,8 @@ int main(int argc, char** argv) {
                 strata::pl::Sched sched;
                 {
                     std::string serr;   // (the configuration passed Sched::check above: what is left is not expected)
+                    if (const char* v = std::getenv("STRATA_SPEC_CLASS"))
+                        if (!cfg.set_class(v, serr)) return die(serr);
                     if (!sched.begin(cfg, p, x, ss.ple_prev, 0.0, serr)) return die(serr);
                 }
                 pl_sched_live = &sched;

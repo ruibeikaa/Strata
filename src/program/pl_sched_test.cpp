@@ -84,9 +84,11 @@ struct World {
     std::vector<int32_t> tr, tab_tok;
     std::vector<float> tab_p;
     std::vector<uint8_t> tab_set;
+    int32_t pre = -1;                    // the token at p0 - 2 (the prompt's <think>)
 
     int32_t truth(int64_t q) const {
         if (q == eos_pos) return kEos;
+        if (q == p0 - 2 && pre >= 0) return pre;
         if (q >= p0 && q - p0 < (int64_t) tr.size()) return tr[(size_t) (q - p0)];
         return 1000 + (int32_t) (mix64((uint64_t) q * 0x9e37u ^ salt) % 100000);
     }
@@ -3334,12 +3336,14 @@ bool load_replay(const char* path, std::vector<ReplayReq>& out) {
         if (line[0] == 'R') {
             char nm[128];
             long long p0 = 0, n = 0;
-            if (std::sscanf(line, "R %127s %lld %lld", nm, &p0, &n) != 3) continue;
+            int pre = -1;
+            if (std::sscanf(line, "R %127s %lld %lld %d", nm, &p0, &n, &pre) < 3) continue;
             out.emplace_back();
             ReplayReq& r = out.back();
             r.name = nm;
             r.w.p0 = p0;
             r.w.max_new = n;
+            r.w.pre = pre;
             r.w.size(n + 64);
             r.w.tr.reserve((size_t) n + 1);
             r.w.tab_tok.assign((size_t) (n + 64) * World::kTab, -1);
@@ -3385,6 +3389,7 @@ int replay_main(int argc, char** argv) {
     Timing tm;
     tm.jitter = 0.0;
     std::vector<double> scales;
+    const char* cls_spec = nullptr;
     static double fr[9], la[9];
     for (int i = 0; i < 9; ++i) {
         fr[i] = kFront[i];
@@ -3397,6 +3402,10 @@ int replay_main(int argc, char** argv) {
         if (a == "--replay") path = argv[++i];
         else if (a == "--scales") {
             for (const std::string& s : split(argv[++i], ',')) scales.push_back(std::atof(s.c_str()));
+        } else if (a == "--class") {
+            std::string e;
+            cls_spec = argv[++i];
+            (void) e;
         } else if (a == "--front" || a == "--last") {
             const std::vector<std::string> v = split(argv[++i], ',');
             for (size_t j = 0; j < v.size() && j < 8; ++j) (a == "--front" ? fr : la)[j + 1] = std::atof(v[j].c_str());
@@ -3410,6 +3419,7 @@ int replay_main(int argc, char** argv) {
                 else if (k == "fh") c.floor_held = v;
                 else if (k == "fc") c.floor_c = v;
                 else if (k == "fa") c.fresh_a = (int) v;
+                else if (k == "fr") c.fresh_h = (int) v;
                 else if (k == "late") c.late_t = v != 0.0;
                 else if (k == "m") c.late_m = (int) v;
                 else if (k == "lp") c.late_p = v;
@@ -3437,6 +3447,13 @@ int replay_main(int argc, char** argv) {
                     return 2;
                 }
             }
+        }
+    }
+    if (cls_spec != nullptr) {
+        std::string e;
+        if (!c.set_class(cls_spec, e)) {
+            std::fprintf(stderr, "%s\n", e.c_str());
+            return 2;
         }
     }
     std::vector<ReplayReq> reqs;

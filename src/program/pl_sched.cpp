@@ -175,6 +175,65 @@ bool Sched::check(const Config& c, std::string& err) {
     return true;
 }
 
+// STRATA_SPEC_CLASS: "think:ff=1.01,m=1;tool:fa=2;text:floor=0.7"; every class starts from the Config's own values
+static void tun_get(const Config& c, Config::Tun& t) {
+    t.spec_min_p = c.spec_min_p; t.floor_fresh = c.floor_fresh; t.floor_held = c.floor_held; t.floor_c = c.floor_c;
+    t.late_p = c.late_p; t.row0 = c.row0; t.theta = c.theta; t.theta3 = c.theta3; t.S_mtp = c.S_mtp; t.fresh_a = c.fresh_a;
+    t.fresh_h = c.fresh_h; t.late_m = c.late_m; t.lk_wait = c.lk_wait; t.late_t = c.late_t; t.late_d = c.late_d;
+}
+
+static void tun_put(Config& c, const Config::Tun& t) {
+    c.spec_min_p = t.spec_min_p; c.floor_fresh = t.floor_fresh; c.floor_held = t.floor_held; c.floor_c = t.floor_c;
+    c.late_p = t.late_p; c.row0 = t.row0; c.theta = t.theta; c.theta3 = t.theta3; c.S_mtp = t.S_mtp; c.fresh_a = t.fresh_a;
+    c.fresh_h = t.fresh_h; c.late_m = t.late_m; c.lk_wait = t.lk_wait; c.late_t = t.late_t; c.late_d = t.late_d;
+}
+
+bool Config::set_class(const char* spec, std::string& err) {
+    Tun base;
+    tun_get(*this, base);
+    for (Tun& t : cls) t = base;
+    cls_on = true;
+    const std::string s(spec);
+    for (size_t a = 0; a < s.size();) {
+        size_t b = s.find(';', a);
+        if (b == std::string::npos) b = s.size();
+        const std::string part = s.substr(a, b - a);
+        a = b + 1;
+        const size_t col = part.find(':');
+        const std::string nm = part.substr(0, col);
+        const int k = nm == "think" ? kClsThink : nm == "tool" ? kClsTool : nm == "text" ? kClsText : -1;
+        if (col == std::string::npos || k < 0) { err = "STRATA_SPEC_CLASS: " + part; return false; }
+        Tun& t = cls[k];
+        for (size_t c = col + 1; c < part.size();) {
+            size_t d = part.find_first_of(",/", c);
+            if (d == std::string::npos) d = part.size();
+            const std::string kv = part.substr(c, d - c);
+            c = d + 1;
+            const size_t e = kv.find('=');
+            if (e == std::string::npos) continue;
+            const std::string key = kv.substr(0, e);
+            const double v = std::atof(kv.c_str() + e + 1);
+            if (key == "floor") t.spec_min_p = v;
+            else if (key == "ff") t.floor_fresh = v;
+            else if (key == "fh") t.floor_held = v;
+            else if (key == "fc") t.floor_c = v;
+            else if (key == "lp") t.late_p = v;
+            else if (key == "row0") t.row0 = v;
+            else if (key == "theta") t.theta = (float) v;
+            else if (key == "theta3") t.theta3 = (float) v;
+            else if (key == "smtp") t.S_mtp = (int) v;
+            else if (key == "fa") t.fresh_a = (int) v;
+            else if (key == "fr") t.fresh_h = (int) v;
+            else if (key == "m") t.late_m = (int) v;
+            else if (key == "lk") t.lk_wait = (int) v;
+            else if (key == "late") t.late_t = v != 0.0;
+            else if (key == "ld") t.late_d = v != 0.0;
+            else { err = "STRATA_SPEC_CLASS: " + key; return false; }
+        }
+    }
+    return true;
+}
+
 // STRATA_CHAIN_DUMP=<file>: what pl_sched_test --replay reads: the tokens emitted and every fresh chain's outputs
 static std::FILE* chain_dump() {
     static std::FILE* f = [] { const char* v = std::getenv("STRATA_CHAIN_DUMP"); return v != nullptr ? std::fopen(v, "a") : nullptr; }();
@@ -185,6 +244,11 @@ bool Sched::begin(const Config& c, int64_t p, int32_t x, const int32_t ple_prev[
     if (!check(c, err)) return false;
     if (std::FILE* f = chain_dump()) std::fprintf(f, "R %lld %d\n", (long long) p, x);
     c_ = c;
+    last_a_ = hi_run_ = 0;
+    if (c_.cls_on) {
+        cls_ = ple_prev[0] == c_.tok_think || ple_prev[1] == c_.tok_think ? Config::kClsThink : Config::kClsText;
+        tun_put(c_, c_.cls[cls_]);
+    }
     err_.clear();
     st_ = Stats{};
     nwin_ = ndoom_ = nheld_ = 0;
@@ -723,7 +787,12 @@ bool Sched::chain_round(PlIo& io) {
         const int k = k_ready;
         const bool s0_free = c_.per_stage() ? !(undo_.active && (undo_.pending & 1u) != 0) : !undo_.active;
         const double ff = fresh_floor();
-        bool decided = k >= c_.S_mtp - 1 || ff >= 1.0 || (c_.late_t && s0_free);
+        bool no_wait = ff >= 1.0;
+        if (no_wait && k == 0 && c_.suffix && c_.lk_wait > 0) {
+            Lookup L;
+            if (io.lookup_propose(2 * (c_.S_sfx > 0 ? c_.S_sfx : c_.S) - 1, L) > 0 && L.match >= c_.lk_wait) no_wait = false;
+        }
+        bool decided = k >= c_.S_mtp - 1 || no_wait || (ff >= 1.0 && k > 0) || (c_.late_t && s0_free && (no_wait || ff < 1.0));
         if (!decided && ff > 0.0)
             for (int j = 0; j < k; ++j)
                 if (io.chain_prob()[j] < (float) ff) { decided = true; break; }
@@ -1104,6 +1173,17 @@ bool Sched::verdict(PlIo& io) {
     ++st_.windows;
     end_ = W.p + a + 1;
     last_a_ = a + 1;
+    if (c_.cls_on) {
+        int cl = cls_;
+        for (int i = 0; i <= a; ++i) {
+            if (outp_[i] == c_.tok_think_end || outp_[i] == c_.tok_tool_end) cl = Config::kClsText;
+            else if (outp_[i] == c_.tok_tool) cl = Config::kClsTool;
+        }
+        if (cl != cls_) {
+            cls_ = cl;
+            tun_put(c_, c_.cls[cl]);
+        }
+    }
     if (std::FILE* f = chain_dump()) {
         for (int i = 0; i <= a; ++i) std::fprintf(f, "T %lld %d\n", (long long) (W.p + 1 + i), outp_[i]);
         std::fflush(f);
