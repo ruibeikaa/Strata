@@ -255,10 +255,8 @@ bool Sched::begin(const Config& c, int64_t p, int32_t x, const int32_t ple_prev[
     if (std::FILE* f = chain_dump()) std::fprintf(f, "R %lld %d\n", (long long) p, x);
     c_ = c;
     last_a_ = hi_run_ = 0;
-    if (c_.cls_on) {
-        cls_ = ple_prev[0] == c_.tok_think || ple_prev[1] == c_.tok_think ? Config::kClsThink : Config::kClsText;
-        tun_put(c_, c_.cls[cls_]);
-    }
+    cls_ = ple_prev[0] == c_.tok_think || ple_prev[1] == c_.tok_think ? Config::kClsThink : Config::kClsText;
+    if (c_.cls_on) tun_put(c_, c_.cls[cls_]);
     err_.clear();
     st_ = Stats{};
     nwin_ = ndoom_ = nheld_ = 0;
@@ -1184,7 +1182,8 @@ bool Sched::verdict(PlIo& io) {
     ++st_.windows;
     end_ = W.p + a + 1;
     last_a_ = a + 1;
-    if (c_.cls_on) {
+    const int wcl = cls_;
+    {
         int cl = cls_;
         for (int i = 0; i <= a; ++i) {
             if (outp_[i] == c_.tok_think_end || outp_[i] == c_.tok_tool_end) cl = Config::kClsText;
@@ -1192,7 +1191,7 @@ bool Sched::verdict(PlIo& io) {
         }
         if (cl != cls_) {
             cls_ = cl;
-            tun_put(c_, c_.cls[cl]);
+            if (c_.cls_on) tun_put(c_, c_.cls[cl]);
         }
     }
     if (std::FILE* f = chain_dump()) {
@@ -1215,6 +1214,8 @@ bool Sched::verdict(PlIo& io) {
             if (c_.cls_on) io.set_cls(cls_);
             io.observe(W, a, now - last_verdict_);
         }
+        st_.text_ms[wcl] += now - last_verdict_;
+        st_.text_tok[wcl] += a + 1;
         st_.cls_ms[c] += now - last_verdict_;
         st_.cls_tok[c] += a + 1;
         st_.cls_n[c] += 1;

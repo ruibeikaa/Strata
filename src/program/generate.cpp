@@ -17652,6 +17652,14 @@ int main(int argc, char** argv) {
                 mtp.set_source_R(ver.final_R_all());   // the serial loop's rows again
                 const double pl_ms = std::chrono::duration<double, std::milli>(Clock::now() - pl_t0).count();
                 dt_run += pl_ms;
+                if (const char* v = std::getenv("STRATA_CLS_LOG"))   // one line a request: tokens, ms by what was being written
+                    if (std::FILE* f = std::fopen(v, "a")) {
+                        const strata::pl::Stats& sc = sched.stats();
+                        std::fprintf(f, "%lld", (long long) produced_n);
+                        for (int i = 0; i < 3; ++i) std::fprintf(f, " %.0f %.1f", sc.text_tok[i], sc.text_ms[i]);
+                        std::fprintf(f, "\n");
+                        std::fclose(f);
+                    }
                 if (dec_timing) {
                     const strata::pl::Stats& st4 = sched.stats();
                     auto avg = [](double s_, double n_) { return n_ > 0 ? s_ / n_ : 0.0; };

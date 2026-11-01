@@ -3530,10 +3530,12 @@ int replay_main(int argc, char** argv) {
         }
         const Stats& s = r.st;
         if (pass + 1 == passes)
-        std::printf("%s gen %lld win %lld ms %.2f fresh %.0f %.2f %.2f held %.0f %.2f %.2f steps %lld c_launched %lld c_on %lld\n",
+        std::printf("%s gen %lld win %lld ms %.2f fresh %.0f %.2f %.2f held %.0f %.2f %.2f steps %lld c_launched %lld c_on %lld"
+                    " text %.0f %.1f %.0f %.1f %.0f %.1f\n",
                     reqs[i].name.c_str(), (long long) r.produced, (long long) r.verdicts, r.t_end, s.cls_n[0], s.cls_ms[0],
                     s.cls_tok[0], s.cls_n[1], s.cls_ms[1], s.cls_tok[1], (long long) s.chain_steps,
-                    (long long) s.c_launched, (long long) s.c_on);
+                    (long long) s.c_launched, (long long) s.c_on, s.text_tok[0], s.text_ms[0], s.text_tok[1], s.text_ms[1],
+                    s.text_tok[2], s.text_ms[2]);
     }
     return 0;
 }

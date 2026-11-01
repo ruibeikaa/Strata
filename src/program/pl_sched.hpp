@@ -268,6 +268,7 @@ public:
 struct Stats {
     int64_t windows = 0, spec = 0, on = 0, undo = 0, gate = 0, fm = 0, fm_c = 0, disagree = 0, late = 0;
     double cls_ms[2] = {0, 0}, cls_tok[2] = {0, 0}, cls_n[2] = {0, 0};
+    double text_ms[3] = {0, 0, 0}, text_tok[3] = {0, 0, 0};   // by what was being written: think, tool, text
     int64_t cal_n[10] = {}, cal_on[10] = {};
     // depth 3 / per-stage undo (the fourth line)
     int64_t held_n[2] = {}; double held_ms[2] = {0, 0};    // [0] first hit after a fresh window, [1] second and on
