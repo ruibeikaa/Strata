@@ -79,9 +79,15 @@ struct World {
     int64_t max_context = (int64_t) 1 << 40;
     int lookup_t = 0;                    // > 0: lookups offered where lk is set, the policy takes up to this many rows
     double lkc_rate = 0.0;               // lookup chaining: the share of positions where lookup_after proposes
+    // --replay: a real request: the tokens from p0 on, and the chain from each position (kTab outputs)
+    static constexpr int kTab = 11;
+    std::vector<int32_t> tr, tab_tok;
+    std::vector<float> tab_p;
+    std::vector<uint8_t> tab_set;
 
     int32_t truth(int64_t q) const {
         if (q == eos_pos) return kEos;
+        if (q >= p0 && q - p0 < (int64_t) tr.size()) return tr[(size_t) (q - p0)];
         return 1000 + (int32_t) (mix64((uint64_t) q * 0x9e37u ^ salt) % 100000);
     }
     bool in(int64_t q) const { return q >= p0 && q < p0 + (int64_t) ok.size(); }
@@ -160,6 +166,11 @@ struct Timing {
     double stage_scale = 1.0;
     double chain_step = 1.56, chain_round = 1.9;
     double host_iter = 0.002;
+    // --replay: durations by rows (null: kFront, kLast), a commit, a restore; kappa: what a chain step takes from the
+    // last stage on its die (of the overlap), kappa_s: the same the other way
+    const double* fr = nullptr;
+    const double* la = nullptr;
+    double commit = 0.25, restore = 0.05, kappa = 0.0, kappa_s = 0.0;
     bool clamp = true;   // chain_launch clamps n_out at the context's end (the old drafter did not)
     // stress: a GDN snapshot copy that crawls (its event is what orders the next state write), and a chain whose
     // source copy crawls (source_done is what orders the slot's next last-stage window: B0/B only, the old loop has
@@ -609,6 +620,12 @@ private:
                 o.started = true;
                 o.ts = best;
                 o.te = best + o.dur;
+                if (T_.kappa > 0.0 && o.k == G_STEP && run_[(size_t) C_.n_front] >= 0) {
+                    ops_[(size_t) run_[(size_t) C_.n_front]].te += T_.kappa * o.dur;
+                    o.te += T_.kappa_s * o.dur;
+                } else if (T_.kappa > 0.0 && o.k == G_WIN && bs == C_.n_front && run_[(size_t) drafter()] >= 0) {
+                    o.te += T_.kappa * std::max(0.0, ops_[(size_t) run_[(size_t) drafter()]].te - best);
+                }
                 start(o, id);
                 run_[(size_t) bs] = id;
             }
@@ -858,6 +875,18 @@ void Sim::finish(GOp& o) {
 // bonus at p + a + 1, then the forced tokens, then its own picks); right only with a right context
 void Sim::compute_chain(const PlOp& o) {
     const int64_t base = o.p + o.a + 1;
+    if (!W_.tr.empty()) {   // --replay: the recorded chain; off its own path its probabilities stand, its tokens are wrong
+        const bool have = base >= W_.p0 && base - W_.p0 < (int64_t) W_.tab_set.size() && W_.tab_set[(size_t) (base - W_.p0)] != 0;
+        const size_t b = have ? (size_t) (base - W_.p0) * World::kTab : 0;
+        bool own = true;
+        for (int j = 0; j < ch_.n; ++j) {
+            const int32_t g = have && j < World::kTab ? W_.tab_tok[b + (size_t) j] : -1;
+            ch_.out[j] = own ? g : -3;
+            ch_.prob[j] = have && j < World::kTab ? W_.tab_p[b + (size_t) j] : 0.0f;
+            if (j < o.n_force && o.force[j] != g) own = false;
+        }
+        return;
+    }
     bool ctx = o.outp[o.a] == W_.truth(base);
     for (int j = 0; j < ch_.n; ++j) {
         const int64_t q = base + 1 + j;
@@ -977,7 +1006,7 @@ bool Sim::exec(const PlOp& o) {
             g.ple[0] = v.pl_prev[0];
             g.ple[1] = v.pl_prev[1];
             g.verif = o.st * kMaxSlots + o.slot;
-            const double base = o.st == last ? kLast[std::min(o.T, 8)] : kFront[std::min(o.T, 8)];
+            const double base = o.st == last ? (T_.la ? T_.la : kLast)[std::min(o.T, 8)] : (T_.fr ? T_.fr : kFront)[std::min(o.T, 8)];
             g.dur = jit(base + (o.st < 4 ? kStageOff[o.st] : 0.0));
             const int id = push(g, o.st);
             v.fl = true;
@@ -1006,7 +1035,7 @@ bool Sim::exec(const PlOp& o) {
             c.slot = o.slot;
             c.uid = o.uid;
             c.keep = o.keep;
-            c.dur = 0.25;
+            c.dur = T_.commit;
             v.commit = push(c, o.st);
             v.commit_live = true;
             if (o.st == 0)
@@ -1023,7 +1052,7 @@ bool Sim::exec(const PlOp& o) {
             r.st = o.st;
             r.slot = o.slot;
             r.uid = o.uid;
-            r.dur = 0.05;
+            r.dur = T_.restore;
             push(r, o.st);
             return true;
         }
@@ -3274,9 +3303,165 @@ void check(bool ok, const std::string& what) {
     }
 }
 
+// ---- --replay: a recorded request through the real scheduler and this GPU.  The file (pl_replay.py) holds the tokens
+// the serial loop writes and every position's chain, so the window shapes are the engine's for any Config; the time is
+// this mock's, with durations calibrated on a real run
+std::vector<std::string> split(const std::string& s, char c) {
+    std::vector<std::string> v;
+    size_t a = 0;
+    while (a <= s.size()) {
+        size_t b = s.find(c, a);
+        if (b == std::string::npos) b = s.size();
+        if (b > a) v.push_back(s.substr(a, b - a));
+        a = b + 1;
+    }
+    return v;
+}
+
+struct ReplayReq {
+    std::string name;
+    World w;
+};
+
+bool load_replay(const char* path, std::vector<ReplayReq>& out) {
+    std::FILE* f = std::fopen(path, "r");
+    if (f == nullptr) return false;
+    static char line[1 << 20];
+    while (std::fgets(line, sizeof line, f) != nullptr) {
+        if (line[0] == 'R') {
+            char nm[128];
+            long long p0 = 0, n = 0;
+            if (std::sscanf(line, "R %127s %lld %lld", nm, &p0, &n) != 3) continue;
+            out.emplace_back();
+            ReplayReq& r = out.back();
+            r.name = nm;
+            r.w.p0 = p0;
+            r.w.max_new = n;
+            r.w.size(n + 64);
+            r.w.tr.reserve((size_t) n + 1);
+            r.w.tab_tok.assign((size_t) (n + 64) * World::kTab, -1);
+            r.w.tab_p.assign((size_t) (n + 64) * World::kTab, 0.0f);
+            r.w.tab_set.assign((size_t) (n + 64), 0);
+        } else if (line[0] == 'T' && !out.empty()) {
+            char* s = line + 1;
+            for (;;) {
+                char* e = nullptr;
+                const long v = std::strtol(s, &e, 10);
+                if (e == s) break;
+                out.back().w.tr.push_back(v == kEos ? kEos + 1 : (int32_t) v);
+                s = e;
+            }
+        } else if (line[0] == 'C' && !out.empty()) {
+            World& w = out.back().w;
+            char* s = line + 1;
+            char* e = nullptr;
+            const long long base = std::strtoll(s, &e, 10);
+            s = e;
+            if (base < w.p0 || base >= w.p0 + w.max_new + 64) continue;
+            const size_t b = (size_t) (base - w.p0);
+            w.tab_set[b] = 1;
+            for (int j = 0; j < World::kTab; ++j) {
+                const long t = std::strtol(s, &e, 10);
+                if (e == s) break;
+                s = e;
+                const float p = std::strtof(s, &e);
+                s = e;
+                w.tab_tok[b * World::kTab + (size_t) j] = t == kEos ? kEos + 1 : (int32_t) t;
+                w.tab_p[b * World::kTab + (size_t) j] = p;
+            }
+        }
+    }
+    std::fclose(f);
+    return true;
+}
+
+int replay_main(int argc, char** argv) {
+    const char* path = nullptr;
+    Config c = base_config(Mode::B);
+    c.theta = 0.1f;
+    Timing tm;
+    tm.jitter = 0.0;
+    std::vector<double> scales;
+    static double fr[9], la[9];
+    for (int i = 0; i < 9; ++i) {
+        fr[i] = kFront[i];
+        la[i] = kLast[i];
+    }
+    tm.fr = fr;
+    tm.la = la;
+    for (int i = 1; i + 1 < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--replay") path = argv[++i];
+        else if (a == "--scales") {
+            for (const std::string& s : split(argv[++i], ',')) scales.push_back(std::atof(s.c_str()));
+        } else if (a == "--front" || a == "--last") {
+            const std::vector<std::string> v = split(argv[++i], ',');
+            for (size_t j = 0; j < v.size() && j < 8; ++j) (a == "--front" ? fr : la)[j + 1] = std::atof(v[j].c_str());
+        } else if (a == "--cfg" || a == "--tm") {
+            for (const std::string& kv : split(argv[++i], ',')) {
+                const size_t e = kv.find('=');
+                if (e == std::string::npos) continue;
+                const std::string k = kv.substr(0, e);
+                const double v = std::atof(kv.c_str() + e + 1);
+                if (k == "ff") c.floor_fresh = v;
+                else if (k == "fh") c.floor_held = v;
+                else if (k == "fc") c.floor_c = v;
+                else if (k == "fa") c.fresh_a = (int) v;
+                else if (k == "late") c.late_t = v != 0.0;
+                else if (k == "m") c.late_m = (int) v;
+                else if (k == "lp") c.late_p = v;
+                else if (k == "ld") c.late_d = v != 0.0;
+                else if (k == "row0") c.row0 = v;
+                else if (k == "theta") c.theta = (float) v;
+                else if (k == "theta3") c.theta3 = (float) v;
+                else if (k == "smtp") c.S_mtp = (int) v;
+                else if (k == "floor") c.spec_min_p = v;
+                else if (k == "stop") c.chain_stop = v != 0.0;
+                else if (k == "cmax") c.chain_max = (int) v;
+                else if (k == "agree") c.agree = v != 0.0;
+                else if (k == "step") tm.chain_step = v;
+                else if (k == "round") tm.chain_round = v;
+                else if (k == "commit") tm.commit = v;
+                else if (k == "restore") tm.restore = v;
+                else if (k == "kappa") tm.kappa = v;
+                else if (k == "kappa_s") tm.kappa_s = v;
+                else if (k == "host") tm.host_iter = v;
+                else {
+                    std::fprintf(stderr, "unknown key %s\n", k.c_str());
+                    return 2;
+                }
+            }
+        }
+    }
+    std::vector<ReplayReq> reqs;
+    if (path == nullptr || !load_replay(path, reqs)) {
+        std::fprintf(stderr, "--replay: cannot read the file\n");
+        return 2;
+    }
+    for (size_t i = 0; i < reqs.size(); ++i) {
+        World& w = reqs[i].w;
+        c.max_context = w.max_context;
+        Timing t = tm;
+        t.stage_scale = i < scales.size() ? scales[i] : 1.0;
+        const RunResult r = run_model(w, c, t, false, false);
+        if (!r.ok) {
+            std::printf("%s FAILED %s\n", reqs[i].name.c_str(), r.err.c_str());
+            continue;
+        }
+        const Stats& s = r.st;
+        std::printf("%s gen %lld win %lld ms %.2f fresh %.0f %.2f %.2f held %.0f %.2f %.2f steps %lld c_launched %lld c_on %lld\n",
+                    reqs[i].name.c_str(), (long long) r.produced, (long long) r.verdicts, r.t_end, s.cls_n[0], s.cls_ms[0],
+                    s.cls_tok[0], s.cls_n[1], s.cls_ms[1], s.cls_tok[1], (long long) s.chain_steps,
+                    (long long) s.c_launched, (long long) s.c_on);
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--replay") == 0) return replay_main(argc, argv);
     bool quick = false;
     int64_t random_target = 1000000;
     std::string only;

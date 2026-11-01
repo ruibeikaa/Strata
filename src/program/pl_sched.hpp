@@ -328,6 +328,7 @@ private:
         int kind = 0;              // 0: no chain being read; 1 forced through windows in flight; 2 fresh
         int n = 0;                 // outputs (chain_n)
         int src_seq = 0;
+        int64_t src_end = 0;       // the verified window's bonus token sits here (STRATA_CHAIN_DUMP)
         bool early_used = false;   // kind 2: the fresh window's size decided
         uint64_t a_uid = 0;        // kind 2: the fresh window
         int targets = 0;           // new windows still to make (after the fresh window)

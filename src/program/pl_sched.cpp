@@ -175,8 +175,15 @@ bool Sched::check(const Config& c, std::string& err) {
     return true;
 }
 
+// STRATA_CHAIN_DUMP=<file>: what pl_sched_test --replay reads: the tokens emitted and every fresh chain's outputs
+static std::FILE* chain_dump() {
+    static std::FILE* f = [] { const char* v = std::getenv("STRATA_CHAIN_DUMP"); return v != nullptr ? std::fopen(v, "a") : nullptr; }();
+    return f;
+}
+
 bool Sched::begin(const Config& c, int64_t p, int32_t x, const int32_t ple_prev[2], double t0_ms, std::string& err) {
     if (!check(c, err)) return false;
+    if (std::FILE* f = chain_dump()) std::fprintf(f, "R %lld %d\n", (long long) p, x);
     c_ = c;
     err_.clear();
     st_ = Stats{};
@@ -727,6 +734,12 @@ bool Sched::chain_round(PlIo& io) {
     if (r < 0) return fail("pipelined decode: the drafter's chain failed");
     // done: the outputs it really has - all it may queue, or (chain_stop) as many as were queued before it closed
     if (r == 1) ch_.n = std::min(ch_.n, io.chain_n());
+    if (r == 1 && ch_.kind != 0)
+        if (std::FILE* f = chain_dump()) {
+            std::fprintf(f, "C %lld", (long long) ch_.src_end);
+            for (int j = 0; j < ch_.n; ++j) std::fprintf(f, " %d %.4f", io.chain_tok()[j], io.chain_prob()[j]);
+            std::fprintf(f, "\n");
+        }
     const int k = r == 1 ? ch_.n : k_ready;
     if (r == 1 && ch_.kind == 2 && !ch_.early_used) {
         if (A == nullptr) return fail("pl_sched: the fresh window of the chain is gone");
@@ -776,6 +789,7 @@ bool Sched::launch_chain(PlIo& io, const ChainReq& r) {
     ch_ = ChainState{};
     ch_.kind = r.kind;
     ch_.src_seq = r.src_seq;
+    ch_.src_end = r.p + r.a + 1;
     const int depth = c_.depth();
     const int cap = depth >= 3 ? c_.chain_max : c_.chain_out2;
     int n_out = 0;
@@ -826,6 +840,7 @@ bool Sched::launch_chain(PlIo& io, const ChainReq& r) {
         // (lookup chaining: a new window may take lkc_k more outputs, whose agreement decides the one behind it)
         n_out = std::min(cap, ch_.n_force + (c_.S_mtp + std::max(0, c_.lkc_k)) * std::max(1, ch_.targets));
     }
+    if (chain_dump() != nullptr) n_out = cap;   // a replay reads the whole chain from every position
     for (int i = 0; i < ch_.n_force; ++i) o.force[i] = ch_.force[i];
     o.n_force = ch_.n_force;
     o.n_out = n_out;
@@ -1089,6 +1104,10 @@ bool Sched::verdict(PlIo& io) {
     ++st_.windows;
     end_ = W.p + a + 1;
     last_a_ = a + 1;
+    if (std::FILE* f = chain_dump()) {
+        for (int i = 0; i <= a; ++i) std::fprintf(f, "T %lld %d\n", (long long) (W.p + 1 + i), outp_[i]);
+        std::fflush(f);
+    }
     PW* X = nwin_ >= 2 ? &win_[1] : nullptr;
     const bool on = X != nullptr && X->launched && a == W.T - 1 && X->tok[0] == outp_[W.T - 1];
     if (X != nullptr && X->made) {   // the gate's calibration: would X have been on the path, by its estimate p_on
