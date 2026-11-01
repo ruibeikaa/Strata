@@ -812,8 +812,8 @@ bool Sched::launch_chain(PlIo& io, const ChainReq& r) {
             ch_.force[ch_.n_force] = X1.tok[i];
             ch_.force_prob[ch_.n_force++] = X1.prob[i - 1];
         }
-        if (depth >= 3 && nwin_ >= f + 2) {   // through the window behind it too (C): the chain then makes D
-            const PW& X2 = win_[f + 1];
+        for (int g = f + 1; depth >= 3 && g < nwin_; ++g) {   // through the windows behind it too (C): the chain then makes D
+            const PW& X2 = win_[g];
             if (ch_.n_force + X2.T >= cap) {
                 // no output left for D's row 0: no chain now - D is made by the chain at B's verdict, forced through C
                 // alone.  A guard only: B and C were made by chains of this same cap whose output 0 was at or before

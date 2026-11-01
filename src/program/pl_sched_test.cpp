@@ -171,6 +171,8 @@ struct Timing {
     const double* fr = nullptr;
     const double* la = nullptr;
     double commit = 0.25, restore = 0.05, kappa = 0.0, kappa_s = 0.0;
+    double gap = 0.0;                    // --replay: what a miss costs stage 0 before a fresh window starts (undo, host)
+    int chain_st = -1;                   // --replay: the stage whose die the chain shares (< 0: the last)
     bool clamp = true;   // chain_launch clamps n_out at the context's end (the old drafter did not)
     // stress: a GDN snapshot copy that crawls (its event is what orders the next state write), and a chain whose
     // source copy crawls (source_done is what orders the slot's next last-stage window: B0/B only, the old loop has
@@ -620,10 +622,11 @@ private:
                 o.started = true;
                 o.ts = best;
                 o.te = best + o.dur;
-                if (T_.kappa > 0.0 && o.k == G_STEP && run_[(size_t) C_.n_front] >= 0) {
-                    ops_[(size_t) run_[(size_t) C_.n_front]].te += T_.kappa * o.dur;
+                const int chs = T_.chain_st >= 0 ? T_.chain_st : C_.n_front;
+                if (T_.kappa > 0.0 && o.k == G_STEP && run_[(size_t) chs] >= 0) {
+                    ops_[(size_t) run_[(size_t) chs]].te += T_.kappa * o.dur;
                     o.te += T_.kappa_s * o.dur;
-                } else if (T_.kappa > 0.0 && o.k == G_WIN && bs == C_.n_front && run_[(size_t) drafter()] >= 0) {
+                } else if (T_.kappa > 0.0 && o.k == G_WIN && bs == chs && run_[(size_t) drafter()] >= 0) {
                     o.te += T_.kappa * std::max(0.0, ops_[(size_t) run_[(size_t) drafter()]].te - best);
                 }
                 start(o, id);
@@ -1052,7 +1055,7 @@ bool Sim::exec(const PlOp& o) {
             r.st = o.st;
             r.slot = o.slot;
             r.uid = o.uid;
-            r.dur = T_.restore;
+            r.dur = T_.restore + (o.st == 0 ? T_.gap : 0.0);
             push(r, o.st);
             return true;
         }
@@ -3426,6 +3429,9 @@ int replay_main(int argc, char** argv) {
                 else if (k == "kappa") tm.kappa = v;
                 else if (k == "kappa_s") tm.kappa_s = v;
                 else if (k == "host") tm.host_iter = v;
+                else if (k == "gap") tm.gap = v;
+                else if (k == "chain_st") tm.chain_st = (int) v;
+                else if (k == "d4") c.depth4 = v != 0.0;
                 else {
                     std::fprintf(stderr, "unknown key %s\n", k.c_str());
                     return 2;

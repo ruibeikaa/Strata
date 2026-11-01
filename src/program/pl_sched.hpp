@@ -31,7 +31,7 @@ inline constexpr int kMaxSlots = 5;      // STRATA_PIPELINE_SLOTS at most
 inline constexpr int kMaxFront = 8;      // front stages (every stage but the last)
 inline constexpr int kChainMax = 11;     // the drafter's chain outputs at most (MtpDrafter::kChainMax)
 inline constexpr int kMaxRows = 8;       // a window's rows at most (kVerifyMaxT)
-inline constexpr int kMaxWin = 3;        // windows not verified at most (depth 3)
+inline constexpr int kMaxWin = 4;        // windows not verified at most (depth 3; depth4: 4)
 
 enum class Mode : uint8_t { N2 = 0, B0 = 1, B = 2 };
 const char* mode_name(Mode m);
@@ -106,8 +106,9 @@ struct Config {
     int lkc_rate = 0;
     int lkc_rate_warm = 16;
 
-    int depth() const { return mode == Mode::B ? 3 : 2; }
-    int ns() const { return mode == Mode::N2 ? 2 : slots > 0 ? slots : mode == Mode::B0 ? 3 : 4; }
+    bool depth4 = false;           // a fourth window: one on every stage (the replay only so far: it needs five slots)
+    int depth() const { return mode == Mode::B ? (depth4 ? 4 : 3) : 2; }
+    int ns() const { return mode == Mode::N2 ? 2 : slots > 0 ? slots : mode == Mode::B0 ? 3 : depth4 ? 5 : 4; }
     float gate(int k) const { return k >= 2 && theta3 >= 0.0f ? theta3 : theta; }
     bool per_stage() const { return mode != Mode::N2; }
 };
@@ -396,7 +397,7 @@ private:
     UndoJob undo_;
     int last_a_ = 0;               // the tokens the last verified window accepted
     int hi_run_ = 0;               // the row 0 guesses in a row at 0.95 or more
-    Held held_[4];
+    Held held_[kMaxSlots + 1];
     int nheld_ = 0;
     ChainState ch_;
     ChainReq req_;
