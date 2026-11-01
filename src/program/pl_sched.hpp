@@ -46,8 +46,12 @@ struct Config {
     // a row's floor by the window's class (STRATA_SPEC_FLOOR_FRESH / _HELD, < 0: spec_min_p).  A row costs a fresh window
     // about 8 ms and a held one 3-5.  A fresh floor >= 1: one row, sized at once, so stage 0 does not wait for the chain
     double floor_fresh = -1.0, floor_held = -1.0;
+    double floor_c = -1.0;         // the window two guesses deep (STRATA_SPEC_FLOOR_C, < 0: floor_held)
+    // STRATA_SPEC_LATE_T: a window is sized when its stage 0 can take it, from the outputs landed by then
+    bool late_t = false;
     double ff() const { return floor_fresh >= 0.0 ? floor_fresh : spec_min_p; }
     double fh() const { return floor_held >= 0.0 ? floor_held : spec_min_p; }
+    double fc() const { return floor_c >= 0.0 ? floor_c : fh(); }
     float theta = 0.2f;            // the gate of a window behind one guess (STRATA_PIPELINE_THETA)
     float theta3 = -1.0f;          // ... behind two guesses (STRATA_PIPELINE_THETA3; < 0: theta)
     int64_t max_context = 0;

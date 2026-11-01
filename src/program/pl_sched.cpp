@@ -573,9 +573,11 @@ bool Sched::decide_next(PlIo& io, int k, bool done) {
     const int32_t* oc = io.chain_tok();
     const float* op = io.chain_prob();
     bool decided = done || k >= base + c_.S_mtp;
-    if (!decided && k > base + 1 && c_.fh() > 0.0)
+    const double floor = nwin_ >= 2 ? c_.fc() : c_.fh();
+    if (!decided && k > base && (floor >= 1.0 || (c_.late_t && pred->fr > 0))) decided = true;
+    if (!decided && k > base + 1 && floor > 0.0)
         for (int j = base + 1; j < k; ++j)
-            if (op[j] < (float) c_.fh()) { decided = true; break; }
+            if (op[j] < (float) floor) { decided = true; break; }
     if (!decided) return false;
     if (done && k < base + c_.S_mtp) ++st_.case_hits[kCase8];   // the chain ended before the window's size said so
     // lookup chaining: pred's lookup tail sits at chain outputs [base - lkc, base).  Where the chain's own outputs there
@@ -626,7 +628,7 @@ bool Sched::decide_next(PlIo& io, int k, bool done) {
         y.seq = pred->seq + 1;
         y.p = pred->p + pred->T;
         y.tok[0] = oc[base];
-        y.T = t_rule(op, base + 1, k, c_.fh());
+        y.T = t_rule(op, base + 1, k, floor);
         for (int i = 1; i < y.T; ++i) {
             y.tok[i] = oc[base + i];
             y.prob[i - 1] = op[base + i];
@@ -709,7 +711,8 @@ bool Sched::chain_round(PlIo& io) {
     if (ch_.kind == 2 && !ch_.early_used && A == nullptr) return fail("pl_sched: the fresh window of the chain is gone");
     if (ch_.kind == 2 && !ch_.early_used) {
         const int k = k_ready;
-        bool decided = k >= c_.S_mtp - 1 || c_.ff() >= 1.0;
+        const bool s0_free = c_.per_stage() ? !(undo_.active && (undo_.pending & 1u) != 0) : !undo_.active;
+        bool decided = k >= c_.S_mtp - 1 || c_.ff() >= 1.0 || (c_.late_t && s0_free);
         if (!decided && c_.ff() > 0.0)
             for (int j = 0; j < k; ++j)
                 if (io.chain_prob()[j] < (float) c_.ff()) { decided = true; break; }
