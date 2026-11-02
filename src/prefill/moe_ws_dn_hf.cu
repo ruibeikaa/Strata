@@ -5,6 +5,8 @@
 
 #include "moe_ws_dn_hf.cuh"
 #include "moe_ws_dn_hf_r2.cuh"
+#include "moe_ws_dn_hf_cls.cuh"
+#include "strata/core/pinned_ring.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -53,6 +55,12 @@ struct Dev {
     int64_t r2_left_n[3] = {};         // launches of a taken layer that stayed on the engine kernel (r2_pick said 0)
     double r2_macs_left[3] = {};
     std::map<std::string, int64_t> r2_left;   // "FMT: reason" -> launches
+    int64_t cls_taken[3] = {};         // STRATA_PF_HFMA_DOWN_CLASSES: [format] launches of the pass-class kernels
+    double cls_macs[3] = {};           // ... their MACs
+    int64_t cls_items[3] = {};         // ... their passes by class (32 rows, 17..31, 1..16)
+    int64_t cls_left_n[3] = {};        // launches that took the one-row kernel instead (a reason below, planned or at launch)
+    double cls_macs_left[3] = {};
+    std::map<std::string, int64_t> cls_left;   // "FMT: reason" -> launches
 };
 std::mutex g_mu;
 Dev g_dev[64];
@@ -62,7 +70,7 @@ void* g_state_ptr[64] = {};
 // the report - the kernels' own time and so their real G MAC/s
 struct Tm {
     cudaEvent_t a = nullptr, b = nullptr, c = nullptr;
-    int fmt = 0, tier = 0, r2 = 0;
+    int fmt = 0, tier = 0, r2 = 0;   // r2: 0 the one-row kernel, 1 the two-rows kernel, 2 the pass-class kernels
     double macs = 0.0;
 };
 std::vector<Tm> g_tm[64];
@@ -150,6 +158,137 @@ int hfma_r2_down() {
 }
 }  // namespace
 
+namespace {
+// STRATA_PF_HFMA_DOWN_CLASSES=1 (opt-in, read once, with STRATA_PF_HFMA_DOWN): the down splits the layer's passes into size classes (32 rows, 17..31, 1..16) on
+// moe_ws_dn_hf_cls.cuh's kernels, wherever r2_pick() says the two-rows kernel would have run (the same tier rule); it replaces the R2 kernel there.  Where it cannot run (no host chunk
+// list, no device buffer, a failed upload or launch) the one-row kernel runs, counted with its reason.
+int hfma_cls_down() {
+    static const int on = [] {
+        const char* e = std::getenv("STRATA_PF_HFMA_DOWN_CLASSES");
+        if (e == nullptr || std::atoi(e) == 0) return 0;
+        const char* x = std::getenv("STRATA_PF_HFMA_DOWN");
+        if (x == nullptr || std::atoi(x) == 0) {
+            std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_DOWN_CLASSES=1 needs STRATA_PF_HFMA_DOWN=1: ignored\n");
+            return 0;
+        }
+        std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_DOWN_CLASSES=1: the FP16 HFMA2 down on pass-class kernels (the host splits each layer's passes into 32 / 17..31 / "
+                             "1..16 rows, each class on its own kernel and stream; the same arithmetic and bits as the one-row and two-rows kernels)\n");
+        return 1;
+    }();
+    return on;
+}
+
+// per device: the layer's pass items on the device (uploaded by down_hf_prep on the compute stream, so a layer's lists are rewritten only after the previous layer's kernels),
+// the side streams and the fork / join events
+struct Cls {
+    std::vector<Chunk> host;          // this layer's items, [full | 17..31 | 1..16], from plan to prep
+    Chunk* d = nullptr;
+    size_t d_cap = 0;
+    strata::core::PinnedRing ring;
+    cudaStream_t st[3] = {nullptr, nullptr, nullptr};
+    cudaEvent_t e0 = nullptr, ej[3] = {nullptr, nullptr, nullptr};
+    bool ready = false;               // the lists are on the device (the upload succeeded)
+    bool init = false;
+};
+Cls* g_cls[64] = {};
+Cls& cls_dev(int dev) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (g_cls[dev] == nullptr) g_cls[dev] = new Cls();   // never freed: the process exit owns the device state
+    return *g_cls[dev];
+}
+
+// the plan: split the layer's chunks into pass items by class; nullptr = taken, else why not
+const char* cls_plan(Layer& L) {
+    L.hd_cls_n[0] = L.hd_cls_n[1] = L.hd_cls_n[2] = 0;
+    if (L.chunks_host == nullptr || L.nchunks <= 0) return "no host copy of the chunk list";
+    Cls& S = cls_dev(cur_dev());
+    static thread_local std::vector<Chunk> v[3];
+    for (auto& x : v) x.clear();
+    for (int64_t ci = 0; ci < L.nchunks; ++ci) {
+        const Chunk& c = L.chunks_host[ci];
+        for (int p0 = 0; p0 < c.rows; p0 += 32) {
+            const int nt = std::min(32, c.rows - p0);
+            v[nt == 32 ? 0 : nt > 16 ? 1 : 2].push_back(Chunk{c.j, c.row0 + p0, nt, p0 == 0 ? 1 : 0});   // pad: the first pass of its chunk (one khist sample a chunk piece)
+        }
+    }
+    const auto bigger = [](const Chunk& a, const Chunk& b) { return a.rows != b.rows ? a.rows > b.rows : a.row0 < b.row0; };
+    for (int c = 1; c < 3; ++c) std::sort(v[c].begin(), v[c].end(), bigger);   // the big remainders first, as the full passes are in chunk order
+    S.host.clear();
+    for (int c = 0; c < 3; ++c) {
+        L.hd_cls_n[c] = (int) v[c].size();
+        S.host.insert(S.host.end(), v[c].begin(), v[c].end());
+    }
+    if (S.host.empty()) return "no passes";
+    if (S.d_cap < S.host.size()) {   // grow-only; cudaFree waits for the device, so this is rare (4096 items = 64 KiB at first)
+        const size_t cap = std::max<size_t>(S.host.size() + S.host.size() / 2, 4096);
+        if (S.d != nullptr) cudaFree(S.d);
+        S.d = nullptr;
+        S.d_cap = 0;
+        if (cudaMalloc((void**) &S.d, cap * sizeof(Chunk)) != cudaSuccess) {
+            cudaGetLastError();
+            S.d = nullptr;
+            return "no device buffer for the pass lists";
+        }
+        S.d_cap = cap;
+    }
+    return nullptr;
+}
+
+// the lists up, on the compute stream (down_hf_prep)
+void cls_upload(const Layer& L, cudaStream_t s) {
+    Cls& S = cls_dev(cur_dev());
+    S.ready = false;
+    const size_t n = (size_t) L.hd_cls_n[0] + (size_t) L.hd_cls_n[1] + (size_t) L.hd_cls_n[2];
+    if (n == 0 || n != S.host.size() || S.d == nullptr || n > S.d_cap) return;
+    S.ready = S.ring.h2d(S.d, S.host.data(), n * sizeof(Chunk), s) == cudaSuccess;
+}
+
+bool cls_init(Cls& S) {
+    if (S.init) return true;
+    for (int i = 0; i < 3; ++i)
+        if (cudaStreamCreateWithFlags(&S.st[i], cudaStreamNonBlocking) != cudaSuccess || cudaEventCreateWithFlags(&S.ej[i], cudaEventDisableTiming) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+    if (cudaEventCreateWithFlags(&S.e0, cudaEventDisableTiming) != cudaSuccess) { cudaGetLastError(); return false; }
+    S.init = true;
+    return true;
+}
+
+// the three class kernels of a layer, each on a side stream that forks from the compute stream and joins back to it; nullptr: launched; else why it was not (nothing, or all but a
+// failed part, is enqueued: the caller runs the one-row kernel after the join, which rewrites every output behind them on the compute stream)
+const char* cls_launch(const Layer& L, cudaStream_t s) {
+    Cls& S = cls_dev(cur_dev());
+    if (!S.ready) return "the pass lists' upload failed";
+    if (!cls_init(S)) return "the side streams could not be created";
+    const int nf = L.hd_cls_n[0], nm = L.hd_cls_n[1], ns = L.hd_cls_n[2];
+    const Chunk* pf = S.d;
+    const Chunk* pm = pf + nf;
+    const Chunk* ps = pm + nm;
+    const char* w = (const char*) L.w;
+    const uint4* hb = (const uint4*) L.gu;
+    cudaEventRecord(S.e0, s);
+    for (int i = 0; i < 3; ++i) cudaStreamWaitEvent(S.st[i], S.e0, 0);
+    if (L.d_type == GGML_TYPE_Q2_0) {
+        if (nf > 0) dn::cls::q::kernel<32, true, 2><<<(unsigned) nf * dn::P2, dn::NT, 0, S.st[2]>>>(pf, w, L.xoff, L.down_off, hb, L.dm);
+        if (nm > 0) dn::cls::q::kernel<32, false, 2><<<(unsigned) nm * dn::P2, dn::NT, 0, S.st[1]>>>(pm, w, L.xoff, L.down_off, hb, L.dm);
+        if (ns > 0) dn::cls::q::kernel<16, false, 2><<<(unsigned) ns * dn::P2, dn::NT, 0, S.st[0]>>>(ps, w, L.xoff, L.down_off, hb, L.dm);
+    } else if (L.d_type == GGML_TYPE_IQ4_NL) {
+        if (nf > 0) dn::cls::n::kernel<32, true, 2><<<(unsigned) nf * dn::P2, dn::NT, 0, S.st[2]>>>(pf, w, L.xoff, L.down_off, hb, L.dm);
+        if (nm > 0) dn::cls::n::kernel<32, false, 2><<<(unsigned) nm * dn::P2, dn::NT, 0, S.st[1]>>>(pm, w, L.xoff, L.down_off, hb, L.dm);
+        if (ns > 0) dn::cls::n::kernel<16, false, 2><<<(unsigned) ns * dn::P2, dn::NT, 0, S.st[0]>>>(ps, w, L.xoff, L.down_off, hb, L.dm);
+    } else {
+        for (int i = 0; i < 3; ++i) { cudaEventRecord(S.ej[i], S.st[i]); cudaStreamWaitEvent(s, S.ej[i], 0); }
+        return "no class kernel for the format";
+    }
+    for (int i = 0; i < 3; ++i) {
+        cudaEventRecord(S.ej[i], S.st[i]);
+        cudaStreamWaitEvent(s, S.ej[i], 0);
+    }
+    return cudaGetLastError() == cudaSuccess ? nullptr : "a class kernel's launch failed";
+}
+}  // namespace
+
 int hfma_down() {
     static const int on = [] {
         const char* e = std::getenv("STRATA_PF_HFMA_DOWN");
@@ -170,6 +309,7 @@ int hfma_down() {
 bool hfma_down_plan(Layer& L) {
     L.hd_tier = 0;
     L.hd_r2 = 0;
+    L.hd_cls = 0;
     const int dev = cur_dev();
     const double rows = (double) L.rows, u = L.n > 0 ? rows / (double) L.n : 0.0;
     const int f = fmt_idx(L.d_type);
@@ -184,17 +324,36 @@ bool hfma_down_plan(Layer& L) {
     L.hd_tier = u >= kU32 ? 32 : 16;
     L.hd_r2 = 0;
     bool r2_stay = false;
-    if (hfma_r2_down() != 0) {
+    const char* cls_why = nullptr;
+    if (hfma_cls_down() != 0 || hfma_r2_down() != 0) {
         const int pick = r2_pick(f, u);
-        if (pick != 0) { L.hd_r2 = 1; L.hd_tier = pick; }
-        else r2_stay = true;
+        if (pick == 0) {
+            r2_stay = true;
+        } else if (hfma_cls_down() != 0) {   // the pass-class kernels replace the two-rows kernel where it would have run; the one-row kernel is their counted fallback
+            cls_why = cls_plan(L);
+            if (cls_why == nullptr) { L.hd_cls = 1; L.hd_tier = pick; }
+        } else {
+            L.hd_r2 = 1;
+            L.hd_tier = pick;
+        }
     }
     std::lock_guard<std::mutex> lk(g_mu);
     Dev& d = g_dev[dev];
     d.seen = true;
     ++d.taken[f][L.hd_tier == 32 ? 1 : 0];
     d.macs_taken[f] += rows * kMacsPerRow;
-    if (L.hd_r2 != 0) {
+    if (hfma_cls_down() != 0) {
+        if (L.hd_cls != 0) {
+            ++d.cls_taken[f];
+            d.cls_macs[f] += rows * kMacsPerRow;
+            for (int c = 0; c < 3; ++c) d.cls_items[c] += L.hd_cls_n[c];
+        } else {
+            ++d.cls_left_n[f];
+            d.cls_macs_left[f] += rows * kMacsPerRow;
+            ++d.cls_left[fmt_name(L.d_type) + ": " +
+                         (cls_why != nullptr ? cls_why : "u below the pass-class kernels' range, the engine's 16-token kernel is faster there")];
+        }
+    } else if (L.hd_r2 != 0) {
         ++d.r2_taken[f];
         d.r2_macs[f] += rows * kMacsPerRow;
     } else if (r2_stay) {
@@ -226,10 +385,11 @@ void down_hf_prep(const Layer& L, void* stream) {
         Tm& t = v[g_tm_n[dev]++];
         t.fmt = fmt_idx(L.d_type);
         t.tier = L.hd_tier;
-        t.r2 = L.hd_r2;
+        t.r2 = L.hd_cls != 0 ? 2 : L.hd_r2;
         t.macs = (double) L.rows * kMacsPerRow;
         cudaEventRecord(t.a, s);
     }
+    if (L.hd_cls != 0) cls_upload(L, s);   // STRATA_PF_HFMA_DOWN_CLASSES: this layer's pass lists up on the compute stream, behind the previous layer's kernels
     dn::swiglu_h16_kernel<<<(unsigned) L.rows, 160, 0, s>>>(L.gu, L.hd_layer);
     ck(cudaGetLastError(), "down FP16: swiglu");
     if (timing_on()) {
@@ -250,7 +410,28 @@ void down_hf(const Layer& L, void* stream) {
     const unsigned grid = (unsigned) (L.nchunks * dn::PIECES);
     const uint4* hb = (const uint4*) L.gu;
     const char* w = (const char*) L.w;
-    if (L.hd_r2 != 0) {   // STRATA_PF_HFMA_R2_DOWN: 256 rows a CTA, ten CTAs a chunk
+    const char* cls_why = nullptr;
+    if (L.hd_cls != 0) cls_why = cls_launch(L, s);   // STRATA_PF_HFMA_DOWN_CLASSES: three class kernels; nullptr = launched
+    if (cls_why != nullptr) {   // the one-row kernel at the tier its own rule gives (everything the class kernels wrote is rewritten behind them on this stream)
+        const int dev = cur_dev();
+        const int f = fmt_idx(L.d_type);
+        const double macs = (double) L.rows * kMacsPerRow;
+        {
+            std::lock_guard<std::mutex> lk(g_mu);
+            Dev& d = g_dev[dev];
+            --d.cls_taken[f];
+            d.cls_macs[f] -= macs;
+            for (int c = 0; c < 3; ++c) d.cls_items[c] -= L.hd_cls_n[c];
+            ++d.cls_left_n[f];
+            d.cls_macs_left[f] += macs;
+            ++d.cls_left[fmt_name(L.d_type) + ": " + cls_why + " (at launch)"];
+            if (timing_on() && g_tm_n[dev] > 0) { g_tm[dev][g_tm_n[dev] - 1].r2 = 0; g_tm[dev][g_tm_n[dev] - 1].tier = 16; }
+        }
+        if (L.d_type == GGML_TYPE_Q2_0) dn::q20::dn_kernel<16><<<grid, dn::NT, 0, s>>>(L.chunks, w, L.xoff, L.down_off, hb, L.dm);
+        else dn::nl4::dn_kernel<16><<<grid, dn::NT, 0, s>>>(L.chunks, w, L.xoff, L.down_off, hb, L.dm);
+    } else if (L.hd_cls != 0) {
+        // launched above
+    } else if (L.hd_r2 != 0) {   // STRATA_PF_HFMA_R2_DOWN: 256 rows a CTA, ten CTAs a chunk
         const unsigned grid2 = (unsigned) (L.nchunks * dn::P2);
         if (L.d_type == GGML_TYPE_Q2_0) dn::r2q::dn2_kernel<16><<<grid2, dn::NT, 0, s>>>(L.chunks, w, L.xoff, L.down_off, hb, L.dm);
         else if (L.d_type == GGML_TYPE_IQ4_NL) dn::r2n::dn2_kernel<32><<<grid2, dn::NT, 0, s>>>(L.chunks, w, L.xoff, L.down_off, hb, L.dm);
@@ -294,14 +475,14 @@ void hfma_down_report(const int64_t tokens) {
         std::string kt;
         if (g_tm_n[dev] > 0) {
             struct Acc { double prep = 0.0, dn = 0.0, macs = 0.0; int64_t n = 0; };
-            std::map<std::pair<int, int>, Acc> acc;   // (format, tier + 100 for the two-rows kernel)
+            std::map<std::pair<int, int>, Acc> acc;   // (format, tier + 100 for the two-rows kernel, + 200 for the pass-class kernels)
             Acc all;
             cudaSetDevice(dev);
             for (size_t i = 0; i < g_tm_n[dev]; ++i) {
                 float p = 0.0f, q = 0.0f;
                 if (cudaEventSynchronize(g_tm[dev][i].c) == cudaSuccess && cudaEventElapsedTime(&p, g_tm[dev][i].a, g_tm[dev][i].b) == cudaSuccess &&
                     cudaEventElapsedTime(&q, g_tm[dev][i].b, g_tm[dev][i].c) == cudaSuccess) {
-                    Acc& a = acc[{g_tm[dev][i].fmt, g_tm[dev][i].tier + (g_tm[dev][i].r2 != 0 ? 100 : 0)}];
+                    Acc& a = acc[{g_tm[dev][i].fmt, g_tm[dev][i].tier + 100 * g_tm[dev][i].r2}];
                     a.prep += p; a.dn += q; a.macs += g_tm[dev][i].macs; ++a.n;
                     all.prep += p; all.dn += q; all.macs += g_tm[dev][i].macs; ++all.n;
                 } else {
@@ -316,7 +497,7 @@ void hfma_down_report(const int64_t tokens) {
                               a.prep + a.dn > 0 ? a.macs / (a.prep + a.dn) * 1e-6 : 0.0);
                 kt += b;
             };
-            for (const auto& [key, a] : acc) line(std::string(key.first == 0 ? "Q2_0" : "IQ4_NL") + " t" + std::to_string(key.second % 100) + (key.second >= 100 ? "r2" : ""), a);
+            for (const auto& [key, a] : acc) line(std::string(key.first == 0 ? "Q2_0" : "IQ4_NL") + " t" + std::to_string(key.second % 100) + (key.second >= 200 ? "cls" : key.second >= 100 ? "r2" : ""), a);
             line("all", all);
         }
         int64_t n_taken = 0, n_left = 0;
@@ -360,6 +541,28 @@ void hfma_down_report(const int64_t tokens) {
             r2s = b;
             r2s += "; by format: " + (rb.empty() ? std::string("-") : rb) + "; left: " + (rl.empty() ? std::string("nothing") : rl);
         }
+        std::string cls_s;   // STRATA_PF_HFMA_DOWN_CLASSES: what ran on the pass-class kernels, what stayed on the one-row / two-rows kernel and why
+        if (hfma_cls_down() != 0) {
+            int64_t c_n = 0, c_l = 0;
+            double c_m = 0.0, c_lm = 0.0;
+            std::string cb;
+            for (int f = 0; f < 3; ++f) {
+                c_n += d.cls_taken[f]; c_l += d.cls_left_n[f]; c_m += d.cls_macs[f]; c_lm += d.cls_macs_left[f];
+                if (d.cls_taken[f] == 0 && d.cls_left_n[f] == 0) continue;
+                char b[200];
+                std::snprintf(b, sizeof b, "%s%s %lld on the class kernels, %lld on the one-row / two-rows kernel", cb.empty() ? "" : "; ", f == 2 ? "other" : fmt_name(types[f]).c_str(),
+                              (long long) d.cls_taken[f], (long long) d.cls_left_n[f]);
+                cb += b;
+            }
+            std::string cl;
+            for (const auto& [what, n] : d.cls_left) cl += (cl.empty() ? "" : ", ") + what + " x" + std::to_string((long long) n);
+            char b[400];
+            std::snprintf(b, sizeof b, "; STRATA_PF_HFMA_DOWN_CLASSES: %lld launches on the class kernels (%.1f%% of the HFMA2 MACs; passes: 32 rows x%lld, 17..31 x%lld, 1..16 x%lld), %lld on the other kernels",
+                          (long long) c_n, c_m + c_lm > 0 ? 100.0 * c_m / (c_m + c_lm) : 0.0, (long long) d.cls_items[0], (long long) d.cls_items[1], (long long) d.cls_items[2],
+                          (long long) c_l);
+            cls_s = b;
+            cls_s += "; by format: " + (cb.empty() ? std::string("-") : cb) + "; left: " + (cl.empty() ? std::string("nothing") : cl);
+        }
         auto f32 = [](unsigned bits) { float f; std::memcpy(&f, &bits, 4); return f; };
         std::string lm;
         for (int l = 0; l < 64; ++l)
@@ -377,11 +580,11 @@ void hfma_down_report(const int64_t tokens) {
             }
         std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_DOWN: read of %lld tokens, CUDA%d: down %lld launches on HFMA2, %lld left to the int8 kernels "
                              "(%.1f%% of %.3g MACs on HFMA2); by format: %s; left: %s; max |H| %.1f (per layer: %s); weights' shift k "
-                             "(2^-k), one sample a CTA: %s; non-finite: H %u values, output %u values; kernel time: %s%s\n",
+                             "(2^-k), one sample a CTA: %s; non-finite: H %u values, output %u values; kernel time: %s%s%s\n",
                      (long long) tokens, dev, (long long) n_taken, (long long) n_left,
                      m_taken + m_left > 0 ? 100.0 * m_taken / (m_taken + m_left) : 0.0, m_taken + m_left, by.empty() ? "-" : by.c_str(),
                      lft.empty() ? "nothing" : lft.c_str(), f32(st.hmax_all), lm.empty() ? "-" : lm.c_str(), kh.empty() ? "-" : kh.c_str(),
-                     st.bad_h, st.bad_y, kt.empty() ? "-" : kt.c_str(), r2s.c_str());
+                     st.bad_h, st.bad_y, kt.empty() ? "-" : kt.c_str(), r2s.c_str(), cls_s.c_str());
         d = Dev{};
     }
     cudaSetDevice(back);

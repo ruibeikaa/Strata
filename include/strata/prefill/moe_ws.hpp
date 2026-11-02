@@ -94,8 +94,8 @@ struct Layer {
     /// STRATA_PF_HFMA_R2=1 (with STRATA_PF_HFMA_EXP): hfma_exp_plan's answer for a layer it took - 1 = the two-rows-a-thread kernel
     /// of moe_ws_hf_r2.cuh runs it at `hf_tier`, 0 = the compiler kernel of moe_ws_hf.cuh (what the layer's u favours).
     int hf_r2 = 0;
-    /// STRATA_PF_HFMA_CLASSES=1 (with STRATA_PF_HFMA_EXP): the host copy of `chunks` (valid only during the layer's hfma_exp_plan; the caller
-    /// sets it with `chunks`), from which the plan splits the layer's passes into size classes; and the plan's answer for a layer it took -
+    /// STRATA_PF_HFMA_CLASSES=1 (with STRATA_PF_HFMA_EXP) and STRATA_PF_HFMA_DOWN_CLASSES=1: the host copy of `chunks` (valid only during the layer's hfma_exp_plan and
+    /// hfma_down_plan, i.e. its loop iteration; the caller sets it with `chunks`), from which the plan splits the layer's passes into size classes; and the plan's answer for a layer it took -
     /// `hf_cls` = 1: moe_ws_hf_cls.cuh's four class kernels run the layer's gate/up at `hf_tier`'s rule (hf_r2 is 0 then), `hf_cls_n[c]` =
     /// the passes of class c (32 rows, 25..31, 17..24, 1..16) that the prepass uploads and gu_hf launches.  0 = the R2 / compiler kernel.
     const Chunk* chunks_host = nullptr;
@@ -110,6 +110,11 @@ struct Layer {
     /// kernel of moe_ws_dn_hf_r2.cuh runs it (Q2_0 at 16 tokens a pass, IQ4_NL at 32; `hd_tier` says which), 0 = the one-row kernel
     /// of moe_ws_dn_hf.cuh.
     int hd_r2 = 0;
+    /// STRATA_PF_HFMA_DOWN_CLASSES=1 (with STRATA_PF_HFMA_DOWN): hfma_down_plan's answer for a layer it took, from `chunks_host` (set by the caller beside `chunks`, read by
+    /// hfma_down_plan in the same iteration) - `hd_cls` = 1: moe_ws_dn_hf_cls.cuh's pass-class kernels run the layer's down at `hd_tier`'s rule (hd_r2 is 0 then), `hd_cls_n[c]` =
+    /// the passes of class c (32 rows, 17..31, 1..16) that down_hf_prep uploads and down_hf launches.  0 = the R2 / one-row kernel.
+    int hd_cls = 0;
+    int hd_cls_n[3] = {0, 0, 0};
 };
 /// The layer's gate/up into gu, one launch; false (nothing launched) where the per-group MMQ is to run instead (mode 0,
 /// or not faster at this u) - the same GU rows either way.  A gu_nib layer has no per-group MMQ (the caller stops on
