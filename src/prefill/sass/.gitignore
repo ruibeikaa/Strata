@@ -1,0 +1,7 @@
+# build_hand.bat's intermediates (only gemm_sass_cubin.inc, the embedded result, is tracked)
+containers.cu
+*.cubin
+*.cuasm
+*.log
+asm.out
+__pycache__/

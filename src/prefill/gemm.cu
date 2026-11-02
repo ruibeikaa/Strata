@@ -39,6 +39,7 @@
 #if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
 #include "gemm_hfma.cuh"   // STRATA_PF_HFMA
 #include "gemm_hfma_hc.cuh"   // STRATA_PF_HFMA_HC
+#include "gemm_sass.cuh"   // STRATA_PF_HFMA_SASS
 #include <cctype>
 #include <cmath>
 #include <map>
@@ -1127,6 +1128,140 @@ void hfma_left(int dev, const char* name, const char* why) {
     ++g_hf_left[dev][w + ": " + why];
 }
 
+// ---- GP100, opt-in (STRATA_PF_HFMA_SASS=1, with STRATA_PF_HFMA and / or STRATA_PF_HFMA_HC): the hand-scheduled SASS kernels of gemm_sass.cuh
+// in place of the compiler's gemm_kernel / gemm_sk_kernel where they cover the call; the rest keeps the compiler kernel, counted by what and
+// why (printed with the read's reports).  The outputs are the same bits.
+bool sass_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_PF_HFMA_SASS"); return e != nullptr && std::atoi(e) != 0; }();
+    return on;
+}
+std::atomic<int64_t> g_sass_taken[64][strata::prefill::sass::kKernCount];
+std::mutex g_sass_mu;
+std::map<std::string, int64_t> g_sass_left[64];   // "what: reason" -> calls
+void sass_left(int dev, const char* what, const char* why) {
+    std::string w = what != nullptr ? what : "?";
+    if (w.compare(0, 4, "blk.") == 0) {   // blk.12.attn_qkv.weight -> attn_qkv.weight
+        size_t i = 4;
+        while (i < w.size() && std::isdigit((unsigned char) w[i])) ++i;
+        if (i < w.size() && w[i] == '.') w.erase(0, i + 1);
+    }
+    std::lock_guard<std::mutex> lk(g_sass_mu);
+    ++g_sass_left[dev][w + ": " + why];
+}
+// STRATA_PF_HFMA_SASS_VERIFY=1 (diagnostic, slow): after every hand-scheduled launch the compiler kernel runs into a scratch buffer and the words that
+// differ are counted and named (a run with it must print none)
+__global__ void sass_cmp_kernel(const unsigned* __restrict__ a, const unsigned* __restrict__ b, const int64_t n, unsigned* __restrict__ out) {
+    for (int64_t i = (int64_t) blockIdx.x * 256 + threadIdx.x; i < n; i += (int64_t) gridDim.x * 256)
+        if (a[i] != b[i]) {
+            atomicAdd(&out[0], 1u);
+            atomicMin(&out[1], (unsigned) i);
+        }
+}
+bool sass_verify_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_PF_HFMA_SASS_VERIFY"); return e != nullptr && std::atoi(e) != 0; }();
+    return on;
+}
+void sass_verify_dense(int dev, int k, const uint16_t* X, const uint16_t* wh, const float* Y, int64_t T, int64_t N, int64_t K, cudaStream_t st) {
+    static float* ref[64] = {};
+    static size_t cap[64] = {};
+    static unsigned* d_out[64] = {};
+    const size_t need = (size_t) T * (size_t) N;
+    if (cap[dev] < need) {
+        cudaStreamSynchronize(st);
+        cudaFree(ref[dev]);
+        ref[dev] = nullptr;
+        cap[dev] = 0;
+        if (cudaMalloc((void**) &ref[dev], need * 4) != cudaSuccess) { cudaGetLastError(); ref[dev] = nullptr; return; }
+        cap[dev] = need;
+    }
+    if (d_out[dev] == nullptr && cudaMalloc((void**) &d_out[dev], 8) != cudaSuccess) { cudaGetLastError(); return; }
+    const unsigned init[2] = {0u, 0xFFFFFFFFu};
+    cudaMemcpyAsync(d_out[dev], init, 8, cudaMemcpyHostToDevice, st);
+    strata::prefill::hfma::gemm(X, K, wh, ref[dev], T, N, K, N, st);
+    sass_cmp_kernel<<<1024, 256, 0, st>>>(reinterpret_cast<const unsigned*>(Y), reinterpret_cast<const unsigned*>(ref[dev]), (int64_t) need, d_out[dev]);
+    unsigned res[2] = {0u, 0u};
+    cudaMemcpyAsync(res, d_out[dev], 8, cudaMemcpyDeviceToHost, st);
+    const cudaError_t e = cudaStreamSynchronize(st);
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_SASS_VERIFY: GPU %d: %s T=%lld N=%lld K=%lld: %s\n", dev, strata::prefill::sass::kKern[k].sym, (long long) T, (long long) N,
+                     (long long) K, cudaGetErrorString(e));
+        std::exit(1);
+    }
+    static std::atomic<int> printed{0};
+    if (res[0] != 0 || printed.fetch_add(1) < 8)
+        std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_SASS_VERIFY: GPU %d: %s T=%lld: %u of %zu words differ from the compiler kernel's%s (X %p Y %p)\n", dev,
+                     strata::prefill::sass::kKern[k].sym, (long long) T, res[0], need,
+                     res[0] ? (std::string(", first at row ") + std::to_string(res[1] / N) + " col " + std::to_string(res[1] % N)).c_str() : "", (const void*) X, (const void*) Y);
+}
+// the hc slice's twin: the compiler kernel as the engine would have run it (its own split Zc, the part buffers of its own) into scratch, compared with y
+void sass_verify_hc(int dev, int prod, const uint16_t* x16, const uint16_t* w16, const float* y, int64_t rows, int64_t N, int64_t K, int Zc, float wmax, cudaStream_t st) {
+    namespace hcn = strata::prefill::hfma::hc;
+    static float* ref[64] = {};
+    static float* part[64] = {};
+    static size_t cap[64] = {}, capp[64] = {};
+    static unsigned* d_out[64] = {};
+    const size_t need = (size_t) rows * (size_t) N, needp = need * (size_t) std::max(Zc, 1);
+    cudaStreamSynchronize(st);
+    if (cap[dev] < need) {
+        cudaFree(ref[dev]);
+        ref[dev] = nullptr;
+        cap[dev] = 0;
+        if (cudaMalloc((void**) &ref[dev], need * 4) != cudaSuccess) { cudaGetLastError(); return; }
+        cap[dev] = need;
+    }
+    if (capp[dev] < needp) {
+        cudaFree(part[dev]);
+        part[dev] = nullptr;
+        capp[dev] = 0;
+        if (cudaMalloc((void**) &part[dev], needp * 4) != cudaSuccess) { cudaGetLastError(); return; }
+        capp[dev] = needp;
+    }
+    if (d_out[dev] == nullptr && cudaMalloc((void**) &d_out[dev], 8) != cudaSuccess) { cudaGetLastError(); return; }
+    const unsigned init[2] = {0u, 0xFFFFFFFFu};
+    cudaMemcpyAsync(d_out[dev], init, 8, cudaMemcpyHostToDevice, st);
+    const dim3 grid((unsigned) ((N + 127) / 128), (unsigned) ((rows + 127) / 128), (unsigned) Zc);
+    hcn::gemm_sk_kernel<<<grid, hfma::kThreads, 0, st>>>(reinterpret_cast<const uint4*>(x16), reinterpret_cast<const uint4*>(w16), Zc > 1 ? part[dev] : ref[dev],
+                                                         (int) rows, (int) N, (int) K, (int) (K / 8), N, rows * N, Zc, wmax);
+    if (Zc > 1) hcn::reduce_kernel<<<(unsigned) std::min<int64_t>(2048, (rows * N + 255) / 256), 256, 0, st>>>(part[dev], ref[dev], rows, N, N, Zc, rows * N);
+    sass_cmp_kernel<<<1024, 256, 0, st>>>(reinterpret_cast<const unsigned*>(y), reinterpret_cast<const unsigned*>(ref[dev]), (int64_t) need, d_out[dev]);
+    unsigned res[2] = {0u, 0u};
+    cudaMemcpyAsync(res, d_out[dev], 8, cudaMemcpyDeviceToHost, st);
+    const cudaError_t e = cudaStreamSynchronize(st);
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_SASS_VERIFY: GPU %d: hc %s rows=%lld: %s\n", dev, prod == 0 ? "down" : "up", (long long) rows, cudaGetErrorString(e));
+        std::exit(1);
+    }
+    static std::atomic<int> printed{0};
+    if (res[0] != 0 || printed.fetch_add(1) < 8)
+        std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_SASS_VERIFY: GPU %d: hc %s rows=%lld (compiler split %d): %u of %zu words differ from the compiler kernel's%s\n", dev,
+                     prod == 0 ? "down" : "up", (long long) rows, Zc, res[0], need,
+                     res[0] ? (std::string(", first at row ") + std::to_string(res[1] / N) + " col " + std::to_string(res[1] % N)).c_str() : "");
+}
+// "attn_qkv N10240 K2560 x75, ..." for the kernels this device ran since the last call (they are cleared), and the fallbacks "what: reason xN, ..."
+void sass_take(int d, int64_t& n_taken, std::string& by_kernel, int64_t& n_left, std::string& by_reason, bool hc) {
+    n_taken = 0;
+    n_left = 0;
+    by_kernel.clear();
+    by_reason.clear();
+    for (int k = 0; k < strata::prefill::sass::kKernCount; ++k) {
+        if ((k >= strata::prefill::sass::kHcDown) != hc) continue;
+        const int64_t n = g_sass_taken[d][k].exchange(0);
+        if (n == 0) continue;
+        n_taken += n;
+        by_kernel += (by_kernel.empty() ? "" : ", ") + std::string("N") + std::to_string(strata::prefill::sass::kKern[k].N) + " K" +
+                     std::to_string(strata::prefill::sass::kKern[k].K) + " x" + std::to_string((long long) n);
+    }
+    std::lock_guard<std::mutex> lk(g_sass_mu);
+    std::map<std::string, int64_t> keep;
+    for (const auto& [what, n] : g_sass_left[d]) {
+        const bool is_hc = what.compare(0, 5, "down:") == 0 || what.compare(0, 3, "up:") == 0;
+        if (is_hc != hc) { keep.emplace(what, n); continue; }
+        n_left += n;
+        by_reason += (by_reason.empty() ? "" : ", ") + what + " x" + std::to_string((long long) n);
+    }
+    g_sass_left[d] = std::move(keep);
+}
+
 // ---- GP100, opt-in (STRATA_PF_HFMA_HC=1): the hyper-connection read's BF16 projections on FP16 HFMA2 --------------------
 // The down (N 320, K 10240) and up (N 10240, K 320) projections of every half-layer's hyper-connection read (the third,
 // the inject projection, has N = 4: its 128-wide tile would be empty, it keeps its route).  On Pascal these BF16 products
@@ -1339,6 +1474,23 @@ bool Gemm::native_hfma(const uint16_t* X, int ggml_type, const void* W_blocks, f
         std::fprintf(stderr, "prefill gemm: the dense projections run as FP16 HFMA2 GEMMs on resident FP16 copies "
                              "(STRATA_PF_HFMA=1; FP16 sums of 64 products widened to FP32, not bitwise the FP32 routes')\n");
     }
+    if (sass_on()) {   // the hand-scheduled twin of gemm_kernel where it covers the call: the same bits
+        int k = -1;
+        const char* r = strata::prefill::sass::dense(X, ldx, wh, Y, T, N, K, ldy, (cudaStream_t) stream_, dev, &k);
+        if (r == nullptr) {
+            static bool said_sass = false;
+            if (!said_sass) {
+                said_sass = true;
+                std::fprintf(stderr, "prefill gemm: the dense FP16 HFMA2 GEMMs run as hand-scheduled SASS kernels where they cover the call "
+                                     "(STRATA_PF_HFMA_SASS=1; the compiler kernels' bits, 81%% of the HFMA2 peak against 64%%)\n");
+            }
+            g_sass_taken[dev][k].fetch_add(1, std::memory_order_relaxed);
+            g_hf_taken[dev].fetch_add(1, std::memory_order_relaxed);
+            if (sass_verify_on()) sass_verify_dense(dev, k, X, wh, Y, T, N, K, (cudaStream_t) stream_);
+            return true;
+        }
+        sass_left(dev, name, r);
+    }
     strata::prefill::hfma::gemm(X, ldx, wh, Y, T, N, K, ldy, (cudaStream_t) stream_);
     g_hf_taken[dev].fetch_add(1, std::memory_order_relaxed);
     return true;
@@ -1365,6 +1517,14 @@ void gemm_hfma_report(int64_t tokens) {
                              "kernel, %lld left to the old route%s%s; %d FP16 weight copies kept, %.0f MiB\n", (long long) tokens, d,
                      (long long) taken, (long long) left, by.c_str(), by.empty() ? "" : ")", copies, copy_mib);
         g_hf_left[d].clear();
+        if (sass_on()) {
+            int64_t n_taken = 0, n_left = 0;
+            std::string by_kernel, by_reason;
+            sass_take(d, n_taken, by_kernel, n_left, by_reason, false);
+            std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_SASS: read of %lld tokens, CUDA%d: %lld dense products on the hand-scheduled kernels (%s), "
+                                 "%lld left to the compiler kernel (%s)\n", (long long) tokens, d, (long long) n_taken, by_kernel.empty() ? "-" : by_kernel.c_str(),
+                         (long long) n_left, by_reason.empty() ? "-" : by_reason.c_str());
+        }
     }
 }
 // STRATA_PF_HFMA_HC=1's product (see the block above): false = nothing launched, bf16() runs; the call is counted under `name`.
@@ -1410,6 +1570,10 @@ bool Gemm::bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y,
             for (int64_t i = 0; i < n_sl; ++i) {
                 const int64_t rows = std::min(kSl, T - i * kSl);
                 zs[i] = hc_pick_z((N + 127) / 128, (rows + 127) / 128, K, nsm);
+                // STRATA_PF_HFMA_SASS: a split whose parts are one 4-stage group each (up: K 320 = 3 groups, Z = 3) sums to the very same FP32
+                // bits as no split (0 + f0, then + f1, + f2, in that order; the scale is a power of two) and costs the part buffers' writes and
+                // the reduce kernel's reads (0.5 ms of a 1.1 ms product): no split
+                if (sass_on() && zs[i] > 1 && zs[i] == (int) ((K / 32 + 3) / 4)) zs[i] = 1;
                 need_x = std::max(need_x, rows * K);
                 if (zs[i] > 1) need_p = std::max(need_p, 2 * (int64_t) zs[i] * rows * N);   // floats as 2-byte elements
             }
@@ -1449,6 +1613,21 @@ bool Gemm::bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y,
         ev_b = t.b;
     }
     void* sp = hc_state_ptr(dev);
+    float* sass_ysc = nullptr;
+    unsigned* sass_sink = nullptr;
+    if (sass_on()) {
+        std::lock_guard<std::mutex> lk(g_hcd_mu);
+        static void* ysc_ptr[64] = {};
+        static void* sink_ptr[64] = {};
+        if (ysc_ptr[dev] == nullptr) {
+            if (cudaGetSymbolAddress(&ysc_ptr[dev], hcn::g_hc_ysc) != cudaSuccess || cudaGetSymbolAddress(&sink_ptr[dev], hcn::g_hc_sink) != cudaSuccess) {
+                (void) cudaGetLastError();
+                ysc_ptr[dev] = sink_ptr[dev] = nullptr;
+            }
+        }
+        sass_ysc = (float*) ysc_ptr[dev];
+        sass_sink = (unsigned*) sink_ptr[dev];
+    }
     if (ev_a != nullptr) cudaEventRecord(ev_a, st);
     uint16_t* const x16 = tc_x_;
     float* const part = reinterpret_cast<float*>(tc_w_);
@@ -1465,10 +1644,33 @@ bool Gemm::bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y,
         else hcn::cvt_kernel<false><<<blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(x16), n8, K8, ldx8, hw.wmax);
         const dim3 grid((unsigned) ((N + 127) / 128), (unsigned) ((rows + 127) / 128), (unsigned) Z);
         float* const y = Y + t0 * ldy;
-        hcn::gemm_sk_kernel<<<grid, hfma::kThreads, 0, st>>>(reinterpret_cast<const uint4*>(x16), reinterpret_cast<const uint4*>(hw.p),
-                                                             Z > 1 ? part : y, (int) rows, (int) N, (int) K, (int) K8, Z > 1 ? N : ldy,
-                                                             rows * N, Z, hw.wmax);
+        bool by_sass = false;
+        if (sass_ysc != nullptr && sass_sink != nullptr) {   // the hand-scheduled twin of gemm_sk_kernel: it takes the scale from a word the kernel below writes
+            hcn::ysc_kernel<<<1, 1, 0, st>>>(sass_ysc, hw.wmax);
+            const char* r = strata::prefill::sass::hc_slice(prod == 0, x16, hw.p, y, part, rows, N, K, ldy, Z, sass_ysc,
+                                                             Z == 1 ? (unsigned*) ((char*) sp + offsetof(hcn::HcState, bad_y)) : sass_sink, st, dev);
+            if (r == nullptr) {
+                by_sass = true;
+                g_sass_taken[dev][prod == 0 ? strata::prefill::sass::kHcDown : strata::prefill::sass::kHcUp].fetch_add(1, std::memory_order_relaxed);
+                static bool said_sass = false;
+                if (!said_sass) {
+                    said_sass = true;
+                    std::fprintf(stderr, "prefill gemm: the hyper-connection FP16 HFMA2 GEMMs run as hand-scheduled SASS kernels where they cover the call "
+                                         "(STRATA_PF_HFMA_SASS=1; the compiler kernel's bits; K 320 is never split)\n");
+                }
+            } else {
+                sass_left(dev, hc_prod_name(prod), r);
+            }
+        } else if (sass_on()) {
+            sass_left(dev, hc_prod_name(prod), "device symbols missing");
+        }
+        if (!by_sass)
+            hcn::gemm_sk_kernel<<<grid, hfma::kThreads, 0, st>>>(reinterpret_cast<const uint4*>(x16), reinterpret_cast<const uint4*>(hw.p),
+                                                                 Z > 1 ? part : y, (int) rows, (int) N, (int) K, (int) K8, Z > 1 ? N : ldy,
+                                                                 rows * N, Z, hw.wmax);
         if (Z > 1) hcn::reduce_kernel<<<(unsigned) std::min<int64_t>(2048, (rows * N + 255) / 256), 256, 0, st>>>(part, y, rows, N, ldy, Z, rows * N);
+        if (by_sass && sass_verify_on())
+            sass_verify_hc(dev, prod, x16, hw.p, y, rows, N, K, hc_pick_z((N + 127) / 128, (rows + 127) / 128, K, nsm), hw.wmax, st);
     }
     if (const cudaError_t le = cudaGetLastError(); le != cudaSuccess) {
         std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_HC: a launch failed: %s\n", cudaGetErrorString(le));
@@ -1548,6 +1750,14 @@ void gemm_hfma_hc_report(int64_t tokens) {
                      g_shadow_h_count[dev], g_shadow_h_bytes[dev] / 1048576.0, xmax, stt.slices, kh.empty() ? "-" : kh.c_str(),
                      d.wmax_hi > 0 ? d.wmax_lo : 0.0f, d.wmax_hi, stt.bad_x, stt.bad_y, free_b / 1048576.0,
                      d.min_free_mib < 1e29 ? d.min_free_mib : -1.0, kt.empty() ? "-" : kt.c_str());
+        if (sass_on()) {
+            int64_t n_taken = 0, n_left = 0;
+            std::string by_kernel, by_reason;
+            sass_take(dev, n_taken, by_kernel, n_left, by_reason, true);
+            std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_SASS: read of %lld tokens, CUDA%d: %lld hyper-connection slices on the hand-scheduled kernels (%s), "
+                                 "%lld left to the compiler kernel (%s)\n", (long long) tokens, dev, (long long) n_taken, by_kernel.empty() ? "-" : by_kernel.c_str(),
+                         (long long) n_left, by_reason.empty() ? "-" : by_reason.c_str());
+        }
         d = HcDev{};
     }
     cudaSetDevice(back);

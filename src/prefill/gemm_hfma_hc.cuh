@@ -41,6 +41,16 @@ __device__ __forceinline__ int shift_k(const unsigned cur_bits, const float wmax
     return e > KMAXH ? KMAXH : e;
 }
 
+// STRATA_PF_SASS: the hand-scheduled hc kernels (gemm_sass.cuh) take the output scale 2^k as a float from a device word instead of
+// working out shift_k themselves: this one-thread kernel (after cvt_kernel in the stream) writes the very value gemm_sk_kernel's
+// `ysc` is, from the same g_hc.cur and the same shift_k.  g_hc_sink is where the split-K parts' non-finite counts go (reduce_kernel
+// counts the sums; gemm_sk_kernel counts only when Z == 1).
+__device__ float g_hc_ysc;
+__device__ unsigned g_hc_sink;
+__global__ void ysc_kernel(float* __restrict__ out, const float wmax) {
+    *out = pow2i(shift_k(*(volatile const unsigned*) &g_hc.cur, wmax));
+}
+
 // the 16-bit pattern as |FP32| bits
 template <bool F16>
 __device__ __forceinline__ unsigned abs_bits(const unsigned h) {
