@@ -45,6 +45,7 @@
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/pf_small.hpp"   // STRATA_PF_HFMA_SMALL
+#include "strata/kernels/qsa_select_exact.hpp"   // STRATA_PF_SEL_EXACT
 #include "strata/prefill/moe_fused.hpp"
 #include "strata/prefill/moe_ws.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
@@ -4103,6 +4104,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // C-1: the grid reaches the batch's last query's n_bid (they rise with the position)
                         const int64_t active = (int64_t) m.steps_host[(size_t) ((t0 + nb - 1) * strata::kernels::kStepCount +
                                                                                 strata::kernels::kStepNBid)] + 1;
+                        // STRATA_PF_SEL_EXACT=1: scores + top-k in one exact path (the FP16 scorer as a filter); false = run the pair below
+                        if (strata::kernels::qsa_select_exact(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb, m.max_blocks, m.cap, s, m.sel_scores,
+                                                              m.sel_ids + t0 * m.cap, m.cs, active))
+                            continue;
                         // the scores on tensor cores (3xTF32: FP32-level, not bitwise), below sm_80 the FP32 tiled kernel with STRATA_SELECT_SIMT=1;
                         // STRATA_SELECT_OLD=1: the warp kernel
                         static const bool old_sel = std::getenv("STRATA_SELECT_OLD") != nullptr;
@@ -7156,6 +7161,9 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                             const int32_t* steps0 = m.steps_dev + q0 * strata::kernels::kStepCount;
                             const int64_t active = (int64_t) m.steps_host[(size_t) ((q0 + nb - 1) * strata::kernels::kStepCount +
                                                                                     strata::kernels::kStepNBid)] + 1;
+                            if (strata::kernels::qsa_select_exact(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512, steps0, nb, m.max_blocks, m.cap, s, m.sel_scores,
+                                                                  m.sel_ids + q0 * m.cap, cs, active))
+                                continue;
                             static const bool old_sel = std::getenv("STRATA_SELECT_OLD") != nullptr;
                             if (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512,
                                                                                  steps0, nb, m.max_blocks, s, m.sel_scores,

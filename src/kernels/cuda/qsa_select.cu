@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include "strata/kernels/qsa_select.hpp"
+#include "strata/kernels/qsa_select_exact.hpp"   // STRATA_PF_SEL_EXACT
 #include "strata/kernels/ktime.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/prefill/pf_small2.hpp"   // STRATA_PF_HFMA_SEL, STRATA_PF_TOPK_SEL
@@ -2392,6 +2393,582 @@ __global__ void __launch_bounds__(TS2_T) block_topk_sel_kernel(const float* __re
     }
 }
 #endif  // !__HIPCC__ && STRATA_EXPERIMENTAL_SM60
+#if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
+// ---- STRATA_PF_SEL_EXACT (default off): the prompt's select with the FP32 scorer's EXACT ids on the FP16 pair scorer (kf-work\kexact; the proof is BOUND.md there).
+// The FP16 scores a_b (sel_scores_h2x_kernel = sel_scores_h2_kernel + the key side of a worst-case error bound) are only a FILTER.  For every score
+//     |a_b - s_b| <= E,   E = SX_C * (sum_h qsc_h * max(Qw_h, 1)) * (ksc_b * max(Kw_b, 1)),      Qw_h^2 = sum_d Wt_d (q_hd / qsc_h)^2,  Kw_b^2 = sum_d Wt_d (k_bd / ksc_b)^2,
+// Wt_d = 4.06 + 1.017 (32 - (d mod 32)): the rounding events a product at chain position d mod 32 meets in the FP16 accumulate (chain of 32 HFMA2, two HADD2 levels), the two FP16 conversions
+// and the FP32 kernel's own rounding, all at their worst case (Cauchy-Schwarz over the weighted norms).  SX_C = 5.2e-4 = 2^-11 + the absolute terms + 2% margin.
+// The bound is taken at its largest over the blocks the scorer CTAs staged (KEmax, one number a query tile), so e = SX_C * QS * KEmax is one number a query.  With T = the weighted
+// width-th largest a (the FP16 scores), the exact threshold lies in [T - e, T + e], a block with a_b < T - 2e is certainly below it and one with a_b > T + 2e certainly above;
+// only a_b in [T - 2e, T + 2e] is recomputed - with block_scores_kernel's arithmetic, lane 0's xor-shuffle tree - and the engine's radix rule runs on those exact keys plus the FP16 keys of the rest:
+// the multiset of cells at or above any t in [T - e, T + e] is the same as the FP32 scores', so thr, the cells above it and the ties (in block order) are the FP32 kernel's.
+// A query the filter cannot decide (more than SX_CAP survivors, a bound it cannot form: NaN / inf / |x| >= 2^100 in q or a key, a bad sample bound, a row of more than 40,960 blocks)
+// has EVERY block recomputed in FP32 in place and runs block_topk_wide_kernel<true> - still the FP32 kernel's ids.
+constexpr int SX_CAP = 4096;           // survivors a query can hold
+constexpr float SX_C = 5.2e-4f;
+// Two small device arrays, cudaMalloc'd once a device (sx_aux) and passed as arguments, not module-level __device__ variables: a new module global would shift the constant-bank addresses
+// of the module's other kernels and the switch-off SASS would no longer be byte-identical.
+//   kpart [strip]: the largest ksc * max(Kw, 1) of the blocks the last query tile's CTA of that strip staged;  stat (STRATA_PF_SEL_EXACT_STATS): queries, blocks, survivors, rescored,
+//   slow; why slow: [5] bound, [6] sample, [7] too many survivors, [8] non-finite score, [9] LB, [10] T
+
+__device__ __forceinline__ float sx_wtot(const int pos) { return 4.06f + 1.017f * (float) (32 - pos); }
+// ksc * max(Kw, 1) of a block (amax = its largest |k|, ss = Kw^2 of the scaled key, e = its exponent); 0 for an all-zero block, +inf where the proof's range does not hold
+__device__ __forceinline__ float sx_ke(const float amax, const float ss, const int e) {
+    if (!(ss == ss) || !(ss < 3.0e38f) || !(amax < sh2_pow2f(100))) return __int_as_float(0x7f800000);
+    if (!(amax > 0.0f)) return 0.0f;
+    return sh2_pow2f(e) * fmaxf(sqrtf(ss), 1.0f);
+}
+__device__ __forceinline__ float sx_key_float(const uint32_t k) { return __uint_as_float((k & 0x80000000u) ? (k & 0x7fffffffu) : ~k); }   // order_key's inverse (k != 0)
+// block_scores_kernel's arithmetic for one (query, block): the lane's float4 of the key against the query head, the xor-shuffle sum, relu, the heads in order; lane 0's value to every lane
+__device__ __forceinline__ float sx_score(const float* __restrict__ key, const float* __restrict__ q, const int lane) {
+    const float4 k4 = *reinterpret_cast<const float4*>(key + lane * 4);
+    float score = 0.0f;
+#pragma unroll
+    for (int h = 0; h < IDX_HEADS; ++h) {
+        const float4 q4 = *reinterpret_cast<const float4*>(q + h * IDX_DIM + lane * 4);
+        float d = k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
+        score += d > 0.0f ? d : 0.0f;
+    }
+    return __shfl_sync(0xffffffffu, score, 0);
+}
+
+// the same bits as sx_score (block_scores_rows_kernel's pairing: the four heads reduce-scattered, xor 16 and 8 then 4, 2, 1, gathered to lane 0 in head order): 9 shuffles a block instead of 20.
+// The score is lane 0's; qr = the lane's float4 of the query's four heads
+__device__ __forceinline__ float sx_score_rs(const float4 k4, const float4 (&qr)[IDX_HEADS], const int lane) {
+    const bool hi16 = (lane & 16) != 0, hi8 = (lane & 8) != 0;
+    float d[IDX_HEADS];
+#pragma unroll
+    for (int h = 0; h < IDX_HEADS; ++h) d[h] = k4.x * qr[h].x + k4.y * qr[h].y + k4.z * qr[h].z + k4.w * qr[h].w;
+    float r2[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+        r2[i] = (hi16 ? d[i + 2] : d[i]) + __shfl_xor_sync(0xffffffffu, hi16 ? d[i] : d[i + 2], 16);
+    float r = (hi8 ? r2[1] : r2[0]) + __shfl_xor_sync(0xffffffffu, hi8 ? r2[0] : r2[1], 8);
+    r += __shfl_xor_sync(0xffffffffu, r, 4);
+    r += __shfl_xor_sync(0xffffffffu, r, 2);
+    r += __shfl_xor_sync(0xffffffffu, r, 1);
+    const float s1 = __shfl_sync(0xffffffffu, r, 8);
+    const float s2 = __shfl_sync(0xffffffffu, r, 16);
+    const float s3 = __shfl_sync(0xffffffffu, r, 24);
+    float score = 0.0f;
+    score += r > 0.0f ? r : 0.0f;
+    score += s1 > 0.0f ? s1 : 0.0f;
+    score += s2 > 0.0f ? s2 : 0.0f;
+    score += s3 > 0.0f ? s3 : 0.0f;
+    return score;
+}
+
+__global__ void __launch_bounds__(256, 1) sel_scores_h2x_kernel(const float* __restrict__ pooled, const float* __restrict__ q_idx,
+                                                               const int32_t* __restrict__ steps, int64_t nq, int64_t max_blocks, int64_t reach,
+                                                               int64_t strip, float* __restrict__ out, float* __restrict__ kpart) {
+    __shared__ __align__(16) uint32_t tile[SH2_TG * 8 * 4 * SH2_CHW];
+    __shared__ float ksc[SH2_TG * 16];
+    __shared__ int64_t s_nbid[SH2_Q];
+    __shared__ float s_ke[8];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5, j = lane & 3;
+    const int ql = warp * 8 + (lane >> 2);
+    const int64_t q0 = (int64_t) blockIdx.y * SH2_Q, qi = q0 + ql;
+    if (t < SH2_Q) s_nbid[t] = q0 + t < nq ? steps[(q0 + t) * kStepCount + kStepNBid] : -1;
+    uint32_t qw[4][16];
+    float qsc[4];
+    {
+        const float* src = q_idx + (qi < nq ? qi : 0) * 512 + 32 * j;
+#pragma unroll
+        for (int h = 0; h < 4; ++h) {
+            float2 v[16];
+            float amax = 0.0f;
+#pragma unroll
+            for (int w = 0; w < 16; ++w) {
+                v[w] = *reinterpret_cast<const float2*>(src + h * 128 + 2 * w);
+                amax = fmaxf(amax, fmaxf(fabsf(v[w].x), fabsf(v[w].y)));
+            }
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+            const int e = sh2_exp_of(amax);
+            const float sin_ = sh2_pow2f(-e);
+            qsc[h] = sh2_pow2f(e);
+#pragma unroll
+            for (int w = 0; w < 16; ++w) qw[h][w] = sh2_pack_h2(v[w].x * sin_, v[w].y * sin_);
+        }
+    }
+    __syncthreads();
+    // STRATA_PF_SEL_EXACT: the key side of the error bound, kemax = the largest ksc * max(Kw, 1) of the blocks this CTA stages (dimension d = 4 lane + c, chain position d mod 32)
+    const bool kcalc = blockIdx.y == gridDim.y - 1;   // the last query tile stages every block of the call
+    float kemax = 0.0f;
+    float kwt[4];
+#pragma unroll
+    for (int c = 0; c < 4; ++c) kwt[c] = sx_wtot(4 * (lane & 7) + c);
+    int64_t top = -1;
+    for (int i = 0; i < SH2_Q; ++i) top = s_nbid[i] > top ? s_nbid[i] : top;
+    const int64_t b_lo = (int64_t) blockIdx.x * strip;
+    int64_t b_hi = b_lo + strip;
+    if (b_hi > reach) b_hi = reach;
+    if (b_hi > top) b_hi = top;
+    if (b_hi > max_blocks) b_hi = max_blocks;
+    for (int64_t b0 = b_lo; b0 < b_hi; b0 += SH2_TG * 16) {
+        __syncthreads();   // the previous tile's reads of tile / ksc are done
+        // ---- stage: warp w packs pairs 2w and 2w+1 of the tile (blocks b0 + 2p, b0 + 2p + 1)
+#pragma unroll
+        for (int pi = 0; pi < SH2_TG; ++pi) {
+            const int p = warp * SH2_TG + pi;
+            const int64_t bA = b0 + 2 * p, bB = bA + 1;
+            float4 a = make_float4(0.f, 0.f, 0.f, 0.f), b = a;
+            if (bA < reach) a = *reinterpret_cast<const float4*>(pooled + bA * 128 + 4 * lane);
+            if (bB < reach) b = *reinterpret_cast<const float4*>(pooled + bB * 128 + 4 * lane);
+            float ma = fmaxf(fmaxf(fabsf(a.x), fabsf(a.y)), fmaxf(fabsf(a.z), fabsf(a.w)));
+            float mb = fmaxf(fmaxf(fabsf(b.x), fabsf(b.y)), fmaxf(fabsf(b.z), fabsf(b.w)));
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                ma = fmaxf(ma, __shfl_xor_sync(0xffffffffu, ma, o));
+                mb = fmaxf(mb, __shfl_xor_sync(0xffffffffu, mb, o));
+            }
+            const int ea = sh2_exp_of(ma), eb = sh2_exp_of(mb);
+            const float sa = sh2_pow2f(-ea), sb = sh2_pow2f(-eb);
+            uint4 wv;
+            wv.x = sh2_pack_h2(a.x * sa, b.x * sb);
+            wv.y = sh2_pack_h2(a.y * sa, b.y * sb);
+            wv.z = sh2_pack_h2(a.z * sa, b.z * sb);
+            wv.w = sh2_pack_h2(a.w * sa, b.w * sb);
+            *reinterpret_cast<uint4*>(&tile[(((p >> 3) * 8 + (p & 7)) * 4 + (lane >> 3)) * SH2_CHW + (lane & 7) * 4]) = wv;
+            if (lane == 0) { ksc[2 * p] = sh2_pow2f(ea); ksc[2 * p + 1] = sh2_pow2f(eb); }
+            if (kcalc) {
+                const float xa0 = a.x * sa, xa1 = a.y * sa, xa2 = a.z * sa, xa3 = a.w * sa;
+                const float xb0 = b.x * sb, xb1 = b.y * sb, xb2 = b.z * sb, xb3 = b.w * sb;
+                float ssa = kwt[0] * xa0 * xa0 + kwt[1] * xa1 * xa1 + kwt[2] * xa2 * xa2 + kwt[3] * xa3 * xa3;
+                float ssb = kwt[0] * xb0 * xb0 + kwt[1] * xb1 * xb1 + kwt[2] * xb2 * xb2 + kwt[3] * xb3 * xb3;
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) {
+                    ssa += __shfl_xor_sync(0xffffffffu, ssa, o);
+                    ssb += __shfl_xor_sync(0xffffffffu, ssb, o);
+                }
+                kemax = fmaxf(kemax, fmaxf(sx_ke(ma, ssa, ea), sx_ke(mb, ssb, eb)));
+            }
+        }
+        __syncthreads();
+        const int ng = (int) ((b_hi - b0 + 15) >> 4) < SH2_TG ? (int) ((b_hi - b0 + 15) >> 4) : SH2_TG;
+        for (int g = 0; g < ng; ++g) {
+            uint32_t acc[4][8];
+#pragma unroll
+            for (int h = 0; h < 4; ++h)
+#pragma unroll
+                for (int pp = 0; pp < 8; ++pp) acc[h][pp] = 0u;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                uint4 kw[8];
+#pragma unroll
+                for (int pp = 0; pp < 8; ++pp) kw[pp] = *reinterpret_cast<const uint4*>(&tile[((g * 8 + pp) * 4 + j) * SH2_CHW + 4 * i]);
+#pragma unroll
+                for (int h = 0; h < 4; ++h) {
+                    const uint32_t w0 = qw[h][2 * i], w1 = qw[h][2 * i + 1];
+                    const uint32_t q0r = sh2_rep_lo(w0), q1r = sh2_rep_hi(w0), q2r = sh2_rep_lo(w1), q3r = sh2_rep_hi(w1);
+#pragma unroll
+                    for (int pp = 0; pp < 8; ++pp) {
+                        acc[h][pp] = sh2_hfma2(q0r, kw[pp].x, acc[h][pp]);
+                        acc[h][pp] = sh2_hfma2(q1r, kw[pp].y, acc[h][pp]);
+                        acc[h][pp] = sh2_hfma2(q2r, kw[pp].z, acc[h][pp]);
+                        acc[h][pp] = sh2_hfma2(q3r, kw[pp].w, acc[h][pp]);
+                    }
+                }
+            }
+            // ---- reduce-scatter over the 4 slice lanes: lane j ends with pairs j and j + 4 of every head
+            const bool bit1 = (lane & 2) != 0, bit0 = (lane & 1) != 0;
+            uint32_t res[4][2];
+#pragma unroll
+            for (int h = 0; h < 4; ++h) {
+#pragma unroll
+                for (int c = 0; c < 2; ++c) {
+                    uint32_t a[2];
+#pragma unroll
+                    for (int b0i = 0; b0i < 2; ++b0i) {
+                        const uint32_t keep = bit1 ? acc[h][4 * c + 2 + b0i] : acc[h][4 * c + b0i];
+                        const uint32_t snd = bit1 ? acc[h][4 * c + b0i] : acc[h][4 * c + 2 + b0i];
+                        a[b0i] = sh2_hadd2(keep, __shfl_xor_sync(0xffffffffu, snd, 2));
+                    }
+                    const uint32_t keep = bit0 ? a[1] : a[0], snd = bit0 ? a[0] : a[1];
+                    res[h][c] = sh2_hadd2(keep, __shfl_xor_sync(0xffffffffu, snd, 1));
+                }
+            }
+#pragma unroll
+            for (int c = 0; c < 2; ++c) {
+                float t0 = 0.0f, t1 = 0.0f;
+#pragma unroll
+                for (int h = 0; h < 4; ++h) {
+                    const __half2 hv = *reinterpret_cast<const __half2*>(&res[h][c]);
+                    const float2 f = __half22float2(hv);
+                    t0 = fmaf(fmaxf(f.x, 0.0f), qsc[h], t0);
+                    t1 = fmaf(fmaxf(f.y, 0.0f), qsc[h], t1);
+                }
+                const int64_t bw = b0 + 16 * g + 2 * (4 * c + j);
+                const float s0 = t0 * ksc[16 * g + 2 * (4 * c + j)], s1 = t1 * ksc[16 * g + 2 * (4 * c + j) + 1];
+                if (qi < nq) {
+                    const int64_t nb = s_nbid[ql];
+                    float* o = out + qi * max_blocks + bw;
+                    if (bw + 1 < nb && ((qi * max_blocks + bw) & 1) == 0) {
+                        *reinterpret_cast<float2*>(o) = make_float2(s0, s1);
+                    } else {
+                        if (bw < nb) o[0] = s0;
+                        if (bw + 1 < nb) o[1] = s1;
+                    }
+                }
+            }
+        }
+    }
+    // the CTA's largest key-side term, for the select kernel
+    if (kcalc) {
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) kemax = fmaxf(kemax, __shfl_xor_sync(0xffffffffu, kemax, o));
+        if (lane == 0) s_ke[warp] = kemax;
+        __syncthreads();
+        if (t == 0) {
+            float mk = s_ke[0];
+#pragma unroll
+            for (int w = 1; w < 8; ++w) mk = fmaxf(mk, s_ke[w]);
+            kpart[blockIdx.x] = mk;
+        }
+    }
+}
+
+__global__ void __launch_bounds__(TS2_T) block_topk_selx_kernel(const float* __restrict__ pooled, const float* __restrict__ q_idx, float* __restrict__ scores,
+                                                               const int32_t* __restrict__ steps, int64_t max_blocks, int64_t cap, int32_t* __restrict__ ids,
+                                                               int nparts, const float* __restrict__ kpart, unsigned long long* __restrict__ stat) {
+    __shared__ uint32_t s_key[SX_CAP];
+    __shared__ uint16_t s_off[SX_CAP];        // the survivor's block number
+    __shared__ unsigned s_mask[32][TS2_PERMAX];
+    __shared__ int s_woff[33];
+    __shared__ int hist[256];
+    __shared__ int s_cnt[32], s_gt[32], s_eq[32], s_warp[33];
+    __shared__ int s_digit, s_above, s_fail;
+    __shared__ float s_am[16], s_ss[16], s_ee;
+    __shared__ int s_bad;
+    const int64_t qi = blockIdx.x;
+    const int32_t* st = steps + qi * kStepCount;
+    const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
+    int32_t* out = ids + qi * cap;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    if (n_kv <= width) {
+        for (int64_t j = t; j < n_kv; j += TS2_T) out[j] = (int32_t) j;
+        if (t == 0) g_tk_fail[qi] = 0;
+        return;
+    }
+    const float* qrow = q_idx + qi * 512;
+    // ---- 0. the query's error bound: ee = 2 * SX_C * QS * KEmax (= 2e, the half-width of the band around T; rounded up by 2e-4), floored at 2^-90 (the FP32 kernel's own underflow);
+    //         bad = a term outside the proof's range (NaN / inf / |x| >= 2^100 in q or in a key)
+    if (t < 512) {
+        float am = fabsf(qrow[t]);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+        if (lane == 0) s_am[warp] = am;
+    }
+    __syncthreads();
+    if (t < 512) {
+        const int h = warp >> 2;
+        const float amax = fmaxf(fmaxf(s_am[4 * h], s_am[4 * h + 1]), fmaxf(s_am[4 * h + 2], s_am[4 * h + 3]));
+        const float xs = qrow[t] * sh2_pow2f(-sh2_exp_of(amax));
+        float v = sx_wtot(t & 31) * xs * xs;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+        if (lane == 0) s_ss[warp] = v;
+    }
+    __syncthreads();
+    if (t == 0) {
+        float qs = 0.0f;
+        int bad = 0;
+        for (int h = 0; h < 4; ++h) {
+            const float amax = fmaxf(fmaxf(s_am[4 * h], s_am[4 * h + 1]), fmaxf(s_am[4 * h + 2], s_am[4 * h + 3]));
+            const float ss = s_ss[4 * h] + s_ss[4 * h + 1] + s_ss[4 * h + 2] + s_ss[4 * h + 3];
+            if (!(amax < sh2_pow2f(100)) || !(ss == ss) || !(ss < 3.0e38f)) bad = 1;
+            if (amax > 0.0f) qs += sh2_pow2f(sh2_exp_of(amax)) * fmaxf(sqrtf(ss), 1.0f);
+        }
+        float ke = 0.0f;
+        for (int i = 0; i < nparts; ++i) ke = fmaxf(ke, kpart[i]);
+        const float ee = SX_C * qs * ke * 2.0002f;
+        if (!(ee < 3.0e38f)) bad = 1;
+        s_ee = fmaxf(ee, sh2_pow2f(-90));
+        s_bad = bad;
+        s_fail = 0;
+    }
+    __syncthreads();
+    const float ee = s_ee;
+    float* scw = scores + qi * max_blocks;
+    const float* sc = scw;
+    const int nbid = (int) n_bid, nb = nbid + 1;
+    const int per = (nb + TS2_T - 1) / TS2_T;                 // rows of 32 blocks a warp
+    const int wlast = (int) (n_kv - n_bid * R);             // the tail block's cells
+    const int w0 = warp * 32 * per;
+    auto weight = [&](int b) -> int { return b < nbid ? R : (b == nbid ? wlast : 0); };
+    const int ns = (nb + TS2_STRIDE - 1) / TS2_STRIDE;
+    // the all-blocks path: every block's score in FP32 (the tail block's is the tail kernel's already), then block_topk_wide_kernel<true> in the next launch
+    auto slow = [&](const int why) {
+        for (int b = warp; b < nbid; b += 32) {
+            const float v = sx_score(pooled + (int64_t) b * IDX_DIM, qrow, lane);
+            if (lane == 0) scw[b] = v;
+        }
+        if (t == 0) {
+            g_tk_fail[qi] = 1;
+            if (stat) { atomicAdd(&stat[0], 1ull); atomicAdd(&stat[1], (unsigned long long) nbid); atomicAdd(&stat[4], 1ull); atomicAdd(&stat[5 + why], 1ull); }
+        }
+    };
+    if (s_bad || per > TS2_PERMAX) { slow(0); return; }
+    // the survivors of the row (blocks with a key >= kmin), per warp in block order: A) a ballot mask a warp-row and the count a warp, B) a scan over the warps, C) gather;
+    // false = more than SX_CAP of them, or a non-finite FP16 score on the way (checked when nonfin_check)
+    int cnt = 0;
+    uint32_t* seg_key = s_key;
+    uint16_t* seg_off = s_off;
+    auto build = [&](const uint32_t kmin, const bool nonfin_check) -> bool {
+        int c = 0;
+        for (int r = 0; r < per; ++r) {
+            const int b = w0 + r * 32 + lane;
+            const int wg = b < nb ? weight(b) : 0;
+            const float fv = wg ? sc[b] : 0.0f;
+            const uint32_t k = wg ? order_key(fv) : 0u;
+            if (nonfin_check && wg && !(fabsf(fv) < 3.0e38f)) atomicOr(&s_fail, 2);   // a non-finite FP16 score: the bound cannot be formed
+            const unsigned mask = __ballot_sync(0xffffffffu, wg != 0 && k >= kmin);
+            if (lane == 0) s_mask[warp][r] = mask;
+            c += __popc(mask);
+        }
+        if (lane == 0) s_cnt[warp] = c;
+        __syncthreads();
+        if (t == 0) {
+            int sum = 0;
+            for (int w2 = 0; w2 < 32; ++w2) { s_woff[w2] = sum; sum += s_cnt[w2]; }
+            s_woff[32] = sum;
+            if (sum > SX_CAP) s_fail |= 1;
+        }
+        __syncthreads();
+        if (s_fail) return false;
+        cnt = c;
+        seg_key = &s_key[s_woff[warp]];
+        seg_off = &s_off[s_woff[warp]];
+        int run = 0;
+        for (int r = 0; r < per; ++r) {
+            const unsigned mask = s_mask[warp][r];
+            if (mask == 0u) continue;
+            if ((mask >> lane) & 1u) {
+                const int pos = run + __popc(mask & ((1u << lane) - 1u));
+                seg_key[pos] = order_key(sc[w0 + r * 32 + lane]);
+                seg_off[pos] = (uint16_t) (w0 + r * 32 + lane);
+            }
+            run += __popc(mask);
+        }
+        __syncthreads();   // the lists are complete (and the masks free again)
+        return true;
+    };
+    // the engine's digit rule over the survivors' keys (all threads): the width-th largest key and the cells strictly above it
+    auto radix = [&](uint32_t& thr_out, int& above_out) {
+        uint32_t pfx = 0;
+        int abv = 0;
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            if (t < 256) hist[t] = 0;
+            __syncthreads();
+            const uint32_t hi_mask = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
+            for (int i = lane; i < cnt; i += 32) {
+                const uint32_t k = seg_key[i];
+                if ((k & hi_mask) == (pfx & hi_mask)) atomicAdd(&hist[(k >> shift) & 255], weight((int) seg_off[i]));
+            }
+            __syncthreads();
+            int v = 0, x = 0;
+            if (t < 256) {
+                v = hist[255 - t];
+                x = v;
+#pragma unroll
+                for (int o = 1; o < 32; o <<= 1) {
+                    const int y = __shfl_up_sync(0xffffffffu, x, o);
+                    if (lane >= o) x += y;
+                }
+                if (lane == 31) s_warp[warp] = x;
+            }
+            __syncthreads();
+            if (t < 256) {
+                int inc = x;
+                for (int w2 = 0; w2 < warp; ++w2) inc += s_warp[w2];
+                const int before = abv + inc - v;
+                if (before < width && (abv + inc >= width || t == 255)) { s_digit = 255 - t; s_above = before; }
+            }
+            __syncthreads();
+            pfx |= (uint32_t) s_digit << shift;
+            abv = s_above;
+            __syncthreads();
+        }
+        thr_out = pfx;
+        above_out = abv;
+    };
+    // ---- 1. the samples
+    for (int i = t; i < ns; i += TS2_T) s_key[i] = weight(i * TS2_STRIDE) ? order_key(sc[i * TS2_STRIDE]) : 0u;
+    __syncthreads();
+    // ---- 2. LB = the KS-th largest sample (radix select, 4 passes over <= ns keys)
+    const int ks_want = 2 * (int) ((width + R * TS2_STRIDE - 1) / (R * TS2_STRIDE)) + 16;
+    const int m = ks_want < ns ? ks_want : ns;
+    uint32_t prefix = 0;
+    int above = 0;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        if (t < 256) hist[t] = 0;
+        __syncthreads();
+        const uint32_t hi_mask = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
+        for (int i = t; i < ns; i += TS2_T) {
+            const uint32_t k = s_key[i];
+            if ((k & hi_mask) == (prefix & hi_mask)) atomicAdd(&hist[(k >> shift) & 255], 1);
+        }
+        __syncthreads();
+        int v = 0, x = 0;
+        if (t < 256) {
+            v = hist[255 - t];
+            x = v;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int y = __shfl_up_sync(0xffffffffu, x, o);
+                if (lane >= o) x += y;
+            }
+            if (lane == 31) s_warp[warp] = x;
+        }
+        __syncthreads();
+        if (t < 256) {
+            int inc = x;
+            for (int w2 = 0; w2 < warp; ++w2) inc += s_warp[w2];
+            const int before = above + inc - v;
+            if (before < m && (above + inc >= m || t == 255)) { s_digit = 255 - t; s_above = before; }
+        }
+        __syncthreads();
+        prefix |= (uint32_t) s_digit << shift;
+        above = s_above;
+        __syncthreads();
+    }
+    const uint32_t lb = prefix;
+    // ---- 3. the survivors at or above LB; their weighted cells must reach `width` (then T >= LB and every block at or above T is among them)
+    if (!build(lb, true)) { slow((s_fail & 2) ? 3 : 2); return; }
+    {
+        int c = 0;
+        for (int i = lane; i < cnt; i += 32) c += weight((int) seg_off[i]);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o);
+        if (lane == 0) s_gt[warp] = c;
+    }
+    __syncthreads();
+    if (t == 0) {
+        long long tot = 0;
+        for (int w2 = 0; w2 < 32; ++w2) tot += s_gt[w2];
+        if (tot < width) s_fail = 1;
+    }
+    __syncthreads();
+    if (s_fail) { slow(4); return; }
+    // ---- 4. T = the width-th largest FP16 key; the band [T - 2e, T + 2e] = [T - ee, T + ee]
+    uint32_t thr_a;
+    int above_a;
+    radix(thr_a, above_a);
+    if (thr_a == 0u) { slow(5); return; }                       // uniform
+    const float ta = sx_key_float(thr_a);
+    const uint32_t klo = order_key(__fsub_rd(ta, ee)), khi = order_key(__fadd_ru(ta, ee));
+    // ---- 5. the survivors again: every block with a key >= T - 2e (the band and what is above it)
+    if (!build(klo, false)) { slow(2); return; }
+    // ---- 6. the band's blocks with the FP32 kernel's arithmetic (all warps over the whole list; the tail block's score is exact already)
+    const int total = s_woff[32];
+    int mine = 0;
+    {
+        float4 qr[IDX_HEADS];
+#pragma unroll
+        for (int h = 0; h < IDX_HEADS; ++h) qr[h] = *reinterpret_cast<const float4*>(qrow + h * IDX_DIM + lane * 4);
+        // a warp takes the chunks of 32 list entries warp, warp + 32, ...; the ballot names the band entries of a chunk, four at a time (their key loads in flight together)
+        for (int c0 = warp * 32; c0 < total; c0 += TS2_T) {
+            const int i = c0 + lane;
+            bool in_band = false;
+            if (i < total) in_band = (int) s_off[i] != nbid && s_key[i] <= khi;
+            unsigned msk = __ballot_sync(0xffffffffu, in_band);
+            while (msk) {
+                int idx[4];
+                float4 kv[4];
+                int n = 0;
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    if (msk) { idx[u] = c0 + __ffs(msk) - 1; msk &= msk - 1; n = u + 1; }
+                    else idx[u] = idx[0];                                  // a repeat of the first: computed, not stored
+                }
+#pragma unroll
+                for (int u = 0; u < 4; ++u) kv[u] = *reinterpret_cast<const float4*>(pooled + (int64_t) s_off[idx[u]] * IDX_DIM + lane * 4);
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    const float v = sx_score_rs(kv[u], qr, lane);
+                    if (lane == 0 && u < n) s_key[idx[u]] = order_key(v);
+                }
+                mine += n;
+            }
+        }
+    }
+    __syncthreads();
+    if (stat && lane == 0 && mine) atomicAdd(&stat[3], (unsigned long long) mine);
+    // ---- 7. thr and `above` over the exact keys of the band and the FP16 keys of the rest (T - e <= thr <= T + e: the FP32 kernel's threshold), the engine's digit rule
+    uint32_t thr;
+    int above2;
+    radix(thr, above2);
+    const int eq_budget = (int) (width - above2);
+    // ---- 8. per warp: cells above thr and at thr
+    {
+        int gt = 0, eq = 0;
+        for (int i = lane; i < cnt; i += 32) {
+            const uint32_t k = seg_key[i];
+            const int wg = weight((int) seg_off[i]);
+            if (k > thr) gt += wg;
+            else if (k == thr) eq += wg;
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            gt += __shfl_xor_sync(0xffffffffu, gt, o);
+            eq += __shfl_xor_sync(0xffffffffu, eq, o);
+        }
+        if (lane == 0) { s_gt[warp] = gt; s_eq[warp] = eq; }
+    }
+    __syncthreads();
+    if (t == 0) {
+        int eb = 0, sb = 0;
+        for (int w2 = 0; w2 < 32; ++w2) {
+            const int g2 = s_gt[w2], e2 = s_eq[w2];
+            const int take = eq_budget - eb < 0 ? 0 : (eq_budget - eb > e2 ? e2 : eq_budget - eb);
+            s_gt[w2] = sb;
+            s_eq[w2] = eb;
+            sb += g2 + take;
+            eb += e2;
+        }
+        g_tk_fail[qi] = 0;
+        if (stat) {
+            atomicAdd(&stat[0], 1ull);
+            atomicAdd(&stat[1], (unsigned long long) nbid);
+            atomicAdd(&stat[2], (unsigned long long) total);
+        }
+    }
+    __syncthreads();
+    // ---- 9. emit, the warp's segment in order
+    int run_sel = s_gt[warp], run_eq = s_eq[warp];
+    for (int c0 = 0; c0 < cnt; c0 += 32) {
+        const int i = c0 + lane;
+        const bool vld = i < cnt;
+        const uint32_t k = vld ? seg_key[i] : 0u;
+        const int b = vld ? (int) seg_off[i] : 0;
+        const int wg = vld ? weight(b) : 0;
+        const int my_gt = (vld && k > thr) ? wg : 0, my_eq = (vld && k == thr) ? wg : 0;
+        if (__ballot_sync(0xffffffffu, (my_gt | my_eq) != 0) == 0u) continue;
+        int pe = my_eq;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int y = __shfl_up_sync(0xffffffffu, pe, o);
+            if (lane >= o) pe += y;
+        }
+        const int left = eq_budget - (run_eq + pe - my_eq);
+        const int take = left < 0 ? 0 : (left > my_eq ? my_eq : left);
+        const int my_sel = my_gt + take;
+        int ps = my_sel;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int y = __shfl_up_sync(0xffffffffu, ps, o);
+            if (lane >= o) ps += y;
+        }
+        int32_t* dst = out + run_sel + ps - my_sel;
+        for (int c = 0; c < my_sel; ++c) dst[c] = (int32_t) ((int64_t) b * R + c);
+        run_eq += __shfl_sync(0xffffffffu, pe, 31);
+        run_sel += __shfl_sync(0xffffffffu, ps, 31);
+    }
+}
+#endif  // !__HIPCC__ && STRATA_EXPERIMENTAL_SM60
 }  // namespace
 
 bool qsa_block_scores_slots(const float* const* pooled, const float* const* dead, const float* q_idx,
@@ -2571,6 +3148,66 @@ static bool qsa_topk_sel_launch(const float* scores, const int32_t* steps, int64
     }
     return true;
 }
+
+struct SxAux { float* kpart = nullptr; unsigned long long* stat = nullptr; };
+static SxAux sx_aux(bool want_stat) {
+    static SxAux aux[64];
+    static std::atomic<bool> lock{false};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); dev = 0; }
+    while (lock.exchange(true)) {}
+    SxAux& a = aux[dev];
+    if (a.kpart == nullptr && cudaMalloc((void**) &a.kpart, 8192 * sizeof(float)) != cudaSuccess) { cudaGetLastError(); a.kpart = nullptr; }
+    if (want_stat && a.stat == nullptr) {
+        if (cudaMalloc((void**) &a.stat, 12 * sizeof(unsigned long long)) == cudaSuccess) cudaMemset(a.stat, 0, 12 * sizeof(unsigned long long));
+        else { cudaGetLastError(); a.stat = nullptr; }
+    }
+    const SxAux r = a;
+    lock.store(false);
+    return r;
+}
+
+// STRATA_PF_SEL_EXACT: scores + select of a prompt call in three launches (the FP16 scorer with the bound's key side, the tail block, the filtered exact select) and the wide kernel for the flagged queries;
+// false = not taken (counted), the caller runs the engine's kernels (qsa_block_scores skips the approximate FP16 scorer while this switch is on, so that path is exact too)
+static bool qsa_select_exact_launch(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
+                                    int64_t active_blocks, const QsaShapes& s, float* scores, int32_t* ids, void* stream) {
+    using namespace strata::prefill;
+    int sms = 0;
+    if (!pf2_dev_cc6(sms)) { pf2_fallback(kPf2SelX, kPf2Arch); return false; }
+    const int64_t reach = active_blocks < max_blocks ? active_blocks : max_blocks;
+    const int64_t qtiles = (nq + SH2_Q - 1) / SH2_Q;
+    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || cap < qsa_selection_width(kTopkMaxCells, s) || nq <= 0 || nq > TS_MAXQ || reach <= 0 ||
+        max_blocks < active_blocks || qtiles > 65535) { pf2_fallback(kPf2SelX, kPf2Geometry); return false; }
+    if (active_blocks > (int64_t) 32 * TS2_PERMAX * 32) { pf2_fallback(kPf2SelX, kPf2Length); return false; }
+    if (((uintptr_t) pooled | (uintptr_t) q_idx | (uintptr_t) dead) & 15) { pf2_fallback(kPf2SelX, kPf2Align); return false; }
+    int64_t strips = (sms + qtiles - 1) / qtiles;                                   // CTAs a query tile: one wave, one CTA a SM
+    int64_t strip = ((reach + strips - 1) / strips + 16 * SH2_TG - 1) / (16 * SH2_TG) * (16 * SH2_TG);   // blocks a CTA, whole tiles
+    if (strip < 16 * SH2_TG * 2) strip = 16 * SH2_TG * 2;
+    strips = (reach + strip - 1) / strip;
+    if (strips * qtiles > 8192) { pf2_fallback(kPf2SelX, kPf2Geometry); return false; }
+    static const bool stats = pf_env_on("STRATA_PF_SEL_EXACT_STATS");   // debug: syncs after every call
+    const SxAux aux = sx_aux(stats);
+    if (aux.kpart == nullptr) { pf2_fallback(kPf2SelX, kPf2Length); return false; }   // no room for 32 KB: the old pair runs
+    ktime::begin(ktime::kSelScores, stream);
+    sel_scores_h2x_kernel<<<dim3((unsigned) strips, (unsigned) qtiles), 256, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach, strip, scores, aux.kpart);
+    ktime::begin(ktime::kSelTail, stream);
+    block_scores_tail_kernel<<<(unsigned) nq, 32, 0, (cudaStream_t) stream>>>(dead, q_idx, steps, max_blocks, scores);
+    ktime::begin(ktime::kSelTopk, stream);
+    block_topk_selx_kernel<<<(unsigned) nq, TS2_T, 0, (cudaStream_t) stream>>>(pooled, q_idx, scores, steps, max_blocks, cap, ids, (int) strips, aux.kpart, stats ? aux.stat : nullptr);
+    block_topk_wide_kernel<true, false><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);   // the flagged queries only
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_select_exact: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    pf2_launched(kPf2SelX);
+    if (stats && aux.stat != nullptr) {
+        unsigned long long z[12] = {0}, v[12] = {0};
+        cudaStreamSynchronize((cudaStream_t) stream);
+        if (cudaMemcpy(v, aux.stat, sizeof v, cudaMemcpyDeviceToHost) == cudaSuccess && cudaMemcpy(aux.stat, z, sizeof z, cudaMemcpyHostToDevice) == cudaSuccess) {
+            g_pf2.selx_queries.fetch_add(v[0]); g_pf2.selx_blocks.fetch_add(v[1]); g_pf2.selx_survivors.fetch_add(v[2]); g_pf2.selx_band.fetch_add(v[3]); g_pf2.selx_slow.fetch_add(v[4]);
+            for (int w = 0; w < 6; ++w) g_pf2.selx_why[w].fetch_add(v[5 + w]);
+        }
+    }
+    return true;
+}
 #endif
 
 // #1825: the prompt path's thread-per-head scorer (bitwise the warp kernel's scores).  Default: Turing with
@@ -2675,7 +3312,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
 #else
 #if defined(STRATA_EXPERIMENTAL_SM60)
     // STRATA_PF_HFMA_SEL (default off): the FP16 pair scorer (sm_60); a call it cannot take is counted and runs on below
-    if (active_blocks > 0 && strata::prefill::pf_hfma_sel()) {
+    if (active_blocks > 0 && strata::prefill::pf_hfma_sel() && !strata::prefill::pf_sel_exact()) {   // STRATA_PF_SEL_EXACT=1: the calls it cannot take run the FP32 kernel, not this approximation
         ktime::begin(ktime::kSelScores, stream);
         if (qsa_scores_hfma_launch(pooled, q_idx, steps, nq, max_blocks, reach, scores, stream)) {
             ktime::begin(ktime::kSelTail, stream);
@@ -2846,6 +3483,18 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_tc: %s\n", cudaGetErrorString(e)); std::exit(1); }
     return true;
 #endif
+}
+
+// STRATA_PF_SEL_EXACT (default off): scores + selection of a prompt call (active_blocks > 0) with the FP32 scorer + top-k's EXACT ids, on the FP16 pair scorer as a filter; false = nothing launched
+bool qsa_select_exact(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap, const QsaShapes& s,
+                      float* scores, int32_t* ids, void* stream, int64_t active_blocks) {
+#if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
+    if (active_blocks > 0 && strata::prefill::pf_sel_exact())
+        return qsa_select_exact_launch(pooled, dead, q_idx, steps, nq, max_blocks, cap, active_blocks, s, scores, ids, stream);
+#else
+    (void) pooled; (void) dead; (void) q_idx; (void) steps; (void) nq; (void) max_blocks; (void) cap; (void) s; (void) scores; (void) ids; (void) stream; (void) active_blocks;
+#endif
+    return false;
 }
 
 void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
