@@ -390,6 +390,7 @@ __global__ void __launch_bounds__(64) ps_value_d4_kernel(QsaAttnPools p, const i
 // STRATA_PF_HFMA_ATTN: the FP16 score kernel (and, =2, the FP16 value kernel); see the two headers
 #include "qsa_pattn_h16.cuh"
 #include "qsa_pattn_h16v.cuh"
+#include "qsa_pattn_h16p.cuh"
 
 bool sm6x_device() {
     static int cc[64] = {};
@@ -470,6 +471,8 @@ namespace {
 struct H16Stats {
     std::mutex mu;
     long long taken[64] = {};
+    long long persist_taken[64] = {};      // score launches on the persistent kernel (STRATA_PF_ATTN_PERSIST)
+    long long persist_fallback[64] = {};   // ... that failed to launch and ran on ps_score_h_kernel
     bool used[64] = {};
     std::map<std::string, long long> left[64];
 };
@@ -488,6 +491,23 @@ void h16_left(const char* why) {
     const int d = h16_dev();
     s.used[d] = true;
     s.left[d][why] += 1;
+}
+void h16_persist_count(bool ok) {
+    H16Stats& s = h16_stats();
+    std::lock_guard<std::mutex> lk(s.mu);
+    (ok ? s.persist_taken : s.persist_fallback)[h16_dev()] += 1;
+}
+// STRATA_PF_ATTN_PERSIST (default off, needs STRATA_PF_HFMA_ATTN): the score kernel as a persistent CTA (qsa_pattn_h16p.cuh), bitwise
+// the same scratch as ps_score_h_kernel's; a launch that fails runs ps_score_h_kernel for that batch (counted)
+bool h16_persist() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PF_ATTN_PERSIST");
+        const bool x = v != nullptr && *v != '\0' && std::atoi(v) != 0;
+        if (x) std::fprintf(stderr, "strata pattn: STRATA_PF_ATTN_PERSIST=1: the FP16 score kernel runs as a persistent CTA of %d chunks "
+                                    "(bitwise the same scratch)\n", SP_NPC);
+        return x;
+    }();
+    return on;
 }
 void h16_taken() {
     H16Stats& s = h16_stats();
@@ -550,13 +570,33 @@ bool qsa_pattn_h16_batch_any_arch(const float* q, const QsaAttnPools& pools, con
         float* const ab = attn + (size_t) t0 * s.n_head * HD;
         ktime::begin(ktime::kAttnScore, st);
         if (mode >= 2) {
-            ps_score_h_kernel<true><<<g1, SH_T, 0, st>>>(qb, pools, ib, sb, (int) s.n_head_kv, (int) s.page_size, scale, scratch,
-                                                         n_chunks, (int) cap);
+            bool done = false;
+            if (h16_persist()) {
+                const int stride = (n_chunks + SP_NPC - 1) / SP_NPC;
+                const dim3 gp((unsigned) stride, (unsigned) s.n_head_kv, (unsigned) nb);
+                ps_score_hp_kernel<true><<<gp, SH_T, 0, st>>>(qb, pools, ib, sb, (int) s.n_head_kv, (int) s.page_size, scale, scratch,
+                                                              n_chunks, (int) cap, stride);
+                done = cudaGetLastError() == cudaSuccess;
+                h16_persist_count(done);
+            }
+            if (!done)
+                ps_score_h_kernel<true><<<g1, SH_T, 0, st>>>(qb, pools, ib, sb, (int) s.n_head_kv, (int) s.page_size, scale, scratch,
+                                                             n_chunks, (int) cap);
             ktime::begin(ktime::kAttnValue, st);
             ps_value_h_kernel<<<g2, VH_T, 0, st>>>(pools, sb, scratch, (int) s.n_head_kv, n_chunks, ab);
         } else {
-            ps_score_h_kernel<false><<<g1, SH_T, 0, st>>>(qb, pools, ib, sb, (int) s.n_head_kv, (int) s.page_size, scale, scratch,
-                                                          n_chunks, (int) cap);
+            bool done = false;
+            if (h16_persist()) {
+                const int stride = (n_chunks + SP_NPC - 1) / SP_NPC;
+                const dim3 gp((unsigned) stride, (unsigned) s.n_head_kv, (unsigned) nb);
+                ps_score_hp_kernel<false><<<gp, SH_T, 0, st>>>(qb, pools, ib, sb, (int) s.n_head_kv, (int) s.page_size, scale, scratch,
+                                                               n_chunks, (int) cap, stride);
+                done = cudaGetLastError() == cudaSuccess;
+                h16_persist_count(done);
+            }
+            if (!done)
+                ps_score_h_kernel<false><<<g1, SH_T, 0, st>>>(qb, pools, ib, sb, (int) s.n_head_kv, (int) s.page_size, scale, scratch,
+                                                              n_chunks, (int) cap);
             ktime::begin(ktime::kAttnValue, st);
             ps_value_d4_kernel<<<g2, 64, 0, st>>>(pools, sb, scratch, (int) s.n_head_kv, n_chunks, ab);
         }
@@ -602,6 +642,11 @@ void qsa_pattn_h16_report(int64_t tokens) {
         std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_ATTN: read of %lld tokens, CUDA%d: %lld attention calls on the FP16 kernels, "
                              "%lld left to the bit-exact kernels%s%s; %llu value CTAs redone in FP32 (non-finite FP16 sum)\n",
                      (long long) tokens, d, s.taken[d], left, by.c_str(), by.empty() ? "" : ")", redo);
+        if (h16_persist())
+            std::fprintf(stderr, "strata prefill: STRATA_PF_ATTN_PERSIST: CUDA%d: %lld score launches on the persistent kernel, %lld fell back to "
+                                 "ps_score_h_kernel (launch failed)\n", d, s.persist_taken[d], s.persist_fallback[d]);
+        s.persist_taken[d] = 0;
+        s.persist_fallback[d] = 0;
         s.taken[d] = 0;
         s.left[d].clear();
         s.used[d] = false;

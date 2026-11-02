@@ -40,6 +40,9 @@ bool qsa_pattn_batch(const float* q, const QsaAttnPools& pools, const int32_t* i
 /// STRATA_PF_HFMA_ATTN (prompt reads only, needs STRATA_PATTN_SM60=1, default off, not bitwise): 0 off; 1 the score kernel on FP16
 /// HFMA2 pairs (qsa_pattn_h16.cuh) with the usual value kernel; 2 the value kernel on FP16 pairs too (qsa_pattn_h16v.cuh).
 /// qsa_pattn_batch tries the FP16 kernels first and runs the bit-exact ones for whatever they refuse (counted by reason).
+/// STRATA_PF_ATTN_PERSIST=1 (default off, with STRATA_PF_HFMA_ATTN): the score kernel as a persistent CTA with a fused epilogue
+/// (qsa_pattn_h16p.cuh), bitwise the same scratch as ps_score_h_kernel's; a launch that fails runs ps_score_h_kernel (counted in
+/// the qsa_pattn_h16_report line).
 int pattn_h16_mode();
 
 /// The FP16 kernels alone (no compute-capability test; mode 1 or 2): false = not applicable or a launch failed, nothing the caller
