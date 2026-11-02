@@ -2785,6 +2785,7 @@ bool hc_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, in
         gm.bf16_hfma(X, x_f16, (const uint16_t*) w->data, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy, ldx, w->hc_q8 == nullptr,
                      X_lo != nullptr, name.c_str()))
         return true;
+    strata::kernels::ktime::begin(strata::kernels::ktime::kHcProjOld, stream);   // (STRATA_PREFILL_TIMING=2) the old route, all of it
     return bf16_proj(gm, w, X, Y, T, name, err, ldy, X_lo, ldx, stream, x_f16);
 }
 
@@ -3195,6 +3196,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
 #endif
         ++stats_.chunks;
         pt.mark(kPfStart, cs);
+        // STRATA_PREFILL_TIMING=2: "embed+steps" by what runs - kt(id) starts the segment `id`, which lasts to the next kt()
+        auto kt = [&m](int id) { strata::kernels::ktime::begin(id, m.cs); };
+        namespace ktid = strata::kernels::ktime;
+        kt(hand_in_ == nullptr ? ktid::kEsEmbed : ktid::kEsHandIn);
         const auto tsetup = Clock::now();
         // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
         // previous stage handed on
@@ -3288,7 +3293,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 ++t;
             }
         }
-        if (hand_in_ == nullptr) gr_broadcast(m.emb, m.R, T, m.cs);
+        if (hand_in_ == nullptr) {
+            kt(ktid::kEsBcast);
+            gr_broadcast(m.emb, m.R, T, m.cs);
+        }
         // ---- the PLE rows of the whole chunk, one batched SSD request on a thread (see ple_gather).  A later chunk's
         // were read ahead during the previous chunk; the first chunk's are read beside layer 0 - they are needed from
         // layer 1 on, and gathering them here first left the GPU idle for the whole read (~0.4 s of a 32K prompt)
@@ -3349,6 +3357,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             stats_.ms_ple += ms_since(tp);
             return true;
         };
+        kt(ktid::kEsSteps);
         for (int64_t t = 0; t < T; ++t) { prev[0] = prev[1]; prev[1] = (int32_t) tokens[c0 + t]; }
         // ---- the QSA step records of every position in the chunk
         for (int64_t t = 0; t < T; ++t) strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, p0 + t, s);
@@ -3391,6 +3400,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // step 3: this chunk's stream - every non-resident expert of every layer, layer by layer in id order (entry
         // k lands in ring slot k % ring); a copy is issued once the entry `ring` before it is consumed (its slot's
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
+        kt(ktid::kEsPlan);   // (lasts to the first layer's hc norm)
         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
         const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
         // the CPU share: this chunk takes the pool if no other stage of a layer split has it now (released at the end
@@ -3787,8 +3797,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 const int64_t ldx = hc_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) && !gr_unfused() &&
                                             !m.xn16_lo ? D + XN_PAD : D;
                 const bool xf16 = m.xn_f16 && !m.xn16_lo && ldx == D;   // xn16 holds FP16 (its writers and readers below)
-                if (gr_unfused()) gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs, m.xn16_lo, xf16);
-                else if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.grs, m.xn16, T, m.cs, m.xn16_lo, ldx, xf16);
+                if (gr_unfused()) { kt(ktid::kHcNorm); gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs, m.xn16_lo, xf16); }
+                else if (!normed) { kt(ktid::kHcNorm); gr_norm_rs(m.R, (const float*) wn->data, EPS, m.grs, m.xn16, T, m.cs, m.xn16_lo, ldx, xf16); }
                 normed = false;
                 bool moe_wrote = false;   // the MoE half's combine also did the write below (moe_combine_write_norm_rs)
                 bool hcd = false;
@@ -3807,6 +3817,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     hcd = true;
                 }
                 if (!hcd && !hdown && !hc_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
+                kt(ktid::kHcSilu);
                 gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
                 bool upmixed = false;
                 if (wu->q8_scale == nullptr && hc_upmix() && T >= std::max(pf_switch_min_t(), hc_upmix_min_t()) && !gr_unfused() && !m.lo16_lo && !m.mixed_bf_lo &&
@@ -3831,6 +3842,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                      "max |diff| %.3e (%s)\n", (long long) l, half, (long long) T,
                                      std::sqrt(e2 / std::max(r2, 1e-30)), emax, upmixed ? "upmix" : "upmix refused");
                     } else {
+                        kt(ktid::kHcUpmix);
                         upmixed = gr_upmix(m.lo16, (const uint16_t*) wu->data, m.R, m.grs, (const float*) wn->data,
                                            m.mixed, m.mixed_bf, m.mixed_h, T, m.cs);
                     }
@@ -3839,11 +3851,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (!hcd && !hc_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
                 if (upmixed) {
                 } else if (gr_unfused()) {
+                    kt(ktid::kHcMix);
                     gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h, m.mixed_bf_lo);
                 } else {
+                    kt(ktid::kHcMix);
                     gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
                              m.mixed_bf_lo);
                 }
+                kt(ktid::kOther);   // the hyper-connection read ends here
 
                 if (wd_q8.data) {   // the HC GEMMs that read the scratch are enqueued: the next user waits for them
                     core::NativeDense::hc_bf16_release(m.cs, 0, 0);
@@ -5750,6 +5765,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         stats_.tokens += T;
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);
+        // (as pt: stage 0's gap to its next chunk is "embed+steps"; the last chunk of a call has no successor, so nothing is carried to the next call)
+        kt(hand_in_ == nullptr && c0 + C < n ? ktid::kEsTail : ktid::kOther);
         if (next_ != nullptr) {
             // The current hand-off slot was used two chunks ago.
             float* h = m.hand[hand_buf_];

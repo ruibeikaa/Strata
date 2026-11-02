@@ -25,11 +25,33 @@ enum Id : int {
     kAttnValue,    // ps_value_d4_kernel or the FP16 twin
     kGdnRec,       // gdn_rec_cols_pipe_kernel (the token chain)
     kGdnNorm,      // gdn_out_norm_kernel (output normalisation + gate, y16)
+    // "hc read" (the hyper-connection read of each half), one id per kernel group, in launch order:
+    kHcNorm,       // gr_norm_rs: RMS row scale of R (HC streams) + the FP16 image xn16
+    kHcXmax,       // bf16_hfma: the 4-byte memset + xmax_kernel (max |x| of the slice)
+    kHcCvt,        // bf16_hfma: cvt_kernel (the slice's activation to FP16 x 2^-k)
+    kHcGemmDown,   // bf16_hfma: the down product (ysc_kernel + SASS or gemm_sk_kernel)
+    kHcReduce,     // bf16_hfma: reduce_kernel (split-K parts -> Y)
+    kHcSilu,       // gr_silu: lo -> lo16
+    kHcGemmUp,     // bf16_hfma: the up product
+    kHcGemmInj,    // bf16_hfma: the inject product
+    kHcProjOld,    // hc_proj when the HFMA2 route declined: the old GEMM (all of it)
+    kHcUpmix,      // gr_upmix (sm_80+ only)
+    kHcMix,        // gr_mix_r / gr_mix: the weighted sum of the HC streams -> mixed (fp32, bf16, fp16)
+    // "embed+steps" (the phase between the chunk's first mark and its first layer's hc read), by what the host/GPU do:
+    kEsEmbed,      // stage 0: token ids up + embedding gather (host loop included)
+    kEsHandIn,     // later stages: wait for the previous stage's pieces + the residual rows' upload
+    kEsBcast,      // stage 0: gr_broadcast of the embedding to the HC streams (+ the PLE thread start)
+    kEsSteps,      // QSA step records: host fill + upload (+ KV prefetch)
+    kEsPlan,       // the chunk's expert stream plan, stager, issuer thread, up to the first layer's hc norm
+    kEsTail,       // stage 0 only: from the end of chunk c (hand-off download, waits) to the start of chunk c+1
     kIdCount
 };
 inline const char* name(int id) {
     static const char* const n[kIdCount] = {"other", "select scores", "select tail", "select top-k", "attn score",
-                                            "attn value", "gdn recurrence", "gdn out norm"};
+                                            "attn value", "gdn recurrence", "gdn out norm",
+                                            "hc norm", "hc act max", "hc act->fp16", "hc gemm down", "hc split-K reduce", "hc silu",
+                                            "hc gemm up", "hc gemm inject", "hc proj old route", "hc upmix", "hc mix",
+                                            "es embed", "es hand-in", "es broadcast", "es steps", "es plan", "es chunk tail"};
     return id >= 0 && id < kIdCount ? n[id] : "?";
 }
 inline bool on() {

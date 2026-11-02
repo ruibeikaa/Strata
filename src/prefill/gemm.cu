@@ -40,6 +40,7 @@
 #include "gemm_hfma.cuh"   // STRATA_PF_HFMA
 #include "gemm_hfma_hc.cuh"   // STRATA_PF_HFMA_HC
 #include "gemm_sass.cuh"   // STRATA_PF_HFMA_SASS
+#include "strata/kernels/ktime.hpp"   // STRATA_PREFILL_TIMING=2: the hyper-connection products' kernels
 #include <cctype>
 #include <cmath>
 #include <map>
@@ -1636,14 +1637,18 @@ bool Gemm::bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y,
         const int Z = zs[i];
         const int64_t n8 = rows * K / 8, K8 = K / 8, ldx8 = ldx / 8;
         const unsigned blocks = (unsigned) std::max<int64_t>(1, std::min<int64_t>(2048, (n8 + 1023) / 1024));
+        namespace kt = strata::kernels::ktime;   // (no-ops unless STRATA_PREFILL_TIMING=2)
+        kt::begin(kt::kHcXmax, st);
         cudaMemsetAsync(sp, 0, sizeof(unsigned), st);   // HcState::cur is its first member
         const uint4* xs = reinterpret_cast<const uint4*>(X + t0 * ldx);
         if (x_f16) hcn::xmax_kernel<true><<<blocks, 256, 0, st>>>(xs, n8, K8, ldx8);
         else hcn::xmax_kernel<false><<<blocks, 256, 0, st>>>(xs, n8, K8, ldx8);
+        kt::begin(kt::kHcCvt, st);
         if (x_f16) hcn::cvt_kernel<true><<<blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(x16), n8, K8, ldx8, hw.wmax);
         else hcn::cvt_kernel<false><<<blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(x16), n8, K8, ldx8, hw.wmax);
         const dim3 grid((unsigned) ((N + 127) / 128), (unsigned) ((rows + 127) / 128), (unsigned) Z);
         float* const y = Y + t0 * ldy;
+        kt::begin(prod == 0 ? kt::kHcGemmDown : prod == 1 ? kt::kHcGemmUp : kt::kHcGemmInj, st);
         bool by_sass = false;
         if (sass_ysc != nullptr && sass_sink != nullptr) {   // the hand-scheduled twin of gemm_sk_kernel: it takes the scale from a word the kernel below writes
             hcn::ysc_kernel<<<1, 1, 0, st>>>(sass_ysc, hw.wmax);
@@ -1668,7 +1673,10 @@ bool Gemm::bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y,
             hcn::gemm_sk_kernel<<<grid, hfma::kThreads, 0, st>>>(reinterpret_cast<const uint4*>(x16), reinterpret_cast<const uint4*>(hw.p),
                                                                  Z > 1 ? part : y, (int) rows, (int) N, (int) K, (int) K8, Z > 1 ? N : ldy,
                                                                  rows * N, Z, hw.wmax);
-        if (Z > 1) hcn::reduce_kernel<<<(unsigned) std::min<int64_t>(2048, (rows * N + 255) / 256), 256, 0, st>>>(part, y, rows, N, ldy, Z, rows * N);
+        if (Z > 1) {
+            kt::begin(kt::kHcReduce, st);
+            hcn::reduce_kernel<<<(unsigned) std::min<int64_t>(2048, (rows * N + 255) / 256), 256, 0, st>>>(part, y, rows, N, ldy, Z, rows * N);
+        }
         if (by_sass && sass_verify_on())
             sass_verify_hc(dev, prod, x16, hw.p, y, rows, N, K, hc_pick_z((N + 127) / 128, (rows + 127) / 128, K, nsm), hw.wmax, st);
     }
