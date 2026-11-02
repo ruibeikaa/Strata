@@ -110,11 +110,16 @@ __device__ __forceinline__ void decode_item_w(const uint4 u, const uint32_t h0, 
 }
 
 // the big passes: direct code loads, one barrier a step
-template <int TPP, int FAM, int MINB, bool FULL>
+// SC4 (STRATA_PF_HFMA_CLASSES_SC4, IQ2_S / IQ2_XS only; kf-work\wide2 cands\n1.cuh, mask 330): a row's scale bytes are read as ONE uint4 and its d values as ONE
+// uint32 every four steps (instead of an LDG.32 and an LDG.U16 a step), row B's item is decoded before row A's, the token groups of the HFMA2 loop are visited
+// in descending order and the tokens of a group descending.  Only the schedule moves: every token's lane sums are the same products in the same order.
+template <int TPP, int FAM, int MINB, bool FULL, bool SC4 = false>
 __global__ void __launch_bounds__(W_NT, MINB) gd_kernel(const Chunk* __restrict__ chunks, const char* __restrict__ w,
                                                        const int64_t* __restrict__ xoff, const uint4* __restrict__ xh,
                                                        const int32_t* __restrict__ src, float* __restrict__ dst, const int layer, const int note) {
     static_assert(TPP % 8 == 0, "");
+    static_assert(!SC4 || FAM == 0, "the wide scale loads are for IQ2_S / IQ2_XS");
+    static_assert(!SC4 || (nb::kScOff % 16 == 0 && nb::kDOff % 4 == 0 && ITEMS % 16 == 0 && NB % 2 == 0), "the wide scale loads need 16-byte scale rows and 4-byte d rows");
     constexpr int NAS = TPP / 8;
     __shared__ __align__(16) uint4 act_s[2][TPP * 16];
     __shared__ uint32_t lut[FAM == 3 ? 256 : 1];   // FAM 3: the (unused) table changes ptxas' schedule: +9% measured on this kernel
@@ -179,11 +184,27 @@ __global__ void __launch_bounds__(W_NT, MINB) gd_kernel(const Chunk* __restrict_
         };
         float fdA = 0.0f, fdB = 0.0f;
         uint4 cA = __ldg(cgA), cB = __ldg(cgB);                 // item 0
+        uint4 sA4 = make_uint4(0u, 0u, 0u, 0u), sB4 = make_uint4(0u, 0u, 0u, 0u);   // SC4: the scale bytes of four steps
+        uint32_t dA2 = 0u, dB2 = 0u;                                                  // SC4: the d values of four steps
 #pragma unroll 1
         for (int hc = 0; hc < NSTEP; ++hc) {
             const int kc = hc >> 1;
-            const uint32_t scvA = __ldg(scwA + hc), scvB = __ldg(scwB + hc);
-            const int dvA = (int) __ldg(drA + kc), dvB = (int) __ldg(drB + kc);
+            uint32_t scvA, scvB;
+            int dvA, dvB;
+            if constexpr (SC4) {
+                if ((hc & 3) == 0) {
+                    sA4 = __ldg((const uint4*) scwA + (hc >> 2)); sB4 = __ldg((const uint4*) scwB + (hc >> 2));
+                    dA2 = __ldg((const uint32_t*) drA + (hc >> 2)); dB2 = __ldg((const uint32_t*) drB + (hc >> 2));
+                }
+                const int q = hc & 3;
+                scvA = q == 0 ? sA4.x : q == 1 ? sA4.y : q == 2 ? sA4.z : sA4.w;
+                scvB = q == 0 ? sB4.x : q == 1 ? sB4.y : q == 2 ? sB4.z : sB4.w;
+                dvA = (int) ((hc & 2) ? (dA2 >> 16) : (dA2 & 0xFFFFu));
+                dvB = (int) ((hc & 2) ? (dB2 >> 16) : (dB2 & 0xFFFFu));
+            } else {
+                scvA = __ldg(scwA + hc); scvB = __ldg(scwB + hc);
+                dvA = (int) __ldg(drA + kc); dvB = (int) __ldg(drB + kc);
+            }
             uint4 av[NAS];
 #pragma unroll
             for (int i = 0; i < NAS; ++i) av[i] = (FULL || ap[i] != nullptr) ? __ldg(ap[i] + hc * 16) : make_uint4(0u, 0u, 0u, 0u);
@@ -206,39 +227,79 @@ __global__ void __launch_bounds__(W_NT, MINB) gd_kernel(const Chunk* __restrict_
                 const int itn = min(4 * hc + s + 1, ITEMS - 1);
                 const uint4 nA = __ldg(cgA + itn), nB = __ldg(cgB + itn);   // next item's codes, in flight during this item's work
                 uint32_t wa[16], wb[16];
-                {
-                    const int ls = (int) ((scvA >> (8 * s)) & 0xFF);
-                    uint32_t h0, h1, n0 = 0u, n1 = 0u;
-                    if constexpr (FAM == 0) { const uint2 u0 = hn_tab[ls & 15], u1 = hn_tab[(ls >> 4) & 15]; h0 = u0.x; n0 = u0.y; h1 = u1.x; n1 = u1.y; }
-                    else { const uint2 u0 = hn_tab[ls & 31]; h0 = u0.x; h1 = h0; n0 = u0.y; n1 = n0; }
-                    decode_item_w<FAM>(cA, h0, h1, n0, n1, wa);
-                }
-                {
-                    const int ls = (int) ((scvB >> (8 * s)) & 0xFF);
-                    uint32_t h0, h1, n0 = 0u, n1 = 0u;
-                    if constexpr (FAM == 0) { const uint2 u0 = hn_tab[ls & 15], u1 = hn_tab[(ls >> 4) & 15]; h0 = u0.x; n0 = u0.y; h1 = u1.x; n1 = u1.y; }
-                    else { const uint2 u0 = hn_tab[ls & 31]; h0 = u0.x; h1 = h0; n0 = u0.y; n1 = n0; }
-                    decode_item_w<FAM>(cB, h0, h1, n0, n1, wb);
+                if constexpr (SC4) {
+                    auto decA = [&] {
+                        const int ls = (int) ((scvA >> (8 * s)) & 0xFF);
+                        const uint2 u0 = hn_tab[ls & 15], u1 = hn_tab[(ls >> 4) & 15];
+                        decode_item_w<FAM>(cA, u0.x, u1.x, u0.y, u1.y, wa);
+                    };
+                    auto decB = [&] {
+                        const int ls = (int) ((scvB >> (8 * s)) & 0xFF);
+                        const uint2 u0 = hn_tab[ls & 15], u1 = hn_tab[(ls >> 4) & 15];
+                        decode_item_w<FAM>(cB, u0.x, u1.x, u0.y, u1.y, wb);
+                    };
+                    decB();
+                    decA();
+                } else {
+                    {
+                        const int ls = (int) ((scvA >> (8 * s)) & 0xFF);
+                        uint32_t h0, h1, n0 = 0u, n1 = 0u;
+                        if constexpr (FAM == 0) { const uint2 u0 = hn_tab[ls & 15], u1 = hn_tab[(ls >> 4) & 15]; h0 = u0.x; n0 = u0.y; h1 = u1.x; n1 = u1.y; }
+                        else { const uint2 u0 = hn_tab[ls & 31]; h0 = u0.x; h1 = h0; n0 = u0.y; n1 = n0; }
+                        decode_item_w<FAM>(cA, h0, h1, n0, n1, wa);
+                    }
+                    {
+                        const int ls = (int) ((scvB >> (8 * s)) & 0xFF);
+                        uint32_t h0, h1, n0 = 0u, n1 = 0u;
+                        if constexpr (FAM == 0) { const uint2 u0 = hn_tab[ls & 15], u1 = hn_tab[(ls >> 4) & 15]; h0 = u0.x; n0 = u0.y; h1 = u1.x; n1 = u1.y; }
+                        else { const uint2 u0 = hn_tab[ls & 31]; h0 = u0.x; h1 = h0; n0 = u0.y; n1 = n0; }
+                        decode_item_w<FAM>(cB, h0, h1, n0, n1, wb);
+                    }
                 }
                 cA = nA; cB = nB;
                 const uint32_t abase = (uint32_t) __cvta_generic_to_shared(act + 4 * s);
+                if constexpr (SC4) {
 #pragma unroll
-                for (int t0 = 0; t0 < TPP; t0 += 4) {
-                    if (t0 < nt) {
+                    for (int g0 = 0; g0 < TPP / 4; ++g0) {
+                        const int t0 = (TPP / 4 - 1 - g0) * 4;   // the groups descending
+                        if (t0 < nt) {
 #pragma unroll
-                        for (int t = t0; t < t0 + 4; ++t) {
-                            uint32_t ha = hA[t], hb = hB[t];
+                            for (int tt = 0; tt < 4; ++tt) {
+                                const int t = t0 + 3 - tt;   // and the tokens of a group descending
+                                uint32_t ha = hA[t], hb = hB[t];
 #pragma unroll
-                            for (int m = 0; m < 4; ++m) {
-                                const uint32_t a0 = lds32(abase + (t * 16 + m) * 16 + 0), a1 = lds32(abase + (t * 16 + m) * 16 + 4);
-                                const uint32_t a2 = lds32(abase + (t * 16 + m) * 16 + 8), a3 = lds32(abase + (t * 16 + m) * 16 + 12);
-                                ha = hfma2(wa[4 * m + 0], a0, ha);  hb = hfma2(wb[4 * m + 0], a0, hb);
-                                ha = hfma2(wa[4 * m + 1], a1, ha);  hb = hfma2(wb[4 * m + 1], a1, hb);
-                                ha = hfma2(wa[4 * m + 2], a2, ha);  hb = hfma2(wb[4 * m + 2], a2, hb);
-                                ha = hfma2(wa[4 * m + 3], a3, ha);  hb = hfma2(wb[4 * m + 3], a3, hb);
+                                for (int m = 0; m < 4; ++m) {
+                                    const uint32_t a0 = lds32(abase + (t * 16 + m) * 16 + 0), a1 = lds32(abase + (t * 16 + m) * 16 + 4);
+                                    const uint32_t a2 = lds32(abase + (t * 16 + m) * 16 + 8), a3 = lds32(abase + (t * 16 + m) * 16 + 12);
+                                    ha = hfma2(wa[4 * m + 0], a0, ha);  hb = hfma2(wb[4 * m + 0], a0, hb);
+                                    ha = hfma2(wa[4 * m + 1], a1, ha);  hb = hfma2(wb[4 * m + 1], a1, hb);
+                                    ha = hfma2(wa[4 * m + 2], a2, ha);  hb = hfma2(wb[4 * m + 2], a2, hb);
+                                    ha = hfma2(wa[4 * m + 3], a3, ha);  hb = hfma2(wb[4 * m + 3], a3, hb);
+                                }
+                                hA[t] = ha;
+                                hB[t] = hb;
                             }
-                            hA[t] = ha;
-                            hB[t] = hb;
+                        }
+                    }
+                } else {
+#pragma unroll
+                    for (int t0 = 0; t0 < TPP; t0 += 4) {
+                        if (t0 < nt) {
+#pragma unroll
+                            for (int t = t0; t < t0 + 4; ++t) {
+                                uint32_t ha = hA[t], hb = hB[t];
+#pragma unroll
+                                for (int m = 0; m < 4; ++m) {
+                                    const uint32_t a0 = lds32(abase + (t * 16 + m) * 16 + 0), a1 = lds32(abase + (t * 16 + m) * 16 + 4);
+                                    const uint32_t a2 = lds32(abase + (t * 16 + m) * 16 + 8), a3 = lds32(abase + (t * 16 + m) * 16 + 12);
+                                    ha = hfma2(wa[4 * m + 0], a0, ha);  hb = hfma2(wb[4 * m + 0], a0, hb);
+                                    ha = hfma2(wa[4 * m + 1], a1, ha);  hb = hfma2(wb[4 * m + 1], a1, hb);
+                                    ha = hfma2(wa[4 * m + 2], a2, ha);  hb = hfma2(wb[4 * m + 2], a2, hb);
+                                    ha = hfma2(wa[4 * m + 3], a3, ha);  hb = hfma2(wb[4 * m + 3], a3, hb);
+                                }
+                                hA[t] = ha;
+                                hB[t] = hb;
+                            }
                         }
                     }
                 }
