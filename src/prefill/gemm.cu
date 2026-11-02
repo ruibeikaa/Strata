@@ -40,6 +40,7 @@
 #include "gemm_hfma.cuh"   // STRATA_PF_HFMA
 #include "gemm_hfma_hc.cuh"   // STRATA_PF_HFMA_HC
 #include "gemm_sass.cuh"   // STRATA_PF_HFMA_SASS
+#include "strata/prefill/pf_small.hpp"   // STRATA_PF_HFMA_SMALL
 #include "strata/kernels/ktime.hpp"   // STRATA_PREFILL_TIMING=2: the hyper-connection products' kernels
 #include <cctype>
 #include <cmath>
@@ -1532,7 +1533,7 @@ void gemm_hfma_report(int64_t tokens) {
 // `resident`: W is the pack's own resident tensor (not a scratch view, whose address is not a key); `x_lo`: a BF16X2 low part
 // follows (a second accumulating product this route does not do).
 bool Gemm::bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
-                     int64_t ldx, bool resident, bool x_lo, const char* name) {
+                     int64_t ldx, bool resident, bool x_lo, const char* name, HcCompanion* comp) {
     namespace hcn = strata::prefill::hfma::hc;
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
@@ -1556,8 +1557,30 @@ bool Gemm::bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y,
         hw = hc_weight(W, N, K, st, dev);
         if (hw.p == nullptr) why = hw.why != nullptr ? hw.why : "no FP16 copy";
     }
-    // the slices (at most 1024 tokens: the FP16 image of the activation and the split-K parts fit a small scratch) and their splits
+    // STRATA_PF_HFMA_SMALL: the fused max + FP16 image (n8 below 2^31), and the inject product beside the down product when its weight can
+    // take the route too.  The shift of the pair is picked from the larger max |w| of the two: the very value without the companion.
     constexpr int64_t kSl = 1024;
+    const bool small = why == nullptr && pf_hfma_small() && kSl * (K / 8) < ((int64_t) 1 << 31);
+    HcW hw2;
+    if (small && comp != nullptr && comp->W != nullptr) {
+        const char* w2why = nullptr;
+        if (comp->N != 4 || K != 10240) w2why = "inject: not N 4 / K 10240";
+        else if (!comp->resident) w2why = "inject: a scratch view of the weight";
+        else if (comp->ldy != 0 && comp->ldy < comp->N) w2why = "inject: Y row stride";
+        else if (((uintptr_t) comp->W & 15) != 0) w2why = "inject: W not 16-byte aligned";
+        else if (ldx != K) w2why = "inject: X row stride is not K";
+        else {
+            hw2 = hc_weight(comp->W, comp->N, K, st, dev);
+            if (hw2.p == nullptr) w2why = hw2.why != nullptr ? hw2.why : "inject: no FP16 copy";
+        }
+        if (w2why != nullptr) {
+            hc_left(dev, comp->name, w2why);
+            hw2 = HcW{};
+        }
+    }
+    const bool with_inj = hw2.p != nullptr;
+    const float wm = with_inj ? std::max(hw.wmax, hw2.wmax) : hw.wmax;
+    // the slices (at most 1024 tokens: the FP16 image of the activation and the split-K parts fit a small scratch) and their splits
     int nsm = 56;
     int zs[16] = {};
     int64_t need_x = 0, need_p = 0;
@@ -1595,6 +1618,14 @@ bool Gemm::bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y,
         std::fprintf(stderr, "prefill gemm: the hyper-connection projections (BF16) run as FP16 HFMA2 GEMMs on resident FP16 copies "
                              "(STRATA_PF_HFMA_HC=1; the activation scaled by a power of two per slice, split-K, FP16 sums of 64 products "
                              "widened to FP32, not bitwise the FP32 route's)\n");
+    }
+    if (small) {
+        static bool said_small = false;
+        if (!said_small) {
+            said_small = true;
+            std::fprintf(stderr, "prefill gemm: STRATA_PF_HFMA_SMALL=1: the hyper-connection read's max |x| and FP16 image in one pass (a second only for a slice that needs a "
+                                 "shift), the inject product (N 4) on FP16 HFMA2 pairs beside the down product's image, gr_mix_r four values a thread\n");
+        }
     }
     cudaEvent_t ev_a = nullptr, ev_b = nullptr;
     const int prod = hc_prod(name);
@@ -1641,17 +1672,28 @@ bool Gemm::bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y,
         kt::begin(kt::kHcXmax, st);
         cudaMemsetAsync(sp, 0, sizeof(unsigned), st);   // HcState::cur is its first member
         const uint4* xs = reinterpret_cast<const uint4*>(X + t0 * ldx);
-        if (x_f16) hcn::xmax_kernel<true><<<blocks, 256, 0, st>>>(xs, n8, K8, ldx8);
-        else hcn::xmax_kernel<false><<<blocks, 256, 0, st>>>(xs, n8, K8, ldx8);
-        kt::begin(kt::kHcCvt, st);
-        if (x_f16) hcn::cvt_kernel<true><<<blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(x16), n8, K8, ldx8, hw.wmax);
-        else hcn::cvt_kernel<false><<<blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(x16), n8, K8, ldx8, hw.wmax);
+        if (small) {   // STRATA_PF_HFMA_SMALL: one pass takes the max and writes the image at shift 0; the second kernel counts the slice and redoes the image only for a shift > 0
+            if (x_f16) hcn::xcvt_kernel<true><<<blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(x16), (unsigned) n8, (unsigned) K8, (unsigned) ldx8);
+            else hcn::xcvt_kernel<false><<<blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(x16), (unsigned) n8, (unsigned) K8, (unsigned) ldx8);
+            kt::begin(kt::kHcCvt, st);
+            // (a smaller grid: at shift 0 every block leaves at once, and the launch of 1280 such blocks costs 30 us; a shifted slice, which
+            // the reads so far never had, strides over the slice with these 4 blocks an SM)
+            const unsigned fix_blocks = std::min<unsigned>(blocks, 4u * (unsigned) nsm);
+            if (x_f16) hcn::cvt_fix_kernel<true><<<fix_blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(x16), (unsigned) n8, (unsigned) K8, (unsigned) ldx8, wm);
+            else hcn::cvt_fix_kernel<false><<<fix_blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(x16), (unsigned) n8, (unsigned) K8, (unsigned) ldx8, wm);
+        } else {
+            if (x_f16) hcn::xmax_kernel<true><<<blocks, 256, 0, st>>>(xs, n8, K8, ldx8);
+            else hcn::xmax_kernel<false><<<blocks, 256, 0, st>>>(xs, n8, K8, ldx8);
+            kt::begin(kt::kHcCvt, st);
+            if (x_f16) hcn::cvt_kernel<true><<<blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(x16), n8, K8, ldx8, wm);
+            else hcn::cvt_kernel<false><<<blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(x16), n8, K8, ldx8, wm);
+        }
         const dim3 grid((unsigned) ((N + 127) / 128), (unsigned) ((rows + 127) / 128), (unsigned) Z);
         float* const y = Y + t0 * ldy;
         kt::begin(prod == 0 ? kt::kHcGemmDown : prod == 1 ? kt::kHcGemmUp : kt::kHcGemmInj, st);
         bool by_sass = false;
         if (sass_ysc != nullptr && sass_sink != nullptr) {   // the hand-scheduled twin of gemm_sk_kernel: it takes the scale from a word the kernel below writes
-            hcn::ysc_kernel<<<1, 1, 0, st>>>(sass_ysc, hw.wmax);
+            hcn::ysc_kernel<<<1, 1, 0, st>>>(sass_ysc, wm);
             const char* r = strata::prefill::sass::hc_slice(prod == 0, x16, hw.p, y, part, rows, N, K, ldy, Z, sass_ysc,
                                                              Z == 1 ? (unsigned*) ((char*) sp + offsetof(hcn::HcState, bad_y)) : sass_sink, st, dev);
             if (r == nullptr) {
@@ -1672,13 +1714,19 @@ bool Gemm::bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y,
         if (!by_sass)
             hcn::gemm_sk_kernel<<<grid, hfma::kThreads, 0, st>>>(reinterpret_cast<const uint4*>(x16), reinterpret_cast<const uint4*>(hw.p),
                                                                  Z > 1 ? part : y, (int) rows, (int) N, (int) K, (int) K8, Z > 1 ? N : ldy,
-                                                                 rows * N, Z, hw.wmax);
+                                                                 rows * N, Z, wm);
         if (Z > 1) {
             kt::begin(kt::kHcReduce, st);
             hcn::reduce_kernel<<<(unsigned) std::min<int64_t>(2048, (rows * N + 255) / 256), 256, 0, st>>>(part, y, rows, N, ldy, Z, rows * N);
         }
+        if (with_inj) {   // STRATA_PF_HFMA_SMALL: the inject product on the very image the down product just read
+            kt::begin(kt::kHcGemmInj, st);
+            const int64_t ldy2 = comp->ldy > 0 ? comp->ldy : comp->N;
+            hcn::inj_kernel<<<(unsigned) ((rows + hcn::kInjRows - 1) / hcn::kInjRows), 256, 0, st>>>(
+                reinterpret_cast<const uint4*>(x16), reinterpret_cast<const uint4*>(hw2.p), comp->Y + t0 * ldy2, (int) rows, ldy2, wm);
+        }
         if (by_sass && sass_verify_on())
-            sass_verify_hc(dev, prod, x16, hw.p, y, rows, N, K, hc_pick_z((N + 127) / 128, (rows + 127) / 128, K, nsm), hw.wmax, st);
+            sass_verify_hc(dev, prod, x16, hw.p, y, rows, N, K, hc_pick_z((N + 127) / 128, (rows + 127) / 128, K, nsm), wm, st);
     }
     if (const cudaError_t le = cudaGetLastError(); le != cudaSuccess) {
         std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_HC: a launch failed: %s\n", cudaGetErrorString(le));
@@ -1688,6 +1736,10 @@ bool Gemm::bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y,
     std::lock_guard<std::mutex> lk(g_hcd_mu);
     g_hcd[dev].seen = true;
     ++g_hcd[dev].taken[prod];
+    if (with_inj) {
+        ++g_hcd[dev].taken[2];
+        comp->done = true;
+    }
     return true;
 }
 void gemm_hfma_hc_report(int64_t tokens) {
@@ -1776,7 +1828,7 @@ bool Gemm::native_hfma(const uint16_t*, int, const void*, float*, int64_t, int64
     return false;   // not the experimental sm_60 CUDA build: native() runs
 }
 void gemm_hfma_report(int64_t) {}
-bool Gemm::bf16_hfma(const uint16_t*, bool, const uint16_t*, float*, int64_t, int64_t, int64_t, int64_t, int64_t, bool, bool, const char*) {
+bool Gemm::bf16_hfma(const uint16_t*, bool, const uint16_t*, float*, int64_t, int64_t, int64_t, int64_t, int64_t, bool, bool, const char*, HcCompanion*) {
     return false;   // not the experimental sm_60 CUDA build: bf16() runs
 }
 void gemm_hfma_hc_report(int64_t) {}

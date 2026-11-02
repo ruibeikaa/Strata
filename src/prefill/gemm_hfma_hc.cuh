@@ -231,5 +231,161 @@ __global__ void __launch_bounds__(256) wscan_kernel(const uint16_t* __restrict__
     }
 }
 
+// ---- STRATA_PF_HFMA_SMALL ---------------------------------------------------------------------------------------------------------------
+// xmax_kernel + cvt_kernel are two passes over the slice, the first dominated by its 64-bit divide per element (row = i / K8).  The pair
+// below is one pass that takes the max |x| AND writes the FP16 image at shift 0 (scale 1), and a second kernel that does the work only for
+// a slice whose shift is not 0 (xmax * wmax > 512, or xmax > 32768: not seen on any real read so far) - redoing the image from x at the
+// slice's own shift, exactly cvt_kernel's - and counts the slice (g_hc.slices / xmax_all / khist / bad_x) either way, as cvt_kernel does.
+// For a slice at shift 0 the image is cvt_kernel's bit for bit (to_f32 * 1.0f is exact), for any other it is cvt_kernel's again, so the
+// outputs of the products are unchanged.  No division: a row of the slice is addressed straight when ldx8 == K8 and by stepping (row, col)
+// otherwise (the grid-stride step is a constant).  n8 < 2^31 (the host checks).
+template <bool F16>
+__global__ void __launch_bounds__(256) xcvt_kernel(const uint4* __restrict__ x, uint4* __restrict__ out, const unsigned n8, const unsigned K8,
+                                                   const unsigned ldx8) {
+    unsigned m = 0;
+    const unsigned step = gridDim.x * 256u;
+    unsigned i = blockIdx.x * 256u + threadIdx.x;
+    const bool straight = ldx8 == K8;
+    unsigned r = 0, c = 0, sr = 0, sc = 0;
+    if (!straight) {
+        r = i / K8;
+        c = i - r * K8;
+        sr = step / K8;
+        sc = step - sr * K8;
+    }
+    for (; i < n8; i += step) {
+        const uint4 v = __ldg(x + (straight ? (size_t) i : (size_t) r * ldx8 + c));
+        const unsigned ws[4] = {v.x, v.y, v.z, v.w};
+        unsigned o[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            m = max(m, abs_bits<F16>(ws[j] & 0xFFFFu));
+            m = max(m, abs_bits<F16>(ws[j] >> 16));
+            o[j] = (unsigned) __half_as_ushort(__float2half_rn(to_f32<F16>(ws[j] & 0xFFFFu))) |
+                   ((unsigned) __half_as_ushort(__float2half_rn(to_f32<F16>(ws[j] >> 16))) << 16);
+        }
+        out[i] = make_uint4(o[0], o[1], o[2], o[3]);
+        if (!straight) {
+            c += sc;
+            r += sr;
+            if (c >= K8) { c -= K8; ++r; }
+        }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) m = max(m, (unsigned) __shfl_xor_sync(0xFFFFFFFFu, (int) m, o));
+    if ((threadIdx.x & 31) == 0 && m != 0) atomicMax(&g_hc.cur, m);
+}
+
+// cvt_kernel after xcvt_kernel: the slice's counts, and the image again only when the slice's shift is not 0
+template <bool F16>
+__global__ void __launch_bounds__(256) cvt_fix_kernel(const uint4* __restrict__ x, uint4* __restrict__ out, const unsigned n8, const unsigned K8,
+                                                      const unsigned ldx8, const float wmax) {
+    const unsigned cur = *(volatile const unsigned*) &g_hc.cur;
+    const int k = shift_k(cur, wmax);
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        atomicAdd(&g_hc.slices, 1u);
+        atomicMax(&g_hc.xmax_all, cur);
+        atomicAdd(&g_hc.khist[k], 1u);
+        if (cur >= 0x7F800000u) atomicAdd(&g_hc.bad_x, 1u);
+    }
+    if (k == 0) return;
+    const float sc = pow2i(-k);
+    const unsigned step = gridDim.x * 256u;
+    unsigned i = blockIdx.x * 256u + threadIdx.x;
+    const bool straight = ldx8 == K8;
+    unsigned r = 0, c = 0, sr = 0, sc2 = 0;
+    if (!straight) {
+        r = i / K8;
+        c = i - r * K8;
+        sr = step / K8;
+        sc2 = step - sr * K8;
+    }
+    for (; i < n8; i += step) {
+        const uint4 v = __ldg(x + (straight ? (size_t) i : (size_t) r * ldx8 + c));
+        const unsigned ws[4] = {v.x, v.y, v.z, v.w};
+        unsigned o[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float lo = to_f32<F16>(ws[j] & 0xFFFFu) * sc, hi = to_f32<F16>(ws[j] >> 16) * sc;
+            o[j] = (unsigned) __half_as_ushort(__float2half_rn(lo)) | ((unsigned) __half_as_ushort(__float2half_rn(hi)) << 16);
+        }
+        out[i] = make_uint4(o[0], o[1], o[2], o[3]);
+        if (!straight) {
+            c += sc2;
+            r += sr;
+            if (c >= K8) { c -= K8; ++r; }
+        }
+    }
+}
+
+// The inject product (N 4, K 10240: the 4 columns of one hyper-connection read) on FP16 HFMA2 pairs: Y[t][n] = 2^k * sum_j x16[t][j] w16[n][j],
+// from the very FP16 image the down product reads (same slice, same shift: k from the pair's larger max |w|).  A 128-wide tile of the GEMM would
+// compute 4 useful columns of 128, so this is the dot products themselves: a block of 256 threads keeps its 5 chunks of 8 columns of the 4 weight rows
+// in registers and walks kInjRows rows; a thread's 40 products per output are summed in FP16 pairs (20 a half-lane: fewer than the GEMM's 64), widened
+// to FP32 and added across the block in a fixed order (warp xor-shuffle tree, then the 8 warps in order): deterministic.
+constexpr int kInjN = 4, kInjK8 = 1280, kInjCpt = kInjK8 / 256, kInjRows = 8;
+__global__ void __launch_bounds__(256) inj_kernel(const uint4* __restrict__ X, const uint4* __restrict__ W, float* __restrict__ Y, const int rows,
+                                                  const int64_t ldy, const float wmax) {
+    __shared__ float part[kInjRows][8][kInjN];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int r0 = blockIdx.x * kInjRows;
+    const int nr = min(kInjRows, rows - r0);
+    const float ysc = pow2i(shift_k(*(volatile const unsigned*) &g_hc.cur, wmax));
+    uint4 w[kInjN][kInjCpt];
+#pragma unroll
+    for (int n = 0; n < kInjN; ++n)
+#pragma unroll
+        for (int c = 0; c < kInjCpt; ++c) w[n][c] = __ldg(W + (size_t) n * kInjK8 + tid + 256 * c);
+    uint4 xv[kInjCpt];
+#pragma unroll
+    for (int c = 0; c < kInjCpt; ++c) xv[c] = __ldg(X + (size_t) r0 * kInjK8 + tid + 256 * c);
+    for (int r = 0; r < nr; ++r) {
+        uint4 xn[kInjCpt];
+#pragma unroll
+        for (int c = 0; c < kInjCpt; ++c) xn[c] = xv[c];
+        if (r + 1 < nr) {
+#pragma unroll
+            for (int c = 0; c < kInjCpt; ++c) xn[c] = __ldg(X + (size_t) (r0 + r + 1) * kInjK8 + tid + 256 * c);
+        }
+        uint32_t acc[kInjN] = {0u, 0u, 0u, 0u};
+#pragma unroll
+        for (int c = 0; c < kInjCpt; ++c)
+#pragma unroll
+            for (int n = 0; n < kInjN; ++n) {
+                acc[n] = hfma2(xv[c].x, w[n][c].x, acc[n]);
+                acc[n] = hfma2(xv[c].y, w[n][c].y, acc[n]);
+                acc[n] = hfma2(xv[c].z, w[n][c].z, acc[n]);
+                acc[n] = hfma2(xv[c].w, w[n][c].w, acc[n]);
+            }
+        float v[kInjN];
+#pragma unroll
+        for (int n = 0; n < kInjN; ++n) {
+            float lo, hi;
+            h2f(acc[n], lo, hi);
+            v[n] = lo + hi;
+        }
+#pragma unroll
+        for (int n = 0; n < kInjN; ++n)
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) v[n] += __shfl_xor_sync(0xFFFFFFFFu, v[n], o);
+        if (lane == 0) {
+#pragma unroll
+            for (int n = 0; n < kInjN; ++n) part[r][warp][n] = v[n];
+        }
+#pragma unroll
+        for (int c = 0; c < kInjCpt; ++c) xv[c] = xn[c];
+    }
+    __syncthreads();
+    if (tid < nr * kInjN) {
+        const int r = tid / kInjN, n = tid % kInjN;
+        float s = 0.0f;
+#pragma unroll
+        for (int wi = 0; wi < 8; ++wi) s += part[r][wi][n];
+        s *= ysc;
+        Y[(size_t) (r0 + r) * (size_t) ldy + n] = s;
+        if (!(fabsf(s) <= 3.0e38f)) atomicAdd(&g_hc.bad_y, 1u);
+    }
+}
+
 }  // namespace
 }  // namespace strata::prefill::hfma::hc

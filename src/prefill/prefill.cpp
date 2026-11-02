@@ -44,6 +44,7 @@
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/prefill/gemm.hpp"
+#include "strata/prefill/pf_small.hpp"   // STRATA_PF_HFMA_SMALL
 #include "strata/prefill/moe_fused.hpp"
 #include "strata/prefill/moe_ws.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
@@ -2779,11 +2780,11 @@ bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, 
 // BF16 weight's resident FP16 copy; a call the kernel cannot take is counted under `name` and runs bf16_proj
 bool hc_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
              std::string& err, int64_t ldy = 0, const uint16_t* X_lo = nullptr, int64_t ldx = 0, void* stream = nullptr,
-             bool x_f16 = false) {
+             bool x_f16 = false, Gemm::HcCompanion* comp = nullptr) {
     static const bool hfma = [] { const char* e = std::getenv("STRATA_PF_HFMA_HC"); return e != nullptr && std::atoi(e) != 0; }();
     if (hfma && w->kind == core::WeightKind::Bf16InF32 && w->data && w->q8_scale == nullptr &&
         gm.bf16_hfma(X, x_f16, (const uint16_t*) w->data, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy, ldx, w->hc_q8 == nullptr,
-                     X_lo != nullptr, name.c_str()))
+                     X_lo != nullptr, name.c_str(), comp))
         return true;
     strata::kernels::ktime::begin(strata::kernels::ktime::kHcProjOld, stream);   // (STRATA_PREFILL_TIMING=2) the old route, all of it
     return bf16_proj(gm, w, X, Y, T, name, err, ldy, X_lo, ldx, stream, x_f16);
@@ -3816,7 +3817,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     hcd = true;
                 }
-                if (!hcd && !hdown && !hc_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
+                // STRATA_PF_HFMA_SMALL: the inject projection (N 4) rides on the down projection's activation image (one call, one max-reduce and
+                // one FP16 image for both); `done` says whether it ran, else it takes its old route below
+                Gemm::HcCompanion inj_c;
+                if (pf_hfma_small() && !hcd && !hdown && wi->kind == core::WeightKind::Bf16InF32 && wi->data && wi->q8_scale == nullptr &&
+                    wi->ne0 == D && wi->ne1 == HC && wi->hc_q8 == nullptr) {
+                    inj_c.W = (const uint16_t*) wi->data;
+                    inj_c.Y = m.inj;
+                    inj_c.N = HC;
+                    inj_c.resident = true;
+                    inj_c.name = si.c_str();
+                }
+                if (!hcd && !hdown && !hc_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16, &inj_c)) return false;
                 kt(ktid::kHcSilu);
                 gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
                 bool upmixed = false;
@@ -3848,7 +3860,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                 }
                 if (!upmixed && !hc_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo, 0, m.cs)) return false;
-                if (!hcd && !hc_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
+                if (!hcd && !inj_c.done && !hc_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
                 if (upmixed) {
                 } else if (gr_unfused()) {
                     kt(ktid::kHcMix);

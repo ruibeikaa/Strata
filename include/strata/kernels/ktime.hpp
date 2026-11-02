@@ -27,13 +27,13 @@ enum Id : int {
     kGdnNorm,      // gdn_out_norm_kernel (output normalisation + gate, y16)
     // "hc read" (the hyper-connection read of each half), one id per kernel group, in launch order:
     kHcNorm,       // gr_norm_rs: RMS row scale of R (HC streams) + the FP16 image xn16
-    kHcXmax,       // bf16_hfma: the 4-byte memset + xmax_kernel (max |x| of the slice)
-    kHcCvt,        // bf16_hfma: cvt_kernel (the slice's activation to FP16 x 2^-k)
+    kHcXmax,       // bf16_hfma: the 4-byte memset + xmax_kernel (max |x| of the slice); STRATA_PF_HFMA_SMALL: xcvt_kernel (max |x| and the image at shift 0)
+    kHcCvt,        // bf16_hfma: cvt_kernel (the slice's activation to FP16 x 2^-k); STRATA_PF_HFMA_SMALL: cvt_fix_kernel (the counts; the image again only at a shift > 0)
     kHcGemmDown,   // bf16_hfma: the down product (ysc_kernel + SASS or gemm_sk_kernel)
     kHcReduce,     // bf16_hfma: reduce_kernel (split-K parts -> Y)
     kHcSilu,       // gr_silu: lo -> lo16
     kHcGemmUp,     // bf16_hfma: the up product
-    kHcGemmInj,    // bf16_hfma: the inject product
+    kHcGemmInj,    // bf16_hfma: the inject product (STRATA_PF_HFMA_SMALL: inj_kernel, after the down product's last kernel)
     kHcProjOld,    // hc_proj when the HFMA2 route declined: the old GEMM (all of it)
     kHcUpmix,      // gr_upmix (sm_80+ only)
     kHcMix,        // gr_mix_r / gr_mix: the weighted sum of the HC streams -> mixed (fp32, bf16, fp16)

@@ -71,8 +71,19 @@ public:
     /// FP32, not bitwise the FP32 route's).  `resident`: W is the pack's own resident tensor; `x_lo`: a BF16X2 low part
     /// follows.  `name`: the weight's name, for the counts.  False = nothing launched (counted under `name` with its reason):
     /// the caller runs bf16().
+    /// STRATA_PF_HFMA_SMALL: a second product on the same activation image, computed in the same call (the inject projection,
+    /// N 4, next to the down projection: one max-reduce and one FP16 image for both).  `done` is set when it ran; unset, the
+    /// caller runs it the old way.
+    struct HcCompanion {
+        const uint16_t* W = nullptr;   // its BF16 weight (resident)
+        float* Y = nullptr;
+        int64_t N = 0, ldy = 0;
+        bool resident = false;
+        const char* name = nullptr;
+        bool done = false;
+    };
     bool bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
-                   int64_t ldx, bool resident, bool x_lo, const char* name);
+                   int64_t ldx, bool resident, bool x_lo, const char* name, HcCompanion* comp = nullptr);
 
     /// HIP gfx103x (prompt_f16()): bf16() takes X as the FP16 image the prompt path's kernels write (set_act_f16),
     /// and bf16() / f16() / native() run the GEMM with FP16 out (rocBLAS's tuned kernels there), widened in place in

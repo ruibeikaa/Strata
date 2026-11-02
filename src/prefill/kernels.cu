@@ -1,5 +1,6 @@
 // src/prefill/kernels.cu - see include/strata/prefill/kernels.hpp.
 #include "strata/prefill/kernels.hpp"
+#include "strata/prefill/pf_small.hpp"   // STRATA_PF_HFMA_SMALL
 #include "strata/kernels/ktime.hpp"
 #include "strata/prefill/gdn_chunk.hpp"
 #include "strata/kernels/mrope.hpp"
@@ -166,6 +167,58 @@ __global__ void gr_mix_r_kernel(const float* __restrict__ R, const float* __rest
         if (mixed16_lo) mixed16_lo[i] = bf_lo(s, h);
     }
     if (mixed_h) mixed_h[i] = hf(s);
+}
+// STRATA_PF_HFMA_SMALL: gr_mix_r_kernel with four consecutive columns a thread (16-byte loads of R, g and w, one 16-byte load of the row's four
+// scales, 16- and 8-byte stores).  Each value is computed by gr_mix_r_kernel's own expression in its own order - x = R * rs * w; s = fmaf(x,
+// sigm(g), s) over the four streams; s / 4 - so the outputs are the same bits; what changes is the instruction count per byte moved and the
+// independent chains a thread keeps in flight.  Needs 16-byte aligned R, g, w, mixed (and 8-byte aligned 16-bit outputs), N a multiple of 4,
+// T * N / 4 below 2^32 (gr_mix_r checks and otherwise launches the scalar kernel).
+__global__ void __launch_bounds__(256) gr_mix_r_vec_kernel(const float* __restrict__ R, const float* __restrict__ rs, const float* __restrict__ w,
+                                                           const float* __restrict__ g, float* __restrict__ mixed, uint16_t* __restrict__ mixed16,
+                                                           unsigned n4, uint16_t* __restrict__ mixed_h, uint16_t* __restrict__ mixed16_lo) {
+    const unsigned i4 = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i4 >= n4) return;
+    constexpr unsigned NQ = N / 4;
+    const unsigned t = i4 / NQ, d = (i4 - t * NQ) * 4;
+    const float4 rsv = *reinterpret_cast<const float4*>(rs + (size_t) t * HC);
+    const float rsc[HC] = {rsv.x, rsv.y, rsv.z, rsv.w};
+    float4 r4[HC], g4[HC], w4[HC];
+#pragma unroll
+    for (int c = 0; c < HC; ++c) {
+        const size_t j = (size_t) t * D + (size_t) c * N + d;
+        r4[c] = *reinterpret_cast<const float4*>(R + j);
+        g4[c] = *reinterpret_cast<const float4*>(g + j);
+        w4[c] = *reinterpret_cast<const float4*>(w + (size_t) c * N + d);
+    }
+    float s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int c = 0; c < HC; ++c) {
+        const float rv[4] = {r4[c].x, r4[c].y, r4[c].z, r4[c].w}, gv[4] = {g4[c].x, g4[c].y, g4[c].z, g4[c].w}, wv[4] = {w4[c].x, w4[c].y, w4[c].z, w4[c].w};
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const float x = rv[e] * rsc[c] * wv[e];   // gr_norm_kernel's value, bit for bit
+            s[e] = fmaf(x, sigm(gv[e]), s[e]);
+        }
+    }
+#pragma unroll
+    for (int e = 0; e < 4; ++e) s[e] /= (float) HC;
+    const size_t o = (size_t) t * N + d;
+    *reinterpret_cast<float4*>(mixed + o) = make_float4(s[0], s[1], s[2], s[3]);
+    if (mixed16) {
+        uint16_t h[4];
+#pragma unroll
+        for (int e = 0; e < 4; ++e) h[e] = act16(s[e]);
+        *reinterpret_cast<uint2*>(mixed16 + o) = make_uint2((uint32_t) h[0] | ((uint32_t) h[1] << 16), (uint32_t) h[2] | ((uint32_t) h[3] << 16));
+        if (mixed16_lo) {
+            uint16_t l[4];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) l[e] = bf_lo(s[e], h[e]);
+            *reinterpret_cast<uint2*>(mixed16_lo + o) = make_uint2((uint32_t) l[0] | ((uint32_t) l[1] << 16), (uint32_t) l[2] | ((uint32_t) l[3] << 16));
+        }
+    }
+    if (mixed_h) {
+        *reinterpret_cast<uint2*>(mixed_h + o) = make_uint2((uint32_t) hf(s[0]) | ((uint32_t) hf(s[1]) << 16), (uint32_t) hf(s[2]) | ((uint32_t) hf(s[3]) << 16));
+    }
 }
 // F-2: gr_write_kernel for one row (t, c), then gr_norm_rs_kernel's reduction over it with the next half's norm
 // weights - the same thread-to-element mapping (256 threads, stride 256) and block_sum, so rs and the BF16 image are
@@ -2632,6 +2685,13 @@ void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint1
 }
 void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float* gated, float* mixed, uint16_t* mixed16,
               int64_t T, void* stream, uint16_t* mixed_h, uint16_t* mixed16_lo) {
+    if (pf_hfma_small() && T > 0 && T * N / 4 < ((int64_t) 1 << 32) && ((uintptr_t) R | (uintptr_t) rs | (uintptr_t) w_norm | (uintptr_t) gated | (uintptr_t) mixed) % 16 == 0 &&
+        ((uintptr_t) mixed16 | (uintptr_t) mixed_h | (uintptr_t) mixed16_lo) % 8 == 0 && (mixed16_lo == nullptr || mixed16 != nullptr)) {
+        const unsigned n4 = (unsigned) (T * N / 4);
+        gr_mix_r_vec_kernel<<<(n4 + 255) / 256, 256, 0, (cudaStream_t) stream>>>(R, rs, w_norm, gated, mixed, mixed16, n4, mixed_h, mixed16_lo);
+        check("gr_mix_r");
+        return;
+    }
     gr_mix_r_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(R, rs, w_norm, gated, mixed, mixed16, T,
                                                                           mixed_h, mixed16_lo);
     check("gr_mix_r");

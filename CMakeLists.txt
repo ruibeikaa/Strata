@@ -1324,6 +1324,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       target_link_libraries(prefill_combine_write_test PRIVATE strata_prefill ${_strata_gpu_runtime_target})
       add_test(NAME prefill_combine_write_test COMMAND prefill_combine_write_test)
       set_tests_properties(prefill_combine_write_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+      # STRATA_PF_HFMA_SMALL (GP100 only; 77 elsewhere): the fused max + FP16 image against the two kernels it replaces (bit for bit), the
+      # inject kernel's error against a double reference next to the up product's; --gemm / --mix write the down / up / mix outputs for
+      # a byte comparison of STRATA_PF_HFMA_SMALL=0 against =1; --bench times the kernels (GPU, synthetic, no model)
+      add_executable(hfma_small_parity src/prefill/hfma_small_parity.cu)
+      target_include_directories(hfma_small_parity PRIVATE src/prefill ${_strata_gpu_include_directories})
+      target_link_libraries(hfma_small_parity PRIVATE strata_prefill ${_strata_gpu_runtime_target})
+      add_test(NAME hfma_small_parity COMMAND hfma_small_parity --kernels)
+      set_tests_properties(hfma_small_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     endif()
     # Pascal, opt-in STRATA_DENSE_F32=1: the dense projections' FP16 GEMMs as cublasSgemm on FP32 copies, bitwise vs
     # the cuBLAS FP16 call over a sweep of chunk sizes (GPU, synthetic, no model; --full sweeps every size, --bench
