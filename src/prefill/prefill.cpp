@@ -440,6 +440,62 @@ static void handoff_piece(int64_t T, int P, int i, int64_t& r0, int64_t& nr) {
     r0 = std::min<int64_t>(T, (int64_t) i * per);
     nr = std::min<int64_t>(T, r0 + per) - r0;
 }
+// STRATA_PF_HFMA_SMALL: the layer split hands a chunk's rows (T x 10240 floats: 94 MB at 2300 tokens) from one die to the next through the host
+// - a download and an upload, each ~3.3 GB/s on a PH402 (the two dies of a board share one such link, and the experts' streams use it too) - or,
+// between the two dies of a board, straight over NVLink (73 GB/s: 1.3 ms for the 94 MB).  Asked once per pair: peer access both ways with
+// native atomics (NVLink's mark; a PCIe-only P2P pair has none), enabled, and a test copy each way that arrives exact (the #2666 guard).
+static bool hand_peer_ok(int a, int b) {
+    static std::mutex mu;
+    static std::map<std::pair<int, int>, bool> known;
+    if (a < 0 || b < 0 || a == b) return false;
+    std::lock_guard<std::mutex> lk(mu);
+    const std::pair<int, int> key{std::min(a, b), std::max(a, b)};
+    if (const auto it = known.find(key); it != known.end()) return it->second;
+    bool ok = false;
+    const char* why = "";
+    int can_ab = 0, can_ba = 0, atom = 0;
+    if (cudaDeviceCanAccessPeer(&can_ab, a, b) != cudaSuccess || cudaDeviceCanAccessPeer(&can_ba, b, a) != cudaSuccess || !can_ab || !can_ba) {
+        why = "no peer access";
+    } else if (cudaDeviceGetP2PAttribute(&atom, cudaDevP2PAttrNativeAtomicSupported, a, b) != cudaSuccess || atom == 0) {
+        why = "not an NVLink pair";
+    } else {
+        const int dev[2] = {a, b};
+        bool enabled = true;
+        for (int k = 0; k < 2 && enabled; ++k) {
+            const core::OnDevice on(dev[k]);
+            const cudaError_t e = cudaDeviceEnablePeerAccess(dev[1 - k], 0);
+            if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) enabled = false;
+            (void) cudaGetLastError();
+        }
+        constexpr size_t kN = 1 << 14;
+        std::vector<float> h(kN), back(kN);
+        for (size_t i = 0; i < kN; ++i) h[i] = 1.0f + (float) ((i * 2654435761u) % 4093u);
+        float* d[2] = {nullptr, nullptr};
+        bool tested = enabled;
+        for (int k = 0; k < 2 && tested; ++k) {
+            const core::OnDevice on(dev[k]);
+            if (cudaMalloc((void**) &d[k], kN * 4) != cudaSuccess) tested = false;
+        }
+        bool exact = tested;
+        for (int dir = 0; dir < 2 && exact; ++dir) {
+            const int from = dir, to = 1 - dir;
+            { const core::OnDevice on(dev[from]); exact = cudaMemcpy(d[from], h.data(), kN * 4, cudaMemcpyHostToDevice) == cudaSuccess; }
+            if (exact) { const core::OnDevice on(dev[to]); exact = cudaMemset(d[to], 0, kN * 4) == cudaSuccess; }
+            if (exact) exact = cudaMemcpyPeer(d[to], dev[to], d[from], dev[from], kN * 4) == cudaSuccess;
+            if (exact) { const core::OnDevice on(dev[to]); exact = cudaMemcpy(back.data(), d[to], kN * 4, cudaMemcpyDeviceToHost) == cudaSuccess; }
+            if (exact) exact = std::memcmp(back.data(), h.data(), kN * 4) == 0;
+        }
+        for (int k = 0; k < 2; ++k)
+            if (d[k] != nullptr) { const core::OnDevice on(dev[k]); cudaFree(d[k]); }
+        (void) cudaGetLastError();
+        ok = enabled && tested && exact;
+        if (!ok) why = !enabled ? "peer access could not be enabled" : !tested ? "no room for the test copy" : "the test copy arrived wrong";
+    }
+    known.emplace(key, ok);
+    std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_SMALL: layer-split hand-off between CUDA%d and CUDA%d: %s\n", a, b,
+                 ok ? "directly over NVLink" : (std::string("through the host (") + why + ")").c_str());
+    return ok;
+}
 // STRATA_HANDOFF_PIPE: the next stage's chunks run on one thread of the stage's own, started once and pinned once
 // (std::async started a thread per chunk: ~1 ms from the hand-off to the next stage's first call, measured with nsys).
 // The futures are the same (run_impl's result, or what it threw), so the chain's waits do not change.
@@ -3003,6 +3059,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // force_chunk is for this run only: taken before any early return can leave it to the next one
     const int64_t forced = hand_in_ == nullptr ? std::exchange(force_chunk_, 0) : 0;
     const bool forced_single = force_single_, forced_planned = force_planned_;
+    const bool direct_in = std::exchange(hand_direct_, false);   // STRATA_PF_HFMA_SMALL: this run's rows are in R already (one chunk)
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
     const core::ModelGeometry& g = *m.g;
@@ -3204,7 +3261,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         const auto tsetup = Clock::now();
         // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
         // previous stage handed on
-        if (hand_in_ != nullptr && hand_ev_ != nullptr) {
+        if (hand_in_ != nullptr && direct_in) {
+            // STRATA_PF_HFMA_SMALL: the stage before (the other die of this board) copied the chunk's rows into R over NVLink and waited
+            // for the copy: nothing to upload (it is one chunk: the sender checked T against this stage's chunk size)
+        } else if (hand_in_ != nullptr && hand_ev_ != nullptr) {
             // STRATA_HANDOFF_PIPE: each piece's upload waits on the GPU for its download on the stage before.  The
             // stage before split the chunk it handed on (n rows); one chunk here is all of it, otherwise (a smaller
             // chunk here) every piece is waited for before the one copy.
@@ -5783,7 +5843,32 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             // The current hand-off slot was used two chunks ago.
             float* h = m.hand[hand_buf_];
             const int hp = m.hand_pieces;
-            if (hp > 0) {
+            // STRATA_PF_HFMA_SMALL: to the other die of this board the chunk goes straight over NVLink (no download, no upload): once the
+            // successor has finished the chunk before, its R is free and the copy is ~1.3 ms for 94 MB instead of 2 x 28 ms through the host
+            const bool direct = pf_hfma_small() && hp == 0 && !helped && next_->impl_ && next_->impl_->R != nullptr &&
+                                T <= next_->impl_->T && hand_peer_ok(m.device, next_->impl_->device);
+            bool landed = false;
+            if (direct) {
+                if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                    err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
+                if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
+                next_err_.clear();
+                landed = cudaMemcpyPeerAsync(next_->impl_->R, next_->impl_->device, m.R, m.device, (size_t) T * D * 4, m.cs) == cudaSuccess &&
+                         cudaStreamSynchronize(m.cs) == cudaSuccess;
+                if (!landed) {   // not expected after the pair's test copy: the host route below, the very copy it has always made
+                    static std::atomic<bool> said{false};
+                    if (!said.exchange(true))
+                        std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_SMALL: the NVLink hand-off copy failed (%s): this chunk goes through the host\n",
+                                     cudaGetErrorString(cudaGetLastError()));
+                    (void) cudaGetLastError();
+                }
+            }
+            if (landed) {
+                // (R is in place on the next stage; the host buffer is not used)
+            } else if (hp > 0) {
                 // STRATA_HANDOFF_PIPE: the pieces' downloads stay queued; the host waits for the chunk's work only (the
                 // state on_stage_chunk saves, the error check), the next stage's uploads wait on the pieces' events
                 bool ok = cudaEventRecord(m.hand_done[hand_buf_], m.cs) == cudaSuccess;
@@ -5806,10 +5891,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             // Wait only for the DIRECT successor's previous chunk. That successor
             // may already have forwarded its older chunk to later GPUs.
-            if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
-            if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
-            next_err_.clear();
+            if (!direct) {   // (the direct hand-off did both before its copy)
+                if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
+                if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
+                next_err_.clear();
+            }
             next_->hand_in_ = h;
+            next_->hand_direct_ = landed;
             next_->hand_ev_ = hp > 0 ? static_cast<const void*>(m.hand_ev[hand_buf_]) : nullptr;
             next_->hand_pieces_ = hp;
             next_->single_chunk_ = single_chunk;

@@ -308,6 +308,9 @@ private:
     /// on its device) when it copies the chunk in pieces without a host wait; null with the one-copy hand-off
     const void* hand_ev_ = nullptr;
     int hand_pieces_ = 0;
+    /// STRATA_PF_HFMA_SMALL: the previous stage (the other die of the same board) already copied the chunk's rows into this stage's R over
+    /// NVLink: the upload from hand_in_ is skipped (hand_in_ stays set - it marks a later stage)
+    bool hand_direct_ = false;
 
     std::string next_err_;
     std::future<bool> next_run_;
