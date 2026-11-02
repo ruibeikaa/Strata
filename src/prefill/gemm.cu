@@ -38,9 +38,12 @@
 
 #if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
 #include "gemm_hfma.cuh"   // STRATA_PF_HFMA
+#include "gemm_hfma_hc.cuh"   // STRATA_PF_HFMA_HC
 #include <cctype>
+#include <cmath>
 #include <map>
 #include <string>
+#include <vector>
 #endif
 
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
@@ -1123,6 +1126,117 @@ void hfma_left(int dev, const char* name, const char* why) {
     std::lock_guard<std::mutex> lk(g_hf_mu);
     ++g_hf_left[dev][w + ": " + why];
 }
+
+// ---- GP100, opt-in (STRATA_PF_HFMA_HC=1): the hyper-connection read's BF16 projections on FP16 HFMA2 --------------------
+// The down (N 320, K 10240) and up (N 10240, K 320) projections of every half-layer's hyper-connection read (the third,
+// the inject projection, has N = 4: its 128-wide tile would be empty, it keeps its route).  On Pascal these BF16 products
+// run as cublasSgemm on the BF16 weight's resident FP32 copy and the activation widened per slice; here the weight's FP16
+// copy (half the bytes, the same shadow books as the dense projections' FP16 copies, the same reserve) and an FP16 image
+// of the activation scaled by a power of two feed gemm_hfma_hc.cuh's split-K HFMA2 kernel.  A BF16 weight in the FP16 range
+// is exact in FP16 (an 8-bit mantissa; only values below 2^-14 lose bits to the subnormals).  The sums are FP16 per 64
+// products, so the outputs are not bitwise the FP32 route's; a call the route cannot take is counted by product and reason
+// and runs the old route.
+struct HcW { const uint16_t* p = nullptr; float wmax = 0.0f; const char* why = nullptr; };
+std::mutex g_hcw_mu;
+std::unordered_map<const void*, HcW> g_hcw;   // BF16 weight address -> its FP16 copy and max |w| (or why not)
+struct HcDev {
+    bool seen = false;
+    int64_t taken[3] = {};                    // [down, up, other] calls
+    std::map<std::string, int64_t> left;      // "product: reason" -> calls
+    int copies = 0;
+    double copy_mib = 0.0, min_free_mib = 1e30;
+    float wmax_lo = 1e30f, wmax_hi = 0.0f;
+};
+HcDev g_hcd[64];
+std::mutex g_hcd_mu;
+struct HcTm {
+    cudaEvent_t a = nullptr, b = nullptr;
+    int prod = 0;
+    double macs = 0.0;
+};
+std::vector<HcTm> g_hctm[64];
+size_t g_hctm_n[64] = {};
+void* g_hc_state_ptr[64] = {};
+bool hc_timing_on() {
+    static const bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
+    return on;
+}
+int hc_prod(const char* name) {
+    const std::string n = name != nullptr ? name : "";
+    return n.find("down") != std::string::npos ? 0 : n.find("up") != std::string::npos ? 1 : 2;
+}
+const char* hc_prod_name(int p) { return p == 0 ? "down" : p == 1 ? "up" : "other"; }
+void* hc_state_ptr(int dev) {
+    std::lock_guard<std::mutex> lk(g_hcd_mu);
+    if (g_hc_state_ptr[dev] == nullptr) {
+        void* p = nullptr;
+        if (cudaGetSymbolAddress(&p, strata::prefill::hfma::hc::g_hc) != cudaSuccess) {
+            std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_HC: the device state symbol is missing on GPU %d\n", dev);
+            std::exit(1);
+        }
+        g_hc_state_ptr[dev] = p;
+    }
+    return g_hc_state_ptr[dev];
+}
+void hc_left(int dev, const char* name, const char* why) {
+    std::lock_guard<std::mutex> lk(g_hcd_mu);
+    HcDev& d = g_hcd[dev];
+    d.seen = true;
+    ++d.left[std::string(hc_prod_name(hc_prod(name))) + ": " + why];
+}
+// the FP16 copy of a BF16 weight (once per weight, with its scan: finite and inside the FP16 range, else refused)
+HcW hc_weight(const uint16_t* W, int64_t N, int64_t K, cudaStream_t st, int dev) {
+    std::lock_guard<std::mutex> lk(g_hcw_mu);
+    if (const auto it = g_hcw.find(W); it != g_hcw.end()) return it->second;
+    HcW r;
+    unsigned* d_stats = nullptr;
+    unsigned h[4] = {};
+    const int64_t n = N * K;
+    if (cudaMalloc((void**) &d_stats, 4 * sizeof(unsigned)) != cudaSuccess) {
+        cudaGetLastError();
+        r.why = "no room for its scan";
+    } else {
+        cudaMemsetAsync(d_stats, 0, 4 * sizeof(unsigned), st);
+        strata::prefill::hfma::hc::wscan_kernel<<<(unsigned) std::min<int64_t>(1024, (n + 255) / 256), 256, 0, st>>>(W, n, d_stats);
+        cudaMemcpyAsync(h, d_stats, 4 * sizeof(unsigned), cudaMemcpyDeviceToHost, st);
+        cudaStreamSynchronize(st);
+        cudaFree(d_stats);
+        float wmax = 0.0f;
+        std::memcpy(&wmax, &h[0], 4);
+        if (h[1] != 0) r.why = "a non-finite BF16 weight";
+        else if (h[2] != 0) r.why = "a BF16 weight outside the FP16 range";
+        else {
+            r.p = shadow_get_h(W, n, st, [&](uint16_t* dst) { bf16_to_f16(W, dst, n, st); });
+            if (r.p == nullptr) {
+                r.why = "no room for its FP16 copy";
+            } else {
+                r.wmax = wmax;
+                size_t free_b = 0, total_b = 0;
+                cudaMemGetInfo(&free_b, &total_b);
+                std::lock_guard<std::mutex> dk(g_hcd_mu);
+                HcDev& d = g_hcd[dev];
+                d.seen = true;
+                ++d.copies;
+                d.copy_mib += (double) n * 2 / 1048576.0;
+                d.min_free_mib = std::min(d.min_free_mib, free_b / 1048576.0);
+                d.wmax_lo = std::min(d.wmax_lo, wmax);
+                d.wmax_hi = std::max(d.wmax_hi, wmax);
+            }
+        }
+    }
+    g_hcw.emplace(W, r);
+    return r;
+}
+int hc_pick_z(int64_t gx, int64_t gy, int64_t K, int nsm) {
+    const int64_t G = (K / 32 + 3) / 4, b0 = gx * gy;
+    int best = 1;
+    double bw = 1e30;
+    for (int z = 1; z <= std::min<int64_t>(8, G); ++z) {
+        const double w = std::ceil((double) (b0 * z) / nsm) / z;
+        if (w < bw - 1e-9) { bw = w; best = z; }
+    }
+    return best;
+}
 #endif
 }  // namespace
 #endif
@@ -1253,12 +1367,201 @@ void gemm_hfma_report(int64_t tokens) {
         g_hf_left[d].clear();
     }
 }
+// STRATA_PF_HFMA_HC=1's product (see the block above): false = nothing launched, bf16() runs; the call is counted under `name`.
+// `resident`: W is the pack's own resident tensor (not a scratch view, whose address is not a key); `x_lo`: a BF16X2 low part
+// follows (a second accumulating product this route does not do).
+bool Gemm::bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                     int64_t ldx, bool resident, bool x_lo, const char* name) {
+    namespace hcn = strata::prefill::hfma::hc;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
+    if (T <= 0 || N <= 0) return false;
+    if (ldx <= 0) ldx = K;
+    if (ldy <= 0) ldy = N;
+    const cudaStream_t st = (cudaStream_t) stream_;
+    const char* why = nullptr;
+    if (current_cc() != 60) why = "not a GP100";
+    else if (x_lo) why = "the BF16X2 low part (a second product)";
+    else if (!resident) why = "a scratch view of the weight (STRATA_HC_Q8 / REQ8)";
+    else if (K <= 0 || K % 32 != 0) why = "K is not a multiple of 32";
+    else if (N < 64) why = "N below 64 (a 128-wide tile would be empty)";
+    else if (T > INT_MAX || N > INT_MAX || K > INT_MAX || ldx > INT_MAX) why = "a size past 2^31";
+    else if (ldx < K || ldx % 8 != 0) why = "X row stride";
+    else if (ldy < N) why = "Y row stride";
+    else if (((uintptr_t) X & 15) != 0) why = "X not 16-byte aligned";
+    else if (((uintptr_t) W & 15) != 0) why = "W not 16-byte aligned";
+    HcW hw;
+    if (why == nullptr) {
+        hw = hc_weight(W, N, K, st, dev);
+        if (hw.p == nullptr) why = hw.why != nullptr ? hw.why : "no FP16 copy";
+    }
+    // the slices (at most 1024 tokens: the FP16 image of the activation and the split-K parts fit a small scratch) and their splits
+    constexpr int64_t kSl = 1024;
+    int nsm = 56;
+    int zs[16] = {};
+    int64_t need_x = 0, need_p = 0;
+    if (why == nullptr) {
+        int v = 0;
+        if (cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && v > 0) nsm = v; else cudaGetLastError();
+        const int64_t n_sl = (T + kSl - 1) / kSl;
+        if (n_sl > 16) {
+            why = "T past 16384";
+        } else {
+            for (int64_t i = 0; i < n_sl; ++i) {
+                const int64_t rows = std::min(kSl, T - i * kSl);
+                zs[i] = hc_pick_z((N + 127) / 128, (rows + 127) / 128, K, nsm);
+                need_x = std::max(need_x, rows * K);
+                if (zs[i] > 1) need_p = std::max(need_p, 2 * (int64_t) zs[i] * rows * N);   // floats as 2-byte elements
+            }
+            if (tc_x_elems_ < need_x || tc_w_elems_ < need_p) cudaStreamSynchronize(st);   // grow() frees what may be in use
+            if (!grow(tc_x_, tc_x_elems_, need_x) || (need_p > 0 && !grow(tc_w_, tc_w_elems_, need_p))) {
+                cudaGetLastError();
+                why = "no room for the activation scratch";
+            }
+        }
+    }
+    if (why != nullptr) {
+        hc_left(dev, name, why);
+        return false;
+    }
+    static bool said = false;
+    if (!said) {
+        said = true;
+        std::fprintf(stderr, "prefill gemm: the hyper-connection projections (BF16) run as FP16 HFMA2 GEMMs on resident FP16 copies "
+                             "(STRATA_PF_HFMA_HC=1; the activation scaled by a power of two per slice, split-K, FP16 sums of 64 products "
+                             "widened to FP32, not bitwise the FP32 route's)\n");
+    }
+    cudaEvent_t ev_a = nullptr, ev_b = nullptr;
+    const int prod = hc_prod(name);
+    if (hc_timing_on()) {
+        std::lock_guard<std::mutex> lk(g_hcd_mu);
+        auto& v = g_hctm[dev];
+        if (g_hctm_n[dev] == v.size()) {
+            HcTm t;
+            cudaEventCreate(&t.a);
+            cudaEventCreate(&t.b);
+            v.push_back(t);
+        }
+        HcTm& t = v[g_hctm_n[dev]++];
+        t.prod = prod;
+        t.macs = (double) T * (double) N * (double) K;
+        ev_a = t.a;
+        ev_b = t.b;
+    }
+    void* sp = hc_state_ptr(dev);
+    if (ev_a != nullptr) cudaEventRecord(ev_a, st);
+    uint16_t* const x16 = tc_x_;
+    float* const part = reinterpret_cast<float*>(tc_w_);
+    for (int64_t i = 0, t0 = 0; t0 < T; ++i, t0 += kSl) {
+        const int64_t rows = std::min(kSl, T - t0);
+        const int Z = zs[i];
+        const int64_t n8 = rows * K / 8, K8 = K / 8, ldx8 = ldx / 8;
+        const unsigned blocks = (unsigned) std::max<int64_t>(1, std::min<int64_t>(2048, (n8 + 1023) / 1024));
+        cudaMemsetAsync(sp, 0, sizeof(unsigned), st);   // HcState::cur is its first member
+        const uint4* xs = reinterpret_cast<const uint4*>(X + t0 * ldx);
+        if (x_f16) hcn::xmax_kernel<true><<<blocks, 256, 0, st>>>(xs, n8, K8, ldx8);
+        else hcn::xmax_kernel<false><<<blocks, 256, 0, st>>>(xs, n8, K8, ldx8);
+        if (x_f16) hcn::cvt_kernel<true><<<blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(x16), n8, K8, ldx8, hw.wmax);
+        else hcn::cvt_kernel<false><<<blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(x16), n8, K8, ldx8, hw.wmax);
+        const dim3 grid((unsigned) ((N + 127) / 128), (unsigned) ((rows + 127) / 128), (unsigned) Z);
+        float* const y = Y + t0 * ldy;
+        hcn::gemm_sk_kernel<<<grid, hfma::kThreads, 0, st>>>(reinterpret_cast<const uint4*>(x16), reinterpret_cast<const uint4*>(hw.p),
+                                                             Z > 1 ? part : y, (int) rows, (int) N, (int) K, (int) K8, Z > 1 ? N : ldy,
+                                                             rows * N, Z, hw.wmax);
+        if (Z > 1) hcn::reduce_kernel<<<(unsigned) std::min<int64_t>(2048, (rows * N + 255) / 256), 256, 0, st>>>(part, y, rows, N, ldy, Z, rows * N);
+    }
+    if (const cudaError_t le = cudaGetLastError(); le != cudaSuccess) {
+        std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_HC: a launch failed: %s\n", cudaGetErrorString(le));
+        std::exit(1);
+    }
+    if (ev_b != nullptr) cudaEventRecord(ev_b, st);
+    std::lock_guard<std::mutex> lk(g_hcd_mu);
+    g_hcd[dev].seen = true;
+    ++g_hcd[dev].taken[prod];
+    return true;
+}
+void gemm_hfma_hc_report(int64_t tokens) {
+    namespace hcn = strata::prefill::hfma::hc;
+    std::lock_guard<std::mutex> lk(g_hcd_mu);
+    int back = 0;
+    cudaGetDevice(&back);
+    for (int dev = 0; dev < 64; ++dev) {
+        HcDev& d = g_hcd[dev];
+        if (!d.seen) continue;
+        hcn::HcState stt{};
+        if (g_hc_state_ptr[dev] != nullptr) {
+            cudaSetDevice(dev);
+            if (cudaMemcpyFromSymbol(&stt, hcn::g_hc, sizeof stt) != cudaSuccess) { cudaGetLastError(); std::memset(&stt, 0, sizeof stt); }
+            hcn::HcState zero{};
+            if (cudaMemcpyToSymbol(hcn::g_hc, &zero, sizeof zero) != cudaSuccess) cudaGetLastError();
+        }
+        std::string kt;
+        if (g_hctm_n[dev] > 0) {
+            struct Acc { double ms = 0.0, macs = 0.0; int64_t n = 0; };
+            Acc acc[3];
+            cudaSetDevice(dev);
+            for (size_t i = 0; i < g_hctm_n[dev]; ++i) {
+                float ms = 0.0f;
+                if (cudaEventSynchronize(g_hctm[dev][i].b) == cudaSuccess && cudaEventElapsedTime(&ms, g_hctm[dev][i].a, g_hctm[dev][i].b) == cudaSuccess) {
+                    Acc& a = acc[g_hctm[dev][i].prod];
+                    a.ms += ms; a.macs += g_hctm[dev][i].macs; ++a.n;
+                } else {
+                    cudaGetLastError();
+                }
+            }
+            g_hctm_n[dev] = 0;
+            double ms_all = 0.0, macs_all = 0.0;
+            for (int p = 0; p < 3; ++p) {
+                if (acc[p].n == 0) continue;
+                char b[160];
+                std::snprintf(b, sizeof b, "%s%s x%lld %.1f ms %.0f GMAC/s", kt.empty() ? "" : "; ", hc_prod_name(p), (long long) acc[p].n, acc[p].ms,
+                              acc[p].ms > 0 ? acc[p].macs / acc[p].ms * 1e-6 : 0.0);
+                kt += b;
+                ms_all += acc[p].ms; macs_all += acc[p].macs;
+            }
+            char b[120];
+            std::snprintf(b, sizeof b, "; all %.1f ms %.0f GMAC/s", ms_all, ms_all > 0 ? macs_all / ms_all * 1e-6 : 0.0);
+            kt += b;
+        }
+        std::string lft;
+        int64_t n_left = 0;
+        for (const auto& [what, n] : d.left) { lft += (lft.empty() ? "" : ", ") + what + " x" + std::to_string((long long) n); n_left += n; }
+        std::string kh;
+        for (int i = 0; i <= hcn::KMAXH; ++i)
+            if (stt.khist[i] != 0) {
+                char b[40];
+                std::snprintf(b, sizeof b, "%s%d x%u", kh.empty() ? "" : ", ", i, stt.khist[i]);
+                kh += b;
+            }
+        float xmax = 0.0f;
+        std::memcpy(&xmax, &stt.xmax_all, 4);
+        size_t free_b = 0, total_b = 0;
+        cudaSetDevice(dev);
+        cudaMemGetInfo(&free_b, &total_b);
+        std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_HC: read of %lld tokens, CUDA%d: %lld hyper-connection projections on the HFMA2 kernel "
+                             "(down %lld, up %lld, other %lld), %lld left to the old route%s%s%s; %d FP16 weight copies made this read, %.0f MiB (all "
+                             "FP16 copies kept: %d, %.0f MiB); input max |x| %.2f over %u slices, activation shift k (2^-k) per slice: %s; max |w| of the "
+                             "copies made: %.3g .. %.3g; non-finite: input in %u slices, output %u values; free VRAM now %.0f MiB (lowest at a copy: %.0f); "
+                             "kernel time: %s\n",
+                     (long long) tokens, dev, (long long) (d.taken[0] + d.taken[1] + d.taken[2]), (long long) d.taken[0], (long long) d.taken[1],
+                     (long long) d.taken[2], (long long) n_left, lft.empty() ? "" : " (", lft.c_str(), lft.empty() ? "" : ")", d.copies, d.copy_mib,
+                     g_shadow_h_count[dev], g_shadow_h_bytes[dev] / 1048576.0, xmax, stt.slices, kh.empty() ? "-" : kh.c_str(),
+                     d.wmax_hi > 0 ? d.wmax_lo : 0.0f, d.wmax_hi, stt.bad_x, stt.bad_y, free_b / 1048576.0,
+                     d.min_free_mib < 1e29 ? d.min_free_mib : -1.0, kt.empty() ? "-" : kt.c_str());
+        d = HcDev{};
+    }
+    cudaSetDevice(back);
+}
 #else
 void gemm_set_dense_f32(int) {}
 bool Gemm::native_hfma(const uint16_t*, int, const void*, float*, int64_t, int64_t, int64_t, int64_t, int64_t, const char*) {
     return false;   // not the experimental sm_60 CUDA build: native() runs
 }
 void gemm_hfma_report(int64_t) {}
+bool Gemm::bf16_hfma(const uint16_t*, bool, const uint16_t*, float*, int64_t, int64_t, int64_t, int64_t, int64_t, bool, bool, const char*) {
+    return false;   // not the experimental sm_60 CUDA build: bf16() runs
+}
+void gemm_hfma_hc_report(int64_t) {}
 #endif
 bool Gemm::bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K) {
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)

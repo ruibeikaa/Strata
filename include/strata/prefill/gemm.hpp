@@ -65,6 +65,14 @@ public:
     /// cannot take, counted under `name` with its reason): the caller runs native().
     bool native_hfma(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                      int64_t ldy, int64_t ldx, const char* name);
+    /// STRATA_PF_HFMA_HC=1, Pascal GP100 only: bf16()'s product (beta = 0) for the hyper-connection read's down and up
+    /// projections with the weight's FP16 copy kept resident and the activation (BF16, or FP16 when `x_f16`) as FP16 scaled by
+    /// a power of two per slice, split-K, the sums done in FP16 pairs (gemm_hfma_hc.cuh; FP16 groups of 64 products widened to
+    /// FP32, not bitwise the FP32 route's).  `resident`: W is the pack's own resident tensor; `x_lo`: a BF16X2 low part
+    /// follows.  `name`: the weight's name, for the counts.  False = nothing launched (counted under `name` with its reason):
+    /// the caller runs bf16().
+    bool bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                   int64_t ldx, bool resident, bool x_lo, const char* name);
 
     /// HIP gfx103x (prompt_f16()): bf16() takes X as the FP16 image the prompt path's kernels write (set_act_f16),
     /// and bf16() / f16() / native() run the GEMM with FP16 out (rocBLAS's tuned kernels there), widened in place in
@@ -157,6 +165,11 @@ void gemm_set_dense_f32(int mode);
 /// STRATA_PF_HFMA: one line per device with what the HFMA2 kernel ran since the last call and, by weight and reason, what it
 /// left to the old route; called when a prompt read of `tokens` tokens has ended.  Prints nothing when no call was made.
 void gemm_hfma_report(int64_t tokens);
+
+/// STRATA_PF_HFMA_HC: one line per device with what the HFMA2 route ran since the last call, what it left to the old route (by
+/// product and reason), the FP16 copies it made, the activation's range and shifts, the non-finite counts, the free VRAM and
+/// (with STRATA_PREFILL_TIMING) the kernels' own time; called when a prompt read of `tokens` tokens has ended.
+void gemm_hfma_hc_report(int64_t tokens);
 
 /// HIP on gfx103x (RDNA2), for the current device: rocBLAS's tuned GEMMs there are FP16 in -> FP16 out only (FP16 or
 /// BF16 in -> FP32 out runs ~6x slower), so the prompt path's 16-bit GEMMs run in FP16 (Gemm::set_f16_io,

@@ -91,6 +91,11 @@ struct Layer {
     int64_t hf_tokens = 0;
     int hf_layer = -1;
     int hf_tier = 0;
+    /// STRATA_PF_HFMA_DOWN=1 (hfma_down() below): the layer's number for the report (set by the caller before
+    /// hfma_down_plan) and the plan's answer `hd_tier`: 0 = the int8 swiglu_quant + down run, 16 / 32 = down_hf_prep +
+    /// down_hf (H as FP16 rows in `gu`'s own rows).
+    int hd_layer = -1;
+    int hd_tier = 0;
 };
 /// The layer's gate/up into gu, one launch; false (nothing launched) where the per-group MMQ is to run instead (mode 0,
 /// or not faster at this u) - the same GU rows either way.  A gu_nib layer has no per-group MMQ (the caller stops on
@@ -115,5 +120,26 @@ void hfma_exp_prepass(const Layer& L, void* stream);
 void hfma_exp_report(int64_t tokens);
 /// The layer's down from hq into dm, one launch.
 void down(const Layer& L, void* stream);
+
+/// STRATA_PF_HFMA_DOWN=1 (opt-in, read once; default off; needs mode() != 0, i.e. STRATA_MMQ_WS=1 on cc 6.0; independent of
+/// STRATA_PF_HFMA_EXP and STRATA_PF_HFMA): the down of a weight-stationary layer (Q2_0 or IQ4_NL experts) on FP16 HFMA2 pairs
+/// (moe_ws_dn_hf.cuh): H, the swiglu of the layer's gate/up rows, as FP16 rows (scaled by a power of two a row) in `gu`'s own
+/// rows instead of q8_1 blocks, the weights times their block scales as FP16 (shifted by a power of two a row and step so no
+/// lane of 64 products can overflow), the sums FP16 per 128 values and widened to FP32.  The same Dm contract (an FP32
+/// [rows][2560]), not its bits.  0 = off: every function below is then not called.
+int hfma_down();
+/// For a layer that took the weight-stationary route (after gate_up): whether its swiglu + down run the FP16 route (sets
+/// L.hd_tier and counts the taken launch, or the fallback with its reason and format).
+bool hfma_down_plan(Layer& L);
+/// A layer of `d_type` that did not reach hfma_down_plan (counted with its reason).
+void hfma_down_left(int d_type, int64_t rows, const char* why);
+/// swiglu of `gu`'s rows into FP16 H in place (replaces mmq::swiglu_quant for a layer with hd_tier != 0).
+void down_hf_prep(const Layer& L, void* stream);
+/// The FP16 down from the rows down_hf_prep left in `gu` into dm, one launch.
+void down_hf(const Layer& L, void* stream);
+/// One line per device with the launches (by format and tier), the fallbacks, the largest |H|, the weights' shifts, the
+/// non-finite counts and (with STRATA_PREFILL_TIMING) the kernels' own time and G MAC/s since the last call; `tokens` = the
+/// read's length.  Prints nothing when no layer was seen.
+void hfma_down_report(int64_t tokens);
 
 }  // namespace strata::prefill::ws

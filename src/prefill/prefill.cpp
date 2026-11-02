@@ -142,6 +142,12 @@ bool hfma_exp_plan(Layer&) { return false; }
 void hfma_exp_left(int, bool, int64_t, const char*) {}
 void hfma_exp_prepass(const Layer&, void*) {}
 void hfma_exp_report(int64_t) {}
+int hfma_down() { return 0; }
+bool hfma_down_plan(Layer&) { return false; }
+void hfma_down_left(int, int64_t, const char*) {}
+void down_hf_prep(const Layer&, void*) {}
+void down_hf(const Layer&, void*) {}
+void hfma_down_report(int64_t) {}
 }  // namespace strata::prefill::ws
 #endif
 
@@ -2768,6 +2774,18 @@ bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, 
     if (X_lo) gm.bf16(X_lo, wb, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy, 1.0f, 0, false, resident);
     return true;
 }
+// STRATA_PF_HFMA_HC=1 (gemm.cu, GP100 only): the hyper-connection read's down and up projections on FP16 HFMA2 pairs and the
+// BF16 weight's resident FP16 copy; a call the kernel cannot take is counted under `name` and runs bf16_proj
+bool hc_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
+             std::string& err, int64_t ldy = 0, const uint16_t* X_lo = nullptr, int64_t ldx = 0, void* stream = nullptr,
+             bool x_f16 = false) {
+    static const bool hfma = [] { const char* e = std::getenv("STRATA_PF_HFMA_HC"); return e != nullptr && std::atoi(e) != 0; }();
+    if (hfma && w->kind == core::WeightKind::Bf16InF32 && w->data && w->q8_scale == nullptr &&
+        gm.bf16_hfma(X, x_f16, (const uint16_t*) w->data, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy, ldx, w->hc_q8 == nullptr,
+                     X_lo != nullptr, name.c_str()))
+        return true;
+    return bf16_proj(gm, w, X, Y, T, name, err, ldy, X_lo, ldx, stream, x_f16);
+}
 
 }  // namespace
 
@@ -3787,7 +3805,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     hcd = true;
                 }
-                if (!hcd && !hdown && !bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
+                if (!hcd && !hdown && !hc_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
                 gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
                 bool upmixed = false;
                 if (wu->q8_scale == nullptr && hc_upmix() && T >= std::max(pf_switch_min_t(), hc_upmix_min_t()) && !gr_unfused() && !m.lo16_lo && !m.mixed_bf_lo &&
@@ -3816,8 +3834,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                            m.mixed, m.mixed_bf, m.mixed_h, T, m.cs);
                     }
                 }
-                if (!upmixed && !bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo, 0, m.cs)) return false;
-                if (!hcd && !bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
+                if (!upmixed && !hc_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo, 0, m.cs)) return false;
+                if (!hcd && !hc_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
                 if (upmixed) {
                 } else if (gr_unfused()) {
                     gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h, m.mixed_bf_lo);
@@ -4821,6 +4839,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     wl.rows = T * K; wl.n = (int) n; wl.xq = m.Xq; wl.gu = m.GU; wl.hq = m.Hq; wl.dm = m.Dm;
                                 }
                             }
+                            if (!ws_layer && ws::hfma_down() != 0)   // STRATA_PF_HFMA_DOWN: counted, runs the route it always did
+                                ws::hfma_down_left(mmq_dt, (int64_t) rows_local, "the layer is not on the weight-stationary route");
                             if (xq_pending) {
                                 // STRATA_PF_HFMA_EXP=1 (moe_ws.hpp): a 4-bit layer on the weight-stationary route may run its gate/up on
                                 // the FP16 image of its input (`mixed_h`, one row a token, read through src_dev: no q8_1 rows, no routed
@@ -5477,9 +5497,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 err = "prefill: the weight-stationary gate/up declined a layer it was picked for";
                                 return false;
                             }
-                            mmq::swiglu_quant(m.GU, m.Hq, T * K, !lay.native, m.cs);
-                            pt.mark(kPfGemmD, cs);
-                            ws::down(wl, m.cs);
+                            // STRATA_PF_HFMA_DOWN=1 (moe_ws.hpp): the down on FP16 HFMA2 - H as FP16 rows in GU's own rows (no q8_1
+                            // rows), the down kernel reading them; a layer the route does not take is counted and runs as below.
+                            // With the switch off hfma_down() is 0 and nothing here changes.
+                            if (ws::hfma_down() != 0) {
+                                wl.hd_layer = (int) l;
+                                ws::hfma_down_plan(wl);
+                            }
+                            if (wl.hd_tier != 0) {
+                                ws::down_hf_prep(wl, m.cs);
+                                pt.mark(kPfGemmD, cs);
+                                ws::down_hf(wl, m.cs);
+                            } else {
+                                mmq::swiglu_quant(m.GU, m.Hq, T * K, !lay.native, m.cs);
+                                pt.mark(kPfGemmD, cs);
+                                ws::down(wl, m.cs);
+                            }
                             if (stream_all && group_gather) give_back(consumed);
                         } else if (!stream_all) {
                             size_t staged = 0;
