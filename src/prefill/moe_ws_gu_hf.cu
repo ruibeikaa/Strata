@@ -3,7 +3,9 @@
 // fell back and why, the range of the input and the weights' shifts.  Opt-in; with the switch off nothing here is called.
 #include "moe_ws_hf.cuh"
 #include "moe_ws_hf_r2.cuh"
+#include "moe_ws_hf_cls.cuh"
 #include "strata/core/expert_nibble.hpp"
+#include "strata/core/pinned_ring.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -51,6 +53,12 @@ struct Dev {
     int64_t r2_left_n[32] = {};       // launches of a taken layer that stayed on the compiler kernel (r2_pick said 0)
     double r2_macs_left[32] = {};
     std::map<std::string, int64_t> r2_left;   // "FMT: reason" -> launches
+    int64_t cls_taken[32] = {};       // STRATA_PF_HFMA_CLASSES: [type & 31] launches of the pass-class kernels
+    double cls_macs[32] = {};         // ... their MACs
+    int64_t cls_items[4] = {};        // ... their passes by class (32 rows, 25..31, 17..24, 1..16)
+    int64_t cls_left_n[32] = {};      // launches that took the compiler kernel instead (a reason below, planned or at launch)
+    double cls_macs_left[32] = {};
+    std::map<std::string, int64_t> cls_left;   // "FMT: reason" -> launches
 };
 std::mutex g_mu;
 Dev g_dev[64];
@@ -60,7 +68,7 @@ void* g_state_ptr[64] = {};
 // kernels' own time and so their real G MAC/s
 struct Tm {
     cudaEvent_t a = nullptr, b = nullptr;
-    int type = 0, tier = 0, r2 = 0;
+    int type = 0, tier = 0, r2 = 0;   // r2: 0 the compiler kernel, 1 the R2 kernel, 2 the pass-class kernels
     double macs = 0.0;
 };
 std::vector<Tm> g_tm[64];
@@ -132,6 +140,142 @@ int hfma_r2() {
 }
 }  // namespace
 
+namespace {
+// STRATA_PF_HFMA_CLASSES=1 (opt-in, read once, with STRATA_PF_HFMA_EXP): the 4-bit gate/up of the prompt runs moe_ws_hf_cls.cuh's pass-class kernels
+// (the host splits the layer's chunk list into passes of 32 / 25..31 / 17..24 / 1..16 rows, each class on its own kernel and stream) wherever
+// r2_pick() says the two-rows kernel would have run (the same tier rule); it replaces the R2 kernel there.  Where it cannot run (no host chunk list,
+// no device buffer, a launch error) the compiler kernel runs, counted with its reason.
+int hfma_cls() {
+    static const int on = [] {
+        const char* e = std::getenv("STRATA_PF_HFMA_CLASSES");
+        if (e == nullptr || std::atoi(e) == 0) return 0;
+        const char* x = std::getenv("STRATA_PF_HFMA_EXP");
+        if (x == nullptr || std::atoi(x) == 0) {
+            std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_CLASSES=1 needs STRATA_PF_HFMA_EXP=1: ignored\n");
+            return 0;
+        }
+        std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_CLASSES=1: the 4-bit gate/up of the prompt on the pass-class FP16 HFMA2 kernels (passes of 32 / 25..31 / "
+                             "17..24 / 1..16 rows on direct-code, direct-code, 24-token and staged-code kernels; the same FP16 sums of 64 products widened to FP32 "
+                             "every 128 values; bitwise the compiler kernel's for IQ2_S, IQ2_XS, IQ2_XXS and IQ3_XXS, the R2 kernel's for IQ3_S)\n");
+        return 1;
+    }();
+    return on;
+}
+
+// per device: the layer's pass items on the device (uploaded by the prepass, on the compute stream, so a layer's lists are rewritten only after the
+// previous layer's kernels), the side streams and the fork / join events
+struct Cls {
+    std::vector<Chunk> host;          // this layer's items, [full | 25..31 | 17..24 | 1..16], from plan to prepass
+    Chunk* d = nullptr;
+    size_t d_cap = 0;
+    strata::core::PinnedRing ring;
+    cudaStream_t st[3] = {nullptr, nullptr, nullptr};
+    cudaEvent_t e0 = nullptr, ej[3] = {nullptr, nullptr, nullptr};
+    bool ready = false;               // the lists are on the device (the prepass's upload succeeded)
+    bool init = false;
+};
+Cls* g_cls[64] = {};
+Cls& cls_dev(int dev) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (g_cls[dev] == nullptr) g_cls[dev] = new Cls();   // never freed: the process exit owns the device state
+    return *g_cls[dev];
+}
+
+// the plan: split the layer's chunks into pass items by class; nullptr = taken, else why not
+const char* cls_plan(Layer& L) {
+    if (L.chunks_host == nullptr || L.nchunks <= 0) return "no host copy of the chunk list";
+    Cls& S = cls_dev(cur_dev());
+    static thread_local std::vector<Chunk> v[4];
+    for (auto& x : v) x.clear();
+    for (int64_t ci = 0; ci < L.nchunks; ++ci) {
+        const Chunk& c = L.chunks_host[ci];
+        for (int p0 = 0; p0 < c.rows; p0 += 32) {
+            const int nt = std::min(32, c.rows - p0);
+            v[nt == 32 ? 0 : nt > hf::W_MID_MIN ? 1 : nt > hf::W_SMALL_MAX ? 2 : 3].push_back(Chunk{c.j, c.row0 + p0, nt, 0});
+        }
+    }
+    const auto bigger = [](const Chunk& a, const Chunk& b) { return a.rows != b.rows ? a.rows > b.rows : a.row0 < b.row0; };
+    for (int c = 1; c < 4; ++c) std::sort(v[c].begin(), v[c].end(), bigger);   // the big remainders first, as the full passes are in chunk order
+    S.host.clear();
+    for (int c = 0; c < 4; ++c) {
+        L.hf_cls_n[c] = (int) v[c].size();
+        S.host.insert(S.host.end(), v[c].begin(), v[c].end());
+    }
+    if (S.host.empty()) return "no passes";
+    if (S.d_cap < S.host.size()) {   // grow-only; cudaFree waits for the device, so this is rare (4096 items = 64 KiB at first)
+        const size_t cap = std::max<size_t>(S.host.size() + S.host.size() / 2, 4096);
+        if (S.d != nullptr) cudaFree(S.d);
+        S.d = nullptr;
+        S.d_cap = 0;
+        if (cudaMalloc((void**) &S.d, cap * sizeof(Chunk)) != cudaSuccess) {
+            cudaGetLastError();
+            S.d = nullptr;
+            return "no device buffer for the pass lists";
+        }
+        S.d_cap = cap;
+    }
+    return nullptr;
+}
+
+// the prepass: the lists up, on the compute stream
+void cls_upload(const Layer& L, cudaStream_t s) {
+    Cls& S = cls_dev(cur_dev());
+    S.ready = false;
+    size_t n = 0;
+    for (int c = 0; c < 4; ++c) n += (size_t) L.hf_cls_n[c];
+    if (n == 0 || n != S.host.size() || S.d == nullptr || n > S.d_cap) return;
+    S.ready = S.ring.h2d(S.d, S.host.data(), n * sizeof(Chunk), s) == cudaSuccess;
+}
+
+bool cls_init(Cls& S) {
+    if (S.init) return true;
+    for (int i = 0; i < 3; ++i)
+        if (cudaStreamCreateWithFlags(&S.st[i], cudaStreamNonBlocking) != cudaSuccess || cudaEventCreateWithFlags(&S.ej[i], cudaEventDisableTiming) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+    if (cudaEventCreateWithFlags(&S.e0, cudaEventDisableTiming) != cudaSuccess) { cudaGetLastError(); return false; }
+    S.init = true;
+    return true;
+}
+
+// the four class kernels of a layer: full passes on the compute stream, the others on side streams that fork from it and join back to it
+template <int FAM>
+const char* cls_launch_fam(const Layer& L, Cls& S, const char* w, const uint4* xh, cudaStream_t s) {
+    const int nf = L.hf_cls_n[0], nm = L.hf_cls_n[1], nm2 = L.hf_cls_n[2], ns = L.hf_cls_n[3];
+    const Chunk* pf = S.d;
+    const Chunk* pm = pf + nf;
+    const Chunk* pm2 = pm + nm;
+    const Chunk* ps = pm2 + nm2;
+    cudaEventRecord(S.e0, s);
+    for (int i = 0; i < 3; ++i) cudaStreamWaitEvent(S.st[i], S.e0, 0);
+    int note = 1;   // the launch is counted by ONE kernel of the layer
+    if (nf > 0) { hf::gd_kernel<32, FAM, 2, true><<<(unsigned) nf * hf::W_PIECES, hf::W_NT, 0, s>>>(pf, w, L.xoff, xh, L.hf_src, L.gu, L.hf_layer, note); note = 0; }
+    if (nm > 0) { hf::gd_kernel<32, FAM, 2, false><<<(unsigned) nm * hf::W_PIECES, hf::W_NT, 0, S.st[0]>>>(pm, w, L.xoff, xh, L.hf_src, L.gu, L.hf_layer, note); note = 0; }
+    if (nm2 > 0) { hf::gd_kernel<24, FAM, 2, false><<<(unsigned) nm2 * hf::W_PIECES, hf::W_NT, 0, S.st[1]>>>(pm2, w, L.xoff, xh, L.hf_src, L.gu, L.hf_layer, note); note = 0; }
+    if (ns > 0) { hf::gs_kernel<16, FAM><<<(unsigned) ns * hf::W_PIECES, hf::W_NT, 0, S.st[2]>>>(ps, w, L.xoff, xh, L.hf_src, L.gu, L.hf_layer, note); note = 0; }
+    for (int i = 0; i < 3; ++i) {
+        cudaEventRecord(S.ej[i], S.st[i]);
+        cudaStreamWaitEvent(s, S.ej[i], 0);
+    }
+    return cudaGetLastError() == cudaSuccess ? nullptr : "a class kernel's launch failed";
+}
+
+// nullptr: launched; else why it was not (nothing, or all but a failed part, is enqueued: the caller runs the compiler kernel after the join)
+const char* cls_launch(const Layer& L, const char* w, const uint4* xh, cudaStream_t s) {
+    Cls& S = cls_dev(cur_dev());
+    if (!S.ready) return "the pass lists' upload failed";
+    if (!cls_init(S)) return "the side streams could not be created";
+    switch (hf::family(L.gu_type)) {
+        case 0: return cls_launch_fam<0>(L, S, w, xh, s);
+        case 1: return cls_launch_fam<1>(L, S, w, xh, s);
+        case 2: return cls_launch_fam<2>(L, S, w, xh, s);
+        case 3: return cls_launch_fam<3>(L, S, w, xh, s);
+        default: return "no class kernel for the format";
+    }
+}
+}  // namespace
+
 int hfma_exp() {
     static const int on = [] {
         const char* e = std::getenv("STRATA_PF_HFMA_EXP");
@@ -164,18 +308,38 @@ bool hfma_exp_plan(Layer& L) {
     }
     L.hf_tier = u >= kU32 ? 32 : 16;
     L.hf_r2 = 0;
+    L.hf_cls = 0;
     bool r2_stay = false;
-    if (hfma_r2() != 0) {
+    const char* cls_why = nullptr;
+    if (hfma_cls() != 0 || hfma_r2() != 0) {
         const int pick = r2_pick(hf::family(L.gu_type), u);
-        if (pick != 0) { L.hf_r2 = 1; L.hf_tier = pick; }
-        else r2_stay = true;
+        if (pick == 0) {
+            r2_stay = true;
+        } else if (hfma_cls() != 0) {   // the pass-class kernels replace the R2 kernel where it would have run; the compiler kernel is their counted fallback
+            cls_why = cls_plan(L);
+            if (cls_why == nullptr) { L.hf_cls = 1; L.hf_tier = pick; }
+        } else {
+            L.hf_r2 = 1;
+            L.hf_tier = pick;
+        }
     }
     std::lock_guard<std::mutex> lk(g_mu);
     Dev& d = g_dev[dev];
     d.seen = true;
     ++d.taken[L.gu_type & 31][L.hf_tier == 32 ? 1 : 0];
     d.macs_taken[L.gu_type & 31] += rows * kMacsPerRow;
-    if (L.hf_r2 != 0) {
+    if (hfma_cls() != 0) {
+        if (L.hf_cls != 0) {
+            ++d.cls_taken[L.gu_type & 31];
+            d.cls_macs[L.gu_type & 31] += rows * kMacsPerRow;
+            for (int c = 0; c < 4; ++c) d.cls_items[c] += L.hf_cls_n[c];
+        } else {
+            ++d.cls_left_n[L.gu_type & 31];
+            d.cls_macs_left[L.gu_type & 31] += rows * kMacsPerRow;
+            ++d.cls_left[std::string(fname(L.gu_type)) + ": " +
+                         (cls_why != nullptr ? cls_why : "u below the pass-class kernels' range, the compiler kernel's 16-token tier is faster there")];
+        }
+    } else if (L.hf_r2 != 0) {
         ++d.r2_taken[L.gu_type & 31][L.hf_tier == 32 ? 1 : 0];
         d.r2_macs[L.gu_type & 31] += rows * kMacsPerRow;
     } else if (r2_stay) {
@@ -200,6 +364,7 @@ void hfma_exp_prepass(const Layer& L, void* stream) {
     const unsigned blocks = (unsigned) std::max<int64_t>(1, std::min<int64_t>(2048, (n16 + 1023) / 1024));
     hf::xmax_kernel<<<blocks, 256, 0, s>>>((const uint4*) L.hf_xh, n16);
     ck(cudaGetLastError(), "hfma_exp: max-reduce");
+    if (L.hf_cls != 0) cls_upload(L, s);   // STRATA_PF_HFMA_CLASSES: this layer's pass lists up on the compute stream, behind the previous layer's kernels
 }
 
 namespace detail {
@@ -214,6 +379,7 @@ void gu_hf(const Layer& L, cudaStream_t s) {
     const uint4* xh = (const uint4*) L.hf_xh;
     const char* w = (const char*) L.w;
     cudaEvent_t ev_b = nullptr;
+    size_t tm_i = 0;
     if (timing_on()) {
         const int dev = cur_dev();
         cudaEvent_t ev_a = nullptr;
@@ -226,10 +392,11 @@ void gu_hf(const Layer& L, cudaStream_t s) {
                 ck(cudaEventCreate(&t.b), "hfma_exp: event");
                 v.push_back(t);
             }
+            tm_i = g_tm_n[dev];
             Tm& t = v[g_tm_n[dev]++];
             t.type = L.gu_type;
             t.tier = L.hf_tier;
-            t.r2 = L.hf_r2;
+            t.r2 = L.hf_cls != 0 ? 2 : L.hf_r2;
             t.macs = (double) L.rows * kMacsPerRow;
             ev_a = t.a;
             ev_b = t.b;
@@ -252,7 +419,28 @@ void gu_hf(const Layer& L, cudaStream_t s) {
         case 3: hf::gu2_kernel<TPP, 3><<<grid2, hf::R2_NT, 0, s>>>(L.chunks, w, L.xoff, xh, L.hf_src, L.gu, L.hf_layer); break; \
         default: std::fprintf(stderr, "prefill ws: 4-bit gate/up type %d has no FP16 kernel\n", L.gu_type); std::exit(1); \
     }
-    if (L.hf_r2 != 0) {   // STRATA_PF_HFMA_R2: 256 rows a CTA, five CTAs a chunk
+    const char* cls_why = nullptr;
+    if (L.hf_cls != 0) cls_why = cls_launch(L, w, xh, s);   // STRATA_PF_HFMA_CLASSES: four class kernels; nullptr = launched
+    if (cls_why != nullptr) {   // the compiler kernel, at the tier its own rule gives (everything the class kernels wrote is rewritten behind them on this stream)
+        const int dev = cur_dev();
+        const double macs = (double) L.rows * kMacsPerRow;
+        const int ftier = (double) L.rows >= kU32 * (double) L.n ? 32 : 16;
+        {
+            std::lock_guard<std::mutex> lk(g_mu);
+            Dev& d = g_dev[dev];
+            --d.cls_taken[L.gu_type & 31];
+            d.cls_macs[L.gu_type & 31] -= macs;
+            for (int c = 0; c < 4; ++c) d.cls_items[c] -= L.hf_cls_n[c];
+            ++d.cls_left_n[L.gu_type & 31];
+            d.cls_macs_left[L.gu_type & 31] += macs;
+            ++d.cls_left[std::string(fname(L.gu_type)) + ": " + cls_why + " (at launch)"];
+            if (ev_b != nullptr) { g_tm[dev][tm_i].r2 = 0; g_tm[dev][tm_i].tier = ftier; }
+        }
+        if (ftier == 32) { STRATA_HF_LAUNCH(32) }
+        else { STRATA_HF_LAUNCH(16) }
+    } else if (L.hf_cls != 0) {
+        // launched above
+    } else if (L.hf_r2 != 0) {   // STRATA_PF_HFMA_R2: 256 rows a CTA, five CTAs a chunk
         const unsigned grid2 = (unsigned) (L.nchunks * hf::R2_PIECES);
         if (L.hf_tier == 32) { STRATA_HF_LAUNCH_R2(32) }
         else { STRATA_HF_LAUNCH_R2(16) }
@@ -290,7 +478,7 @@ void hfma_exp_report(int64_t tokens) {
             for (size_t i = 0; i < g_tm_n[dev]; ++i) {
                 float ms = 0.0f;
                 if (cudaEventSynchronize(g_tm[dev][i].b) == cudaSuccess && cudaEventElapsedTime(&ms, g_tm[dev][i].a, g_tm[dev][i].b) == cudaSuccess) {
-                    Acc& a = acc[{g_tm[dev][i].type, g_tm[dev][i].tier + (g_tm[dev][i].r2 != 0 ? 100 : 0)}];
+                    Acc& a = acc[{g_tm[dev][i].type, g_tm[dev][i].tier + 100 * g_tm[dev][i].r2}];
                     a.ms += ms; a.macs += g_tm[dev][i].macs; ++a.n;
                     ms_all += ms; macs_all += g_tm[dev][i].macs;
                 } else {
@@ -301,7 +489,7 @@ void hfma_exp_report(int64_t tokens) {
             for (const auto& [key, a] : acc) {
                 char b[160];
                 std::snprintf(b, sizeof b, "%s%s t%d%s x%lld %.1f ms %.0f GMAC/s", kt.empty() ? "" : "; ", fname(key.first), key.second % 100,
-                              key.second >= 100 ? "r2" : "", (long long) a.n, a.ms, a.ms > 0 ? a.macs / a.ms * 1e-6 : 0.0);
+                              key.second >= 200 ? "cls" : key.second >= 100 ? "r2" : "", (long long) a.n, a.ms, a.ms > 0 ? a.macs / a.ms * 1e-6 : 0.0);
                 kt += b;
             }
             char b[120];
@@ -349,6 +537,28 @@ void hfma_exp_report(int64_t tokens) {
             r2s = b;
             r2s += "; by format: " + (rb.empty() ? std::string("-") : rb) + "; left: " + (rl.empty() ? std::string("nothing") : rl);
         }
+        std::string cls_s;   // STRATA_PF_HFMA_CLASSES: what ran on the pass-class kernels, what stayed on the compiler kernel and why
+        if (hfma_cls() != 0) {
+            int64_t c_n = 0, c_l = 0;
+            double c_m = 0.0, c_lm = 0.0;
+            std::string cb;
+            for (int t = 0; t < 32; ++t) {
+                c_n += d.cls_taken[t]; c_l += d.cls_left_n[t]; c_m += d.cls_macs[t]; c_lm += d.cls_macs_left[t];
+                if (d.cls_taken[t] == 0 && d.cls_left_n[t] == 0) continue;
+                char b[160];
+                std::snprintf(b, sizeof b, "%s%s %lld on the class kernels, %lld on the compiler kernel", cb.empty() ? "" : "; ", fname(t), (long long) d.cls_taken[t],
+                              (long long) d.cls_left_n[t]);
+                cb += b;
+            }
+            std::string cl;
+            for (const auto& [what, n] : d.cls_left) cl += (cl.empty() ? "" : ", ") + what + " x" + std::to_string((long long) n);
+            char b[400];
+            std::snprintf(b, sizeof b, "; STRATA_PF_HFMA_CLASSES: %lld launches on the class kernels (%.1f%% of the HFMA2 MACs; passes: 32 rows x%lld, 25..31 x%lld, 17..24 x%lld, 1..16 x%lld), %lld on the compiler kernel",
+                          (long long) c_n, c_m + c_lm > 0 ? 100.0 * c_m / (c_m + c_lm) : 0.0, (long long) d.cls_items[0], (long long) d.cls_items[1], (long long) d.cls_items[2],
+                          (long long) d.cls_items[3], (long long) c_l);
+            cls_s = b;
+            cls_s += "; by format: " + (cb.empty() ? std::string("-") : cb) + "; left: " + (cl.empty() ? std::string("nothing") : cl);
+        }
         auto h2f = [](unsigned bits) { return __half2float(__ushort_as_half((unsigned short) bits)); };
         std::string lm;
         for (int l = 0; l < 64; ++l)
@@ -366,11 +576,11 @@ void hfma_exp_report(int64_t tokens) {
             }
         std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_EXP: read of %lld tokens, CUDA%d: gate/up %lld launches on HFMA2, %lld left to the int8 kernels "
                              "(%.1f%% of %.3g MACs on HFMA2); by format: %s; left: %s; input max |x| %.2f (per layer: %s); weights' shift k "
-                             "(2^-k) per launch: %s; non-finite: input in %u launches, output %u values; kernel time: %s%s\n",
+                             "(2^-k) per launch: %s; non-finite: input in %u launches, output %u values; kernel time: %s%s%s\n",
                      (long long) tokens, dev, (long long) n_taken, (long long) n_left,
                      m_taken + m_left > 0 ? 100.0 * m_taken / (m_taken + m_left) : 0.0, m_taken + m_left, by.empty() ? "-" : by.c_str(),
                      lft.empty() ? "nothing" : lft.c_str(), h2f(st.all_max), lm.empty() ? "-" : lm.c_str(), kh.empty() ? "-" : kh.c_str(), st.bad_x,
-                     st.bad_y, kt.empty() ? "-" : kt.c_str(), r2s.c_str());
+                     st.bad_y, kt.empty() ? "-" : kt.c_str(), r2s.c_str(), cls_s.c_str());
         d = Dev{};
     }
     cudaSetDevice(back);

@@ -94,6 +94,13 @@ struct Layer {
     /// STRATA_PF_HFMA_R2=1 (with STRATA_PF_HFMA_EXP): hfma_exp_plan's answer for a layer it took - 1 = the two-rows-a-thread kernel
     /// of moe_ws_hf_r2.cuh runs it at `hf_tier`, 0 = the compiler kernel of moe_ws_hf.cuh (what the layer's u favours).
     int hf_r2 = 0;
+    /// STRATA_PF_HFMA_CLASSES=1 (with STRATA_PF_HFMA_EXP): the host copy of `chunks` (valid only during the layer's hfma_exp_plan; the caller
+    /// sets it with `chunks`), from which the plan splits the layer's passes into size classes; and the plan's answer for a layer it took -
+    /// `hf_cls` = 1: moe_ws_hf_cls.cuh's four class kernels run the layer's gate/up at `hf_tier`'s rule (hf_r2 is 0 then), `hf_cls_n[c]` =
+    /// the passes of class c (32 rows, 25..31, 17..24, 1..16) that the prepass uploads and gu_hf launches.  0 = the R2 / compiler kernel.
+    const Chunk* chunks_host = nullptr;
+    int hf_cls = 0;
+    int hf_cls_n[4] = {0, 0, 0, 0};
     /// STRATA_PF_HFMA_DOWN=1 (hfma_down() below): the layer's number for the report (set by the caller before
     /// hfma_down_plan) and the plan's answer `hd_tier`: 0 = the int8 swiglu_quant + down run, 16 / 32 = down_hf_prep +
     /// down_hf (H as FP16 rows in `gu`'s own rows).

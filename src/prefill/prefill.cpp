@@ -4935,6 +4935,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                         ch = m.ws_chunks_host.data();
                                     }
                                     wl.nchunks = (int64_t) ws::chunks(order.data(), n, m.cnt.data(), m.bounds_host.data(), ch);
+                                    wl.chunks_host = ch;   // STRATA_PF_HFMA_CLASSES: read by hfma_exp_plan below, in this iteration only
                                     if (grp_mapped) {
                                         copy_i32((int32_t*) m.ws_chunks, m.grp_dev + ((int32_t*) ch - m.grp_host), 4 * wl.nchunks, m.cs);
                                     } else if (m.up_ring.h2d(m.xoff_dev, m.xoff_host.data(), n * sizeof(int64_t), m.cs) != cudaSuccess ||
