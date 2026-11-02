@@ -7,14 +7,19 @@
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/ktime.hpp"
 #include "strata/kernels/gfx_arch.hpp"
+#include "strata/prefill/pf_small2.hpp"   // STRATA_PF_HFMA_SEL, STRATA_PF_TOPK_SEL
 
 #include <cuda_runtime.h>
+#if !defined(__HIPCC__)
+#include <cuda_fp16.h>   // STRATA_PF_HFMA_SEL
+#endif
 
 #include <atomic>
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace strata::kernels {
 namespace {
@@ -1965,6 +1970,428 @@ __global__ void __launch_bounds__(MT_T) block_topk_multi_emit_kernel(const float
     }
 }
 #endif  // !__HIPCC__ && STRATA_EXPERIMENTAL_SM60
+#if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
+// ---- STRATA_PF_HFMA_SEL (default off): the prompt's select scores on FP16 HFMA2 pairs of key blocks (sm_60).  Found with the Kernel Forge harness (kf-work\ksel, node 7):
+// 256 threads = 64 queries x 4 K-slice lanes; a lane keeps its quarter of the query (4 heads x 32 values, scaled by a power of two per (query, head) so that max |q| is in [1, 2)) as FP16 pairs
+// in 64 registers; the keys are staged per tile of 128 blocks, scaled by a power of two per block (max |k| in [1, 2)), converted to FP16 and packed as PAIRS OF BLOCKS (one HFMA2 = the same
+// d of two blocks), so a lane runs 32 independent accumulators of <= 32 products (the engine's FP16 convention is <= 64) and reduces them over the 4 lanes with HADD2 (nothing can overflow:
+// |q| < 2, |k| < 2, 128 products < 512); relu, the head sum and the unscaling are FP32.  One strip of blocks a CTA, as many CTAs as SMs (no waves).  The scores are not the FP32 kernel's
+// bits: relative rms error 4.4e-4 against double on real calls, the selection differs in 0.06-0.16% of the cells, only for blocks within 1.3e-3 of the exact threshold.
+constexpr int SH2_TG = 8;         // groups of 16 blocks a tile (128 blocks: 37 KB of shared)
+constexpr int SH2_BR = 256;       // blocks a CTA
+constexpr int SH2_CHW = 36;       // words of a 32-d chunk row (32 + 4: the four slices' LDS.128 land in different banks)
+constexpr int SH2_Q = 64;         // queries a CTA
+
+__device__ __forceinline__ uint32_t sh2_hfma2(const uint32_t a, const uint32_t b, const uint32_t c) {
+    uint32_t d;
+    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
+}
+__device__ __forceinline__ uint32_t sh2_hadd2(const uint32_t a, const uint32_t b) {
+    uint32_t d;
+    asm("add.rn.f16x2 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b));
+    return d;
+}
+__device__ __forceinline__ uint32_t sh2_rep_lo(const uint32_t w) {
+    uint32_t r;
+    asm("{ .reg .b16 lo, hi; mov.b32 {lo,hi}, %1; mov.b32 %0, {lo,lo}; }" : "=r"(r) : "r"(w));
+    return r;
+}
+__device__ __forceinline__ uint32_t sh2_rep_hi(const uint32_t w) {
+    uint32_t r;
+    asm("{ .reg .b16 lo, hi; mov.b32 {lo,hi}, %1; mov.b32 %0, {hi,hi}; }" : "=r"(r) : "r"(w));
+    return r;
+}
+__device__ __forceinline__ uint32_t sh2_pack_h2(const float lo, const float hi) {
+    return (uint32_t) __half_as_ushort(__float2half_rn(lo)) | ((uint32_t) __half_as_ushort(__float2half_rn(hi)) << 16);
+}
+// floor(log2(amax)) clamped, 0 for 0 / inf / NaN
+__device__ __forceinline__ int sh2_exp_of(const float amax) {
+    if (!(amax > 0.0f) || !(amax < 3.0e38f)) return 0;
+    int e = (int) (__float_as_uint(amax) >> 23) - 127;
+    return e < -100 ? -100 : (e > 100 ? 100 : e);
+}
+__device__ __forceinline__ float sh2_pow2f(const int e) { return __int_as_float((127 + e) << 23); }
+
+__global__ void __launch_bounds__(256, 1) sel_scores_h2_kernel(const float* __restrict__ pooled, const float* __restrict__ q_idx,
+                                                              const int32_t* __restrict__ steps, int64_t nq, int64_t max_blocks, int64_t reach,
+                                                              int64_t strip, float* __restrict__ out) {
+    __shared__ __align__(16) uint32_t tile[SH2_TG * 8 * 4 * SH2_CHW];
+    __shared__ float ksc[SH2_TG * 16];
+    __shared__ int64_t s_nbid[SH2_Q];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5, j = lane & 3;
+    const int ql = warp * 8 + (lane >> 2);
+    const int64_t q0 = (int64_t) blockIdx.y * SH2_Q, qi = q0 + ql;
+    if (t < SH2_Q) s_nbid[t] = q0 + t < nq ? steps[(q0 + t) * kStepCount + kStepNBid] : -1;
+    uint32_t qw[4][16];
+    float qsc[4];
+    {
+        const float* src = q_idx + (qi < nq ? qi : 0) * 512 + 32 * j;
+#pragma unroll
+        for (int h = 0; h < 4; ++h) {
+            float2 v[16];
+            float amax = 0.0f;
+#pragma unroll
+            for (int w = 0; w < 16; ++w) {
+                v[w] = *reinterpret_cast<const float2*>(src + h * 128 + 2 * w);
+                amax = fmaxf(amax, fmaxf(fabsf(v[w].x), fabsf(v[w].y)));
+            }
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+            const int e = sh2_exp_of(amax);
+            const float sin_ = sh2_pow2f(-e);
+            qsc[h] = sh2_pow2f(e);
+#pragma unroll
+            for (int w = 0; w < 16; ++w) qw[h][w] = sh2_pack_h2(v[w].x * sin_, v[w].y * sin_);
+        }
+    }
+    __syncthreads();
+    int64_t top = -1;
+    for (int i = 0; i < SH2_Q; ++i) top = s_nbid[i] > top ? s_nbid[i] : top;
+    const int64_t b_lo = (int64_t) blockIdx.x * strip;
+    int64_t b_hi = b_lo + strip;
+    if (b_hi > reach) b_hi = reach;
+    if (b_hi > top) b_hi = top;
+    if (b_hi > max_blocks) b_hi = max_blocks;
+    for (int64_t b0 = b_lo; b0 < b_hi; b0 += SH2_TG * 16) {
+        __syncthreads();   // the previous tile's reads of tile / ksc are done
+        // ---- stage: warp w packs pairs 2w and 2w+1 of the tile (blocks b0 + 2p, b0 + 2p + 1)
+#pragma unroll
+        for (int pi = 0; pi < SH2_TG; ++pi) {
+            const int p = warp * SH2_TG + pi;
+            const int64_t bA = b0 + 2 * p, bB = bA + 1;
+            float4 a = make_float4(0.f, 0.f, 0.f, 0.f), b = a;
+            if (bA < reach) a = *reinterpret_cast<const float4*>(pooled + bA * 128 + 4 * lane);
+            if (bB < reach) b = *reinterpret_cast<const float4*>(pooled + bB * 128 + 4 * lane);
+            float ma = fmaxf(fmaxf(fabsf(a.x), fabsf(a.y)), fmaxf(fabsf(a.z), fabsf(a.w)));
+            float mb = fmaxf(fmaxf(fabsf(b.x), fabsf(b.y)), fmaxf(fabsf(b.z), fabsf(b.w)));
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                ma = fmaxf(ma, __shfl_xor_sync(0xffffffffu, ma, o));
+                mb = fmaxf(mb, __shfl_xor_sync(0xffffffffu, mb, o));
+            }
+            const int ea = sh2_exp_of(ma), eb = sh2_exp_of(mb);
+            const float sa = sh2_pow2f(-ea), sb = sh2_pow2f(-eb);
+            uint4 wv;
+            wv.x = sh2_pack_h2(a.x * sa, b.x * sb);
+            wv.y = sh2_pack_h2(a.y * sa, b.y * sb);
+            wv.z = sh2_pack_h2(a.z * sa, b.z * sb);
+            wv.w = sh2_pack_h2(a.w * sa, b.w * sb);
+            *reinterpret_cast<uint4*>(&tile[(((p >> 3) * 8 + (p & 7)) * 4 + (lane >> 3)) * SH2_CHW + (lane & 7) * 4]) = wv;
+            if (lane == 0) { ksc[2 * p] = sh2_pow2f(ea); ksc[2 * p + 1] = sh2_pow2f(eb); }
+        }
+        __syncthreads();
+        const int ng = (int) ((b_hi - b0 + 15) >> 4) < SH2_TG ? (int) ((b_hi - b0 + 15) >> 4) : SH2_TG;
+        for (int g = 0; g < ng; ++g) {
+            uint32_t acc[4][8];
+#pragma unroll
+            for (int h = 0; h < 4; ++h)
+#pragma unroll
+                for (int pp = 0; pp < 8; ++pp) acc[h][pp] = 0u;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                uint4 kw[8];
+#pragma unroll
+                for (int pp = 0; pp < 8; ++pp) kw[pp] = *reinterpret_cast<const uint4*>(&tile[((g * 8 + pp) * 4 + j) * SH2_CHW + 4 * i]);
+#pragma unroll
+                for (int h = 0; h < 4; ++h) {
+                    const uint32_t w0 = qw[h][2 * i], w1 = qw[h][2 * i + 1];
+                    const uint32_t q0r = sh2_rep_lo(w0), q1r = sh2_rep_hi(w0), q2r = sh2_rep_lo(w1), q3r = sh2_rep_hi(w1);
+#pragma unroll
+                    for (int pp = 0; pp < 8; ++pp) {
+                        acc[h][pp] = sh2_hfma2(q0r, kw[pp].x, acc[h][pp]);
+                        acc[h][pp] = sh2_hfma2(q1r, kw[pp].y, acc[h][pp]);
+                        acc[h][pp] = sh2_hfma2(q2r, kw[pp].z, acc[h][pp]);
+                        acc[h][pp] = sh2_hfma2(q3r, kw[pp].w, acc[h][pp]);
+                    }
+                }
+            }
+            // ---- reduce-scatter over the 4 slice lanes: lane j ends with pairs j and j + 4 of every head
+            const bool bit1 = (lane & 2) != 0, bit0 = (lane & 1) != 0;
+            uint32_t res[4][2];
+#pragma unroll
+            for (int h = 0; h < 4; ++h) {
+#pragma unroll
+                for (int c = 0; c < 2; ++c) {
+                    uint32_t a[2];
+#pragma unroll
+                    for (int b0i = 0; b0i < 2; ++b0i) {
+                        const uint32_t keep = bit1 ? acc[h][4 * c + 2 + b0i] : acc[h][4 * c + b0i];
+                        const uint32_t snd = bit1 ? acc[h][4 * c + b0i] : acc[h][4 * c + 2 + b0i];
+                        a[b0i] = sh2_hadd2(keep, __shfl_xor_sync(0xffffffffu, snd, 2));
+                    }
+                    const uint32_t keep = bit0 ? a[1] : a[0], snd = bit0 ? a[0] : a[1];
+                    res[h][c] = sh2_hadd2(keep, __shfl_xor_sync(0xffffffffu, snd, 1));
+                }
+            }
+#pragma unroll
+            for (int c = 0; c < 2; ++c) {
+                float t0 = 0.0f, t1 = 0.0f;
+#pragma unroll
+                for (int h = 0; h < 4; ++h) {
+                    const __half2 hv = *reinterpret_cast<const __half2*>(&res[h][c]);
+                    const float2 f = __half22float2(hv);
+                    t0 = fmaf(fmaxf(f.x, 0.0f), qsc[h], t0);
+                    t1 = fmaf(fmaxf(f.y, 0.0f), qsc[h], t1);
+                }
+                const int64_t bw = b0 + 16 * g + 2 * (4 * c + j);
+                const float s0 = t0 * ksc[16 * g + 2 * (4 * c + j)], s1 = t1 * ksc[16 * g + 2 * (4 * c + j) + 1];
+                if (qi < nq) {
+                    const int64_t nb = s_nbid[ql];
+                    float* o = out + qi * max_blocks + bw;
+                    if (bw + 1 < nb && ((qi * max_blocks + bw) & 1) == 0) {
+                        *reinterpret_cast<float2*>(o) = make_float2(s0, s1);
+                    } else {
+                        if (bw < nb) o[0] = s0;
+                        if (bw + 1 < nb) o[1] = s1;
+                    }
+                }
+            }
+        }
+    }
+}
+#endif  // !__HIPCC__ && STRATA_EXPERIMENTAL_SM60
+#if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
+// ---- STRATA_PF_TOPK_SEL (default off): the prompt's select top-k with ids EXACTLY block_topk_wide_kernel's (kf-work\ktopk, node 4).  A bound LB (the KS-th largest of every 32nd
+// block's key) is verified by counting (the weighted cells at or above it must reach `width`: then the width-th largest key, thr, is >= LB and every block at or above thr is a survivor); one
+// coalesced pass leaves a ballot mask a warp-row and the survivors are gathered in block order (a scan over the warps); thr and `above` come from the engine's radix rule over the survivors
+// only and the cells are emitted by its tie rule.  A query whose row is longer than 40,960 blocks, whose survivors do not fit (4,096) or whose bound is wrong is flagged in g_tk_fail and run
+// by block_topk_wide_kernel<true> in the next launch.
+constexpr int TS2_T = 1024;
+constexpr int TS2_CAP = 4096;          // survivors a query can hold
+constexpr int TS2_PERMAX = 40;         // rows of 32 blocks a warp (nb <= 40,960 = a 163K-token prompt)
+constexpr int TS2_STRIDE = 32;         // sample stride in blocks
+
+__global__ void __launch_bounds__(TS2_T) block_topk_sel_kernel(const float* __restrict__ scores, const int32_t* __restrict__ steps, int64_t max_blocks, int64_t cap, int32_t* __restrict__ ids) {
+    __shared__ uint32_t s_key[TS2_CAP];
+    __shared__ uint16_t s_off[TS2_CAP];
+    __shared__ unsigned s_mask[32][TS2_PERMAX];
+    __shared__ int s_woff[33];
+    __shared__ int hist[256];
+    __shared__ int s_cnt[32], s_gt[32], s_eq[32], s_warp[33];
+    __shared__ int s_digit, s_above, s_fail;
+        const int64_t qi = blockIdx.x;
+    const int32_t* st = steps + qi * kStepCount;
+    const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
+    int32_t* out = ids + qi * cap;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    if (n_kv <= width) {
+        for (int64_t j = t; j < n_kv; j += TS2_T) out[j] = (int32_t) j;
+        if (t == 0) g_tk_fail[qi] = 0;
+        return;
+    }
+    const float* sc = scores + qi * max_blocks;
+    const int nbid = (int) n_bid, nb = nbid + 1;
+    const int per = (nb + TS2_T - 1) / TS2_T;                 // rows of 32 blocks a warp
+    const int wlast = (int) (n_kv - n_bid * R);             // the tail block's cells
+    const int w0 = warp * 32 * per;
+    auto weight = [&](int b) -> int { return b < nbid ? R : (b == nbid ? wlast : 0); };
+    const int ns = (nb + TS2_STRIDE - 1) / TS2_STRIDE;
+    if (t == 0) s_fail = 0;
+    if (per > TS2_PERMAX) {                                  // too long a row for the masks
+
+        if (t == 0) g_tk_fail[qi] = 1;
+        return;
+    }
+    // ---- 1. the samples
+    for (int i = t; i < ns; i += TS2_T) s_key[i] = weight(i * TS2_STRIDE) ? order_key(sc[i * TS2_STRIDE]) : 0u;
+    __syncthreads();
+    // ---- 2. LB = the KS-th largest sample (radix select, 4 passes over <= ns keys)
+    const int ks_want = 2 * (int) ((width + R * TS2_STRIDE - 1) / (R * TS2_STRIDE)) + 16;
+    const int m = ks_want < ns ? ks_want : ns;
+    uint32_t prefix = 0;
+    int above = 0;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        if (t < 256) hist[t] = 0;
+        __syncthreads();
+        const uint32_t hi_mask = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
+        for (int i = t; i < ns; i += TS2_T) {
+            const uint32_t k = s_key[i];
+            if ((k & hi_mask) == (prefix & hi_mask)) atomicAdd(&hist[(k >> shift) & 255], 1);
+        }
+        __syncthreads();
+        int v = 0, x = 0;
+        if (t < 256) {
+            v = hist[255 - t];
+            x = v;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int y = __shfl_up_sync(0xffffffffu, x, o);
+                if (lane >= o) x += y;
+            }
+            if (lane == 31) s_warp[warp] = x;
+        }
+        __syncthreads();
+        if (t < 256) {
+            int inc = x;
+            for (int w2 = 0; w2 < warp; ++w2) inc += s_warp[w2];
+            const int before = above + inc - v;
+            if (before < m && (above + inc >= m || t == 255)) { s_digit = 255 - t; s_above = before; }
+        }
+        __syncthreads();
+        prefix |= (uint32_t) s_digit << shift;
+        above = s_above;
+        __syncthreads();
+    }
+    const uint32_t lb = prefix;
+    // ---- 3. the survivors of the row: A) a ballot mask a warp-row and the count a warp, B) a scan over the warps, C) gather the survivors in block order
+    int cnt = 0;
+    for (int r = 0; r < per; ++r) {
+        const int b = w0 + r * 32 + lane;
+        const int wg = b < nb ? weight(b) : 0;
+        const uint32_t k = wg ? order_key(sc[b]) : 0u;
+        const unsigned mask = __ballot_sync(0xffffffffu, wg != 0 && k >= lb);
+        if (lane == 0) s_mask[warp][r] = mask;
+        cnt += __popc(mask);
+    }
+    if (lane == 0) s_cnt[warp] = cnt;
+    __syncthreads();
+    if (t == 0) {
+        int sum = 0;
+        for (int w2 = 0; w2 < 32; ++w2) { s_woff[w2] = sum; sum += s_cnt[w2]; }
+        s_woff[32] = sum;
+        if (sum > TS2_CAP) s_fail = 1;
+    }
+    __syncthreads();
+    if (s_fail) {
+        if (t == 0) g_tk_fail[qi] = 1;
+        return;
+    }
+    const int base = s_woff[warp];
+    uint32_t* seg_key = &s_key[base];
+    uint16_t* seg_off = &s_off[base];
+    {
+        int run = 0;
+        for (int r = 0; r < per; ++r) {
+            const unsigned mask = s_mask[warp][r];
+            if (mask == 0u) continue;
+            if ((mask >> lane) & 1u) {
+                const int pos = run + __popc(mask & ((1u << lane) - 1u));
+                seg_key[pos] = order_key(sc[w0 + r * 32 + lane]);
+                seg_off[pos] = (uint16_t) (r * 32 + lane);
+            }
+            run += __popc(mask);
+        }
+    }
+    __syncwarp();
+    // ---- 4. weighted cells of the survivors must reach `width`
+    {
+        int c = 0;
+        for (int i = lane; i < cnt; i += 32) c += weight(w0 + (int) seg_off[i]);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o);
+        if (lane == 0) s_gt[warp] = c;
+    }
+    __syncthreads();
+    if (t == 0) {
+        long long tot = 0;
+        for (int w2 = 0; w2 < 32; ++w2) tot += s_gt[w2];
+        if (tot < width) s_fail = 1;
+    }
+    __syncthreads();
+    if (s_fail) {
+        if (t == 0) g_tk_fail[qi] = 1;
+        return;
+    }
+    // ---- 5. thr and `above` over the survivors (weighted), the engine's digit rule
+    prefix = 0;
+    above = 0;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        if (t < 256) hist[t] = 0;
+        __syncthreads();
+        const uint32_t hi_mask = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
+        for (int i = lane; i < cnt; i += 32) {
+            const uint32_t k = seg_key[i];
+            if ((k & hi_mask) == (prefix & hi_mask)) atomicAdd(&hist[(k >> shift) & 255], weight(w0 + (int) seg_off[i]));
+        }
+        __syncthreads();
+        int v = 0, x = 0;
+        if (t < 256) {
+            v = hist[255 - t];
+            x = v;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int y = __shfl_up_sync(0xffffffffu, x, o);
+                if (lane >= o) x += y;
+            }
+            if (lane == 31) s_warp[warp] = x;
+        }
+        __syncthreads();
+        if (t < 256) {
+            int inc = x;
+            for (int w2 = 0; w2 < warp; ++w2) inc += s_warp[w2];
+            const int before = above + inc - v;
+            if (before < width && (above + inc >= width || t == 255)) { s_digit = 255 - t; s_above = before; }
+        }
+        __syncthreads();
+        prefix |= (uint32_t) s_digit << shift;
+        above = s_above;
+        __syncthreads();
+    }
+    const uint32_t thr = prefix;
+    const int eq_budget = (int) (width - above);
+    // ---- 6. per warp: cells above thr and at thr
+    {
+        int gt = 0, eq = 0;
+        for (int i = lane; i < cnt; i += 32) {
+            const uint32_t k = seg_key[i];
+            const int wg = weight(w0 + (int) seg_off[i]);
+            if (k > thr) gt += wg;
+            else if (k == thr) eq += wg;
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            gt += __shfl_xor_sync(0xffffffffu, gt, o);
+            eq += __shfl_xor_sync(0xffffffffu, eq, o);
+        }
+        if (lane == 0) { s_gt[warp] = gt; s_eq[warp] = eq; }
+    }
+    __syncthreads();
+    if (t == 0) {
+        int eb = 0, sb = 0;
+        for (int w2 = 0; w2 < 32; ++w2) {
+            const int g2 = s_gt[w2], e2 = s_eq[w2];
+            const int take = eq_budget - eb < 0 ? 0 : (eq_budget - eb > e2 ? e2 : eq_budget - eb);
+            s_gt[w2] = sb;
+            s_eq[w2] = eb;
+            sb += g2 + take;
+            eb += e2;
+        }
+        g_tk_fail[qi] = 0;
+    }
+    __syncthreads();
+    // ---- 7. emit, the warp's segment in order
+    int run_sel = s_gt[warp], run_eq = s_eq[warp];
+    for (int c0 = 0; c0 < cnt; c0 += 32) {
+        const int i = c0 + lane;
+        const bool vld = i < cnt;
+        const uint32_t k = vld ? seg_key[i] : 0u;
+        const int b = vld ? w0 + (int) seg_off[i] : 0;
+        const int wg = vld ? weight(b) : 0;
+        const int my_gt = (vld && k > thr) ? wg : 0, my_eq = (vld && k == thr) ? wg : 0;
+        if (__ballot_sync(0xffffffffu, (my_gt | my_eq) != 0) == 0u) continue;
+        int pe = my_eq;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int y = __shfl_up_sync(0xffffffffu, pe, o);
+            if (lane >= o) pe += y;
+        }
+        const int left = eq_budget - (run_eq + pe - my_eq);
+        const int take = left < 0 ? 0 : (left > my_eq ? my_eq : left);
+        const int my_sel = my_gt + take;
+        int ps = my_sel;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int y = __shfl_up_sync(0xffffffffu, ps, o);
+            if (lane >= o) ps += y;
+        }
+        int32_t* dst = out + run_sel + ps - my_sel;
+        for (int c = 0; c < my_sel; ++c) dst[c] = (int32_t) ((int64_t) b * R + c);
+        run_eq += __shfl_sync(0xffffffffu, pe, 31);
+        run_sel += __shfl_sync(0xffffffffu, ps, 31);
+    }
+}
+#endif  // !__HIPCC__ && STRATA_EXPERIMENTAL_SM60
 }  // namespace
 
 bool qsa_block_scores_slots(const float* const* pooled, const float* const* dead, const float* q_idx,
@@ -2085,6 +2512,67 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_halve_kernel(co
     }
 }
 
+#if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
+// compute capability 6.x (cc_major_of: the emulated card counts), and the SM count, once a device
+static bool pf2_dev_cc6(int& sms) {
+    static int ok[64] = {};   // 0 unknown, 1 yes, 2 no
+    static int nsm[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); sms = 0; return false; }
+    if (ok[dev] == 0) {
+        int major = 0, n = 0;
+        const bool yes = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess && strata::cc_major_of(major) == 6 &&
+                         cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && n > 0;
+        if (!yes) cudaGetLastError();
+        ok[dev] = yes ? 1 : 2;
+        nsm[dev] = n;
+    }
+    sms = nsm[dev];
+    return ok[dev] == 1;
+}
+
+// STRATA_PF_HFMA_SEL: the FP16 pair scorer for a prompt call; false = not taken (counted), the caller runs the FP32 kernel
+static bool qsa_scores_hfma_launch(const float* pooled, const float* q_idx, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t reach, float* scores, void* stream) {
+    using namespace strata::prefill;
+    int sms = 0;
+    if (!pf2_dev_cc6(sms)) { pf2_fallback(kPf2Sel, kPf2Arch); return false; }
+    const int64_t qtiles = (nq + SH2_Q - 1) / SH2_Q;
+    if (nq <= 0 || reach <= 0 || max_blocks < reach || qtiles > 65535) { pf2_fallback(kPf2Sel, kPf2Geometry); return false; }
+    if (((uintptr_t) pooled | (uintptr_t) q_idx) & 15) { pf2_fallback(kPf2Sel, kPf2Align); return false; }
+    int64_t strips = (sms + qtiles - 1) / qtiles;                                   // CTAs a query tile: one wave, one CTA a SM
+    int64_t strip = ((reach + strips - 1) / strips + 16 * SH2_TG - 1) / (16 * SH2_TG) * (16 * SH2_TG);   // blocks a CTA, whole tiles
+    if (strip < 16 * SH2_TG * 2) strip = 16 * SH2_TG * 2;
+    strips = (reach + strip - 1) / strip;
+    const dim3 grid((unsigned) strips, (unsigned) qtiles);
+    sel_scores_h2_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach, strip, scores);
+    pf2_launched(kPf2Sel);
+    return true;
+}
+
+// STRATA_PF_TOPK_SEL: the sample-bound top-k for a prompt call; false = not taken (counted), the caller runs the engine's kernels
+static bool qsa_topk_sel_launch(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap, int64_t active_blocks, const QsaShapes& s, int32_t* ids, void* stream) {
+    using namespace strata::prefill;
+    int sms = 0;
+    if (!pf2_dev_cc6(sms)) { pf2_fallback(kPf2Topk, kPf2Arch); return false; }
+    if (s.idx_block != R || cap < qsa_selection_width(kTopkMaxCells, s) || nq <= 0 || nq > TS_MAXQ || max_blocks < active_blocks) { pf2_fallback(kPf2Topk, kPf2Geometry); return false; }
+    if (active_blocks > (int64_t) 32 * TS2_PERMAX * 32) { pf2_fallback(kPf2Topk, kPf2Length); return false; }
+    block_topk_sel_kernel<<<(unsigned) nq, TS2_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+    block_topk_wide_kernel<true, false><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);   // the flagged queries only
+    pf2_launched(kPf2Topk);
+    static const bool stats = pf_env_on("STRATA_PF_TOPK_SEL_STATS");   // debug: syncs after every call
+    if (stats) {
+        std::vector<int> flags((size_t) nq);
+        cudaStreamSynchronize((cudaStream_t) stream);
+        if (cudaMemcpyFromSymbol(flags.data(), g_tk_fail, sizeof(int) * (size_t) nq) == cudaSuccess) {
+            uint64_t n = 0;
+            for (int f : flags) n += f != 0;
+            g_pf2.flagged[kPf2Topk].fetch_add(n);
+        }
+    }
+    return true;
+}
+#endif
+
 // #1825: the prompt path's thread-per-head scorer (bitwise the warp kernel's scores).  Default: Turing with
 // STRATA_SM75_PERF=1 (the P100 gain measured here is +1..3% at 30-60K tokens, under the 3% bar for a new default);
 // STRATA_SCORES_THREAD=1 turns it on, =0 off, on any CUDA card
@@ -2185,6 +2673,20 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
         return;
     }
 #else
+#if defined(STRATA_EXPERIMENTAL_SM60)
+    // STRATA_PF_HFMA_SEL (default off): the FP16 pair scorer (sm_60); a call it cannot take is counted and runs on below
+    if (active_blocks > 0 && strata::prefill::pf_hfma_sel()) {
+        ktime::begin(ktime::kSelScores, stream);
+        if (qsa_scores_hfma_launch(pooled, q_idx, steps, nq, max_blocks, reach, scores, stream)) {
+            ktime::begin(ktime::kSelTail, stream);
+            block_scores_tail_kernel<<<(unsigned) nq, 32, 0, (cudaStream_t) stream>>>(dead, q_idx, steps, max_blocks, scores);
+            ktime::begin(ktime::kOther, stream);
+            const cudaError_t e = cudaGetLastError();
+            if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores hfma: %s\n", cudaGetErrorString(e)); std::exit(1); }
+            return;
+        }
+    }
+#endif
     // prompt calls (an active-block count): the thread-per-head kernel, the same bits (opt-in: scores_thread_on); else the
     // warp kernel below
     if (active_blocks > 0 && scores_thread_on()) {
@@ -2951,6 +3453,15 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
 #endif
     const int64_t reach = counted && active_blocks < max_blocks ? active_blocks : max_blocks;
     const int64_t fit = (int64_t) TK_T * (counted ? TK_PER_MAX : TK_PER);
+#if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
+    // STRATA_PF_TOPK_SEL (default off): the sample-bound top-k of a prompt call (an active-block count), the same ids; a call it cannot take is counted and runs on below
+    if (!old && active_blocks > 0 && strata::prefill::pf_topk_sel() &&
+        qsa_topk_sel_launch(scores, steps, nq, max_blocks, cap, active_blocks, s, ids, stream)) {
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk (sample bound): %s\n", cudaGetErrorString(e)); std::exit(1); }
+        return;
+    }
+#endif
 #if defined(__HIPCC__)
     // gfx1201: below ~28K cells (7,168 blocks) the 1,024-thread kernel's fixed cost loses to the ref.  STRATA_TOPK_REG_MIN_BLOCKS
     // moves the line (0: the register kernel always); gfx1151's table sets 4096, the crossover with the cooperative scan
