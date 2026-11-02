@@ -84,6 +84,12 @@ public:
     };
     bool bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                    int64_t ldx, bool resident, bool x_lo, const char* name, HcCompanion* comp = nullptr);
+    /// STRATA_PF_ROUTER_V2=1, Pascal (STRATA_DENSE_F32, bf16() path 2): the MoE layer's router logits Yr [T, Nr] = X . Wr^T (+ X_lo . Wr^T) and the shared expert's scalar gate Yg [T] =
+    /// X . Wg^T (+ X_lo . Wg^T) in ONE pass over the activation: bf16() widens X to FP32 in slices and calls cublasSgemm per weight, so the two products widened it twice each (hi and lo);
+    /// here each slice is widened once and both weights' cublasSgemm calls (the same arguments bf16() passes them) read it.  BIT-IDENTICAL to bf16(X, Wr, Yr, T, Nr, K, ..., resident) + bf16(X_lo, ...
+    /// beta 1) + bf16(X, Wg, Yg, T, 1, K) + bf16(X_lo, ..., beta 1).  `r_resident`: Wr is the pack's own resident tensor.  False = nothing launched (the path, the room or the residency
+    /// is not the one bf16() would take whole): the caller runs the two bf16_proj / bf16 calls.
+    bool bf16_router_gate(const uint16_t* X, const uint16_t* X_lo, const uint16_t* Wr, bool r_resident, float* Yr, int64_t Nr, const uint16_t* Wg, float* Yg, int64_t T, int64_t K);
 
     /// HIP gfx103x (prompt_f16()): bf16() takes X as the FP16 image the prompt path's kernels write (set_act_f16),
     /// and bf16() / f16() / native() run the GEMM with FP16 out (rocBLAS's tuned kernels there), widened in place in

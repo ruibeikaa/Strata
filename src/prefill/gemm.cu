@@ -41,6 +41,7 @@
 #include "gemm_hfma_hc.cuh"   // STRATA_PF_HFMA_HC
 #include "gemm_sass.cuh"   // STRATA_PF_HFMA_SASS
 #include "strata/prefill/pf_small.hpp"   // STRATA_PF_HFMA_SMALL
+#include "strata/prefill/pf_small2.hpp"   // STRATA_PF_ROUTER_V2
 #include "strata/kernels/ktime.hpp"   // STRATA_PREFILL_TIMING=2: the hyper-connection products' kernels
 #include <cctype>
 #include <cmath>
@@ -1832,6 +1833,9 @@ bool Gemm::bf16_hfma(const uint16_t*, bool, const uint16_t*, float*, int64_t, in
     return false;   // not the experimental sm_60 CUDA build: bf16() runs
 }
 void gemm_hfma_hc_report(int64_t) {}
+bool Gemm::bf16_router_gate(const uint16_t*, const uint16_t*, const uint16_t*, bool, float*, int64_t, const uint16_t*, float*, int64_t, int64_t) {
+    return false;   // not the experimental sm_60 CUDA build: bf16() runs
+}
 #endif
 bool Gemm::bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K) {
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
@@ -2095,6 +2099,40 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
        "cublasGemmEx");
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx");
 }
+
+#if defined(STRATA_EXPERIMENTAL_SM60)
+// STRATA_PF_ROUTER_V2: see gemm.hpp.  Gemm::bf16's path-2 branch for two weights over one widened slice: the same slices (x_rows), the same cublasSgemm arguments per weight, the same
+// widening kernel (bf16_to_f32) - a value is widened once instead of twice.  Taken only where bf16() would run each weight whole (the weights' and the slice's buffers fit), the router's
+// FP32 copy is the resident one and the shared gate's is widened into tc_w_ as bf16() does for a non-resident weight.
+bool Gemm::bf16_router_gate(const uint16_t* X, const uint16_t* X_lo, const uint16_t* Wr, bool r_resident, float* Yr, int64_t Nr, const uint16_t* Wg, float* Yg, int64_t T, int64_t K) {
+    using namespace strata::prefill;
+    if (!pf_router_v2()) return false;
+    if (T <= 0 || Nr <= 0 || K <= 0 || bf16_path() != 2) { pf2_fallback(kPf2Router, kPf2Arch); return false; }
+    if (!r_resident || !f32_resident_bf16()) { pf2_fallback(kPf2Router, kPf2Geometry); return false; }
+    const int64_t x_rows = std::max<int64_t>(1, std::min<int64_t>(T, kXSliceElems / K));
+    if (!grow(tc_w_, tc_w_elems_, 2 * std::max<int64_t>(Nr, 1) * K) || !grow(tc_x_, tc_x_elems_, 2 * x_rows * K)) { pf2_fallback(kPf2Router, kPf2Length); return false; }   // bf16() would tile: it runs
+    const float alpha = 1.0f;
+    const float* wr = shadow_get(Wr, Nr * K, (cudaStream_t) stream_, [&](float* dst) { bf16_to_f32(Wr, dst, Nr * K, (cudaStream_t) stream_); });
+    if (wr == nullptr) { pf2_fallback(kPf2Router, kPf2Geometry); return false; }
+    float* const wg = reinterpret_cast<float*>(tc_w_);
+    float* const xf = reinterpret_cast<float*>(tc_x_);
+    bf16_to_f32(Wg, wg, K, (cudaStream_t) stream_);   // the shared gate's weight, as bf16() widens a non-resident one into tc_w_
+    for (int pass = 0; pass < (X_lo != nullptr ? 2 : 1); ++pass) {
+        const uint16_t* Xp = pass == 0 ? X : X_lo;
+        const float beta = pass == 0 ? 0.0f : 1.0f;
+        for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
+            const int64_t n = std::min<int64_t>(x_rows, T - t0);
+            bf16_to_f32(Xp + t0 * K, xf, n * K, (cudaStream_t) stream_);
+            ck(cublasSgemm((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) Nr, (int) n, (int) K, &alpha, wr, (int) K, xf, (int) K, &beta, Yr + t0 * Nr, (int) Nr),
+               "cublasSgemm (bf16 on Pascal)");
+            ck(cublasSgemm((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, 1, (int) n, (int) K, &alpha, wg, (int) K, xf, (int) K, &beta, Yg + t0, 1),
+               "cublasSgemm (bf16 on Pascal)");
+        }
+    }
+    pf2_launched(kPf2Router);
+    return true;
+}
+#endif
 
 void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                float beta) {

@@ -46,6 +46,7 @@
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/pf_small.hpp"   // STRATA_PF_HFMA_SMALL
 #include "strata/kernels/qsa_select_exact.hpp"   // STRATA_PF_SEL_EXACT
+#include "strata/prefill/pf_small2.hpp"   // STRATA_PF_ROUTER_V2
 #include "strata/prefill/moe_fused.hpp"
 #include "strata/prefill/moe_ws.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
@@ -2833,6 +2834,14 @@ bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, 
     if (X_lo) gm.bf16(X_lo, wb, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy, 1.0f, 0, false, resident);
     return true;
 }
+// STRATA_PF_ROUTER_V2=1 (gemm.cu, Pascal STRATA_DENSE_F32): the router's logits and the shared expert's scalar gate from one FP32 widening of the layer input a slice, bit for bit what
+// bf16_proj(router) + the shared gate's two bf16() calls give; false = nothing launched, the caller runs those
+bool router_gate_v2(Gemm& gm, const core::WeightRef* wr, const core::WeightRef* wgi, const uint16_t* X, const uint16_t* X_lo, float* logits, float* sg, int64_t T, int64_t N) {
+    if (!strata::prefill::pf_router_v2()) return false;
+    if (wr->kind != core::WeightKind::Bf16InF32 || !wr->data || wr->q8_scale != nullptr || wr->hc_q8 != nullptr) return false;
+    if (wgi->kind != core::WeightKind::Bf16InF32 || !wgi->data || wr->ne0 != N || wgi->ne0 != N) return false;
+    return gm.bf16_router_gate(X, X_lo, (const uint16_t*) wr->data, true, logits, wr->ne1 > 0 ? wr->ne1 : 1, (const uint16_t*) wgi->data, sg, T, N);
+}
 // STRATA_PF_HFMA_HC=1 (gemm.cu, GP100 only): the hyper-connection read's down and up projections on FP16 HFMA2 pairs and the
 // BF16 weight's resident FP16 copy; a call the kernel cannot take is counted under `name` and runs bf16_proj
 bool hc_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
@@ -4256,7 +4265,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           *wsd = need(v, "ffn_down_shexp.weight", err);
                     if (!wr || !wgi || !wsg || !wsu || !wsd) return false;
                     pt.mark(kPfRouter, cs);
-                    if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
+                    // STRATA_PF_ROUTER_V2=1: the router's logits and the shared gate's sums from one widening of X a slice (bit-identical); false = the calls as before
+                    const bool sg_done = router_gate_v2(m.gemm, wr, wgi, m.mixed_bf, m.mixed_bf_lo, m.logits, m.sg, T, N);
+                    if (!sg_done && !bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
                     // RESEARCH HOOK (141-research, opt-in, never on by default): STRATA_DBG_FEAT=<file> dumps, per MoE layer and chunk,
                     // the routed ids + weights (and for the layers in STRATA_DBG_FEAT_LAYERS the router-input hidden state, bf16);
@@ -4325,8 +4336,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
                         if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
                         if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
-                        m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
-                        if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);
+                        if (!sg_done) {
+                            m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
+                            if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);
+                        }
                         return true;
                     };
                     // Only the router needs to finish before readback. Queue the shared expert afterwards
@@ -7199,15 +7212,19 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                                               *wsd = need(v, "ffn_down_shexp.weight", err);
                         if (!wr || !wgi || !wsg || !wsu || !wsd) return false;
                         pt.mark(kPfRouter, cs);
-                        if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
+                        // STRATA_PF_ROUTER_V2=1: the router's logits and the shared gate's sums from one widening of X a slice (bit-identical); false = the calls as before
+                        const bool sg_done = router_gate_v2(m.gemm, wr, wgi, m.mixed_bf, m.mixed_bf_lo, m.logits, m.sg, T, N);
+                        if (!sg_done && !bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                         route(m.logits, lb.ids + t0 * K, lb.w + t0 * K, T, m.g->n_expert, cs);
                         if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
                         if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
                         swiglu_pair(m.sgate, m.sup, m.sh_h, T, cs);
                         if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
                         if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
-                        m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
-                        if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);
+                        if (!sg_done) {
+                            m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
+                            if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);
+                        }
                         moe_shared_init(m.shared, m.sg, acc, T, cs);
                         break;   // the FFN half's write waits for the experts (the next layer, or the final pass)
                     }

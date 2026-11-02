@@ -2270,6 +2270,18 @@ __global__ void swiglu_pair_kernel(const float* __restrict__ g, const float* __r
     const float a = g[i];
     h16[i] = hf_sat(a / (1.0f + __expf(-a)) * u[i]);
 }
+#if !defined(__HIPCC__)
+// STRATA_PF_ROUTER_V2 (default off): swiglu_pair_kernel four columns a thread - the same expression per element, loads and stores wider (kf-work\krouter, n3)
+__global__ void swiglu_pair4_kernel(const float4* __restrict__ g, const float4* __restrict__ u, uint2* __restrict__ h16, int64_t n4) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n4) return;
+    const float4 a = g[i], c = u[i];
+    uint2 o;
+    o.x = (uint32_t) hf_sat(a.x / (1.0f + __expf(-a.x)) * c.x) | ((uint32_t) hf_sat(a.y / (1.0f + __expf(-a.y)) * c.y) << 16);
+    o.y = (uint32_t) hf_sat(a.z / (1.0f + __expf(-a.z)) * c.z) | ((uint32_t) hf_sat(a.w / (1.0f + __expf(-a.w)) * c.w) << 16);
+    h16[i] = o;
+}
+#endif
 __global__ void gather_rows16_kernel(const uint16_t* __restrict__ x, const int32_t* __restrict__ src,
                                      uint16_t* __restrict__ dst, int64_t n, int64_t width) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;   // one uint4 (8 bf16)
@@ -3189,6 +3201,14 @@ void swiglu_split_f16(const float* gu, uint16_t* h16, int64_t rows, int n_ff, bo
     check("swiglu_split_f16");
 }
 void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream) {
+#if !defined(__HIPCC__)
+    // STRATA_PF_ROUTER_V2: four columns a thread (float4 loads, one uint2 store; the same per-element expression)
+    if (strata::prefill::pf_router_v2() && n > 0 && (((uintptr_t) g | (uintptr_t) u | (uintptr_t) h16) & 15) == 0) {
+        swiglu_pair4_kernel<<<blocks_for(n * 640 / 4), 256, 0, (cudaStream_t) stream>>>(reinterpret_cast<const float4*>(g), reinterpret_cast<const float4*>(u), reinterpret_cast<uint2*>(h16), n * 640 / 4);
+        check("swiglu_pair4");
+        return;
+    }
+#endif
     swiglu_pair_kernel<<<blocks_for(n * 640), 256, 0, (cudaStream_t) stream>>>(g, u, h16, n);
     check("swiglu_pair");
 }

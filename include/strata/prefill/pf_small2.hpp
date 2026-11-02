@@ -5,6 +5,8 @@
 //   STRATA_PF_TOPK_SEL=1    the prompt's select top-k (qsa_block_topk) by a sample bound and ordered survivors instead of the six-pass radix: the ids are EXACTLY the wide kernel's
 //   STRATA_PF_GDN_FUSED=1   the GDN recurrence in one pass over the state registers a token, one barrier a token, two columns a thread: BIT-IDENTICAL to gdn_rec_cols_pipe_kernel
 //   STRATA_PF_COMBINE_V2=1  the MoE combine + hyper-connection write (moe_combine_write_norm_rs): the 4 rows loaded together, one block sum, prefetched wn: BIT-IDENTICAL
+//   STRATA_PF_ROUTER_V2=1   the MoE layer's router logits and the shared expert's scalar gate from ONE FP32 widening of the layer input a slice (the engine widened it four times: router hi / lo,
+//                           shared gate hi / lo) and the shared expert's SwiGLU four columns a thread: the same cublasSgemm calls with the same arguments, BIT-IDENTICAL (kf-work\krouter)
 //   STRATA_PF_SEL_EXACT=1   the prompt's select (scores + top-k) as ONE exact path on the FP16 pair scorer: the FP16 scores are only a filter - a score is trusted outside a PROVEN worst-case error
 //                           band around the top-k threshold and recomputed with the FP32 kernel's own arithmetic inside it, so the selected ids are IDENTICAL to the FP32 scorer + top-k's
 //                           (kf-work\kexact\BOUND.md).  Takes the place of STRATA_PF_HFMA_SEL (which it overrides) and STRATA_PF_TOPK_SEL for the prompt calls it takes.
@@ -28,8 +30,9 @@ inline bool pf_topk_sel() { static const bool on = pf_env_on("STRATA_PF_TOPK_SEL
 inline bool pf_gdn_fused() { static const bool on = pf_env_on("STRATA_PF_GDN_FUSED"); return on; }
 inline bool pf_combine_v2() { static const bool on = pf_env_on("STRATA_PF_COMBINE_V2"); return on; }
 inline bool pf_sel_exact() { static const bool on = pf_env_on("STRATA_PF_SEL_EXACT"); return on; }
+inline bool pf_router_v2() { static const bool on = pf_env_on("STRATA_PF_ROUTER_V2"); return on; }
 
-enum Pf2Switch { kPf2Sel = 0, kPf2Topk, kPf2Gdn, kPf2Comb, kPf2SelX, kPf2Count };
+enum Pf2Switch { kPf2Sel = 0, kPf2Topk, kPf2Gdn, kPf2Comb, kPf2SelX, kPf2Router, kPf2Count };
 enum Pf2Reason { kPf2Arch = 0, kPf2Geometry, kPf2Align, kPf2Length, kPf2ReasonCount };
 
 struct Pf2Stats {
@@ -46,8 +49,8 @@ struct Pf2Stats {
         }
     }
     ~Pf2Stats() {
-        static const char* names[kPf2Count] = {"STRATA_PF_HFMA_SEL", "STRATA_PF_TOPK_SEL", "STRATA_PF_GDN_FUSED", "STRATA_PF_COMBINE_V2", "STRATA_PF_SEL_EXACT"};
-        static const char* what[kPf2Count] = {"calls on the FP16 pair scorer", "calls on the sample-bound top-k", "recurrence calls on the fused kernel", "calls on the v2 combine", "calls on the exact FP16-filtered select"};
+        static const char* names[kPf2Count] = {"STRATA_PF_HFMA_SEL", "STRATA_PF_TOPK_SEL", "STRATA_PF_GDN_FUSED", "STRATA_PF_COMBINE_V2", "STRATA_PF_SEL_EXACT", "STRATA_PF_ROUTER_V2"};
+        static const char* what[kPf2Count] = {"calls on the FP16 pair scorer", "calls on the sample-bound top-k", "recurrence calls on the fused kernel", "calls on the v2 combine", "calls on the exact FP16-filtered select", "layer calls on the shared-widening router + shared gate"};
         static const char* why[kPf2ReasonCount] = {"architecture", "geometry", "alignment", "row length"};
         for (int i = 0; i < kPf2Count; ++i) {
             const uint64_t n = launches[i].load();
@@ -75,7 +78,7 @@ inline Pf2Stats g_pf2;   // one for the process (inline variable)
 inline void pf2_launched(Pf2Switch s) {
     if (g_pf2.launches[s].fetch_add(1) == 0)
         std::fprintf(stderr, "strata prefill: %s is on: first call on the new kernel\n",
-                     s == kPf2Sel ? "STRATA_PF_HFMA_SEL" : s == kPf2Topk ? "STRATA_PF_TOPK_SEL" : s == kPf2Gdn ? "STRATA_PF_GDN_FUSED" : s == kPf2Comb ? "STRATA_PF_COMBINE_V2" : "STRATA_PF_SEL_EXACT");
+                     s == kPf2Sel ? "STRATA_PF_HFMA_SEL" : s == kPf2Topk ? "STRATA_PF_TOPK_SEL" : s == kPf2Gdn ? "STRATA_PF_GDN_FUSED" : s == kPf2Comb ? "STRATA_PF_COMBINE_V2" : s == kPf2SelX ? "STRATA_PF_SEL_EXACT" : "STRATA_PF_ROUTER_V2");
 }
 inline void pf2_fallback(Pf2Switch s, Pf2Reason r) { g_pf2.fallbacks[s][r].fetch_add(1); }
 
