@@ -91,11 +91,18 @@ struct Layer {
     int64_t hf_tokens = 0;
     int hf_layer = -1;
     int hf_tier = 0;
+    /// STRATA_PF_HFMA_R2=1 (with STRATA_PF_HFMA_EXP): hfma_exp_plan's answer for a layer it took - 1 = the two-rows-a-thread kernel
+    /// of moe_ws_hf_r2.cuh runs it at `hf_tier`, 0 = the compiler kernel of moe_ws_hf.cuh (what the layer's u favours).
+    int hf_r2 = 0;
     /// STRATA_PF_HFMA_DOWN=1 (hfma_down() below): the layer's number for the report (set by the caller before
     /// hfma_down_plan) and the plan's answer `hd_tier`: 0 = the int8 swiglu_quant + down run, 16 / 32 = down_hf_prep +
     /// down_hf (H as FP16 rows in `gu`'s own rows).
     int hd_layer = -1;
     int hd_tier = 0;
+    /// STRATA_PF_HFMA_R2_DOWN=1 (with STRATA_PF_HFMA_DOWN): hfma_down_plan's answer for a layer it took - 1 = the two-rows-a-thread
+    /// kernel of moe_ws_dn_hf_r2.cuh runs it (Q2_0 at 16 tokens a pass, IQ4_NL at 32; `hd_tier` says which), 0 = the one-row kernel
+    /// of moe_ws_dn_hf.cuh.
+    int hd_r2 = 0;
 };
 /// The layer's gate/up into gu, one launch; false (nothing launched) where the per-group MMQ is to run instead (mode 0,
 /// or not faster at this u) - the same GU rows either way.  A gu_nib layer has no per-group MMQ (the caller stops on
