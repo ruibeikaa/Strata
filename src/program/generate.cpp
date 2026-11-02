@@ -75,6 +75,7 @@
 #include "strata/core/dflash2.hpp"
 #include "strata/core/draft_cap.hpp"
 #endif
+#include "strata/kernels/qsa_pattn.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_ws.hpp"
 #include "strata/prefill/kva.hpp"
@@ -17053,6 +17054,7 @@ int main(int argc, char** argv) {
             strata::prefill::ws::hfma_exp_report(n - (int64_t) resume);   // STRATA_PF_HFMA_EXP: what the read's 4-bit gate/up ran on (nothing printed without it)
             strata::prefill::ws::hfma_down_report(n - (int64_t) resume);   // STRATA_PF_HFMA_DOWN: what the read's down ran on (nothing printed without it)
             strata::prefill::gemm_hfma_hc_report(n - (int64_t) resume);   // STRATA_PF_HFMA_HC: what the read's hyper-connection projections ran on (nothing printed without it)
+            strata::kernels::qsa_pattn_h16_report(n - (int64_t) resume);   // STRATA_PF_HFMA_ATTN: what the read's QSA attention ran on (nothing printed without it)
             // the verify windows: the first holds the last prompt token alone (STRATA_ADMIT_MERGE_FIRST: the prompt
             // tokens from merge_at on, the last one's output its first token)
             const int merge_T = merge_at >= 0 && !cancelled ? (int) (n - merge_at) : 0;

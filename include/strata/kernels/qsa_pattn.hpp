@@ -37,6 +37,22 @@ bool qsa_pattn_batch(const float* q, const QsaAttnPools& pools, const int32_t* i
                      const QsaShapes& s, float* scratch, uint64_t scratch_floats, float* attn, int64_t n_q,
                      void* stream);
 
+/// STRATA_PF_HFMA_ATTN (prompt reads only, needs STRATA_PATTN_SM60=1, default off, not bitwise): 0 off; 1 the score kernel on FP16
+/// HFMA2 pairs (qsa_pattn_h16.cuh) with the usual value kernel; 2 the value kernel on FP16 pairs too (qsa_pattn_h16v.cuh).
+/// qsa_pattn_batch tries the FP16 kernels first and runs the bit-exact ones for whatever they refuse (counted by reason).
+int pattn_h16_mode();
+
+/// The FP16 kernels alone (no compute-capability test; mode 1 or 2): false = not applicable or a launch failed, nothing the caller
+/// can rely on was written.  For src/kernels/qsa_pattn_h16_bench.cu.
+bool qsa_pattn_h16_batch_any_arch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                                  int64_t cap, const QsaShapes& s, float* scratch, uint64_t scratch_floats, float* attn,
+                                  int64_t n_q, void* stream, int mode);
+
+/// One line per device that ran STRATA_PF_HFMA_ATTN since the last call: calls on the FP16 kernels, calls left to the bit-exact
+/// ones by reason, value CTAs redone in FP32; called when a prompt read of `tokens` tokens has ended.  Prints nothing with the
+/// switch off.
+void qsa_pattn_h16_report(int64_t tokens);
+
 /// The same without the compute-capability test, for src/kernels/qsa_pattn_parity.cpp (it runs the kernels on any card
 /// to compare them with the decode kernels' output). False in a build without the sm_6x kernels.
 bool qsa_pattn_batch_any_arch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,

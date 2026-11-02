@@ -18,10 +18,14 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
+#include <string>
 
 #if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
 #define STRATA_PATTN_BUILT 1   // the CUDA build with STRATA_EXPERIMENTAL_SM60 only (not HIP, not Metal)
@@ -383,6 +387,10 @@ __global__ void __launch_bounds__(64) ps_value_d4_kernel(QsaAttnPools p, const i
     }
 }
 
+// STRATA_PF_HFMA_ATTN: the FP16 score kernel (and, =2, the FP16 value kernel); see the two headers
+#include "qsa_pattn_h16.cuh"
+#include "qsa_pattn_h16v.cuh"
+
 bool sm6x_device() {
     static int cc[64] = {};
     int dev = 0;
@@ -403,7 +411,12 @@ bool sm6x_device() {
 bool qsa_pattn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
                      const QsaShapes& s, float* scratch, uint64_t scratch_floats, float* attn, int64_t n_q,
                      void* stream) {
-    return sm6x_device() && qsa_pattn_batch_any_arch(q, pools, ids, steps, cap, s, scratch, scratch_floats, attn, n_q, stream);
+    if (!sm6x_device()) return false;
+    // STRATA_PF_HFMA_ATTN: the FP16 kernels first; whatever they refuse (counted by reason) runs on the bit-exact kernels
+    if (const int h16 = pattn_h16_mode(); h16 != 0 &&
+        qsa_pattn_h16_batch_any_arch(q, pools, ids, steps, cap, s, scratch, scratch_floats, attn, n_q, stream, h16))
+        return true;
+    return qsa_pattn_batch_any_arch(q, pools, ids, steps, cap, s, scratch, scratch_floats, attn, n_q, stream);
 }
 
 bool qsa_pattn_batch_any_arch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
@@ -452,7 +465,155 @@ bool qsa_pattn_batch_any_arch(const float* q, const QsaAttnPools& pools, const i
     return true;
 }
 
+// ---- STRATA_PF_HFMA_ATTN (host side) ----------------------------------------------------------------------------
+namespace {
+struct H16Stats {
+    std::mutex mu;
+    long long taken[64] = {};
+    bool used[64] = {};
+    std::map<std::string, long long> left[64];
+};
+H16Stats& h16_stats() {
+    static H16Stats s;
+    return s;
+}
+int h16_dev() {
+    int d = 0;
+    if (cudaGetDevice(&d) != cudaSuccess) { cudaGetLastError(); return 0; }
+    return d & 63;
+}
+void h16_left(const char* why) {
+    H16Stats& s = h16_stats();
+    std::lock_guard<std::mutex> lk(s.mu);
+    const int d = h16_dev();
+    s.used[d] = true;
+    s.left[d][why] += 1;
+}
+void h16_taken() {
+    H16Stats& s = h16_stats();
+    std::lock_guard<std::mutex> lk(s.mu);
+    const int d = h16_dev();
+    s.used[d] = true;
+    s.taken[d] += 1;
+}
+}  // namespace
+
+int pattn_h16_mode() {
+    static const int m = [] {
+        const char* v = std::getenv("STRATA_PF_HFMA_ATTN");
+        const int x = v != nullptr && *v != '\0' ? std::atoi(v) : 0;
+        if (x == 0) return 0;
+        if (pattn_mode() == 0) {
+            std::fprintf(stderr, "strata pattn: STRATA_PF_HFMA_ATTN=%d needs STRATA_PATTN_SM60=1 (and a build with the sm_6x kernels); "
+                                 "the usual attention runs\n", x);
+            return 0;
+        }
+        const int mode = x >= 2 ? 2 : 1;
+        std::fprintf(stderr, "strata pattn: STRATA_PF_HFMA_ATTN=%d: the prompt's QSA attention %s on FP16 HFMA2 pairs "
+                             "(not bitwise; int8 K/V, compute capability 6.x)\n", x,
+                     mode == 2 ? "score and value kernels" : "score kernel");
+        return mode;
+    }();
+    return m;
+}
+
+bool qsa_pattn_h16_batch_any_arch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                                  int64_t cap, const QsaShapes& s, float* scratch, uint64_t scratch_floats, float* attn,
+                                  int64_t n_q, void* stream, int mode) {
+    if (n_q <= 0) return true;
+    const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
+    const char* why = nullptr;
+    if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps ||
+        !pools.page_table || pools.k_q == nullptr || pools.v_q == nullptr || pools.k_q4 != nullptr ||
+        pools.v_q4 != nullptr || !pools.k_scale || !pools.v_scale || s.n_head_kv != 2)
+        why = "geometry or pools not as compiled";
+    else if (n_chunks > NCM) why = "selection longer than 33 chunks";
+    else if ((((uintptr_t) q | (uintptr_t) scratch | (uintptr_t) attn) & 15) != 0) why = "operand not 16-byte aligned";
+    int64_t max_batch = 0;
+    if (why == nullptr) {
+        const uint64_t per_q = (uint64_t) s.n_head_kv * (uint64_t) n_chunks * PS_BLK;
+        max_batch = (int64_t) (scratch_floats / per_q);
+        if (max_batch < 1) why = "attention scratch too small";
+    }
+    if (why != nullptr) { h16_left(why); return false; }
+    const cudaStream_t st = (cudaStream_t) stream;
+    const float scale = 1.0f / sqrtf((float) HD);
+    const int64_t n_batches = (n_q + max_batch - 1) / max_batch;
+    const int64_t batch = (n_q + n_batches - 1) / n_batches;
+    for (int64_t t0 = 0; t0 < n_q; t0 += batch) {
+        const int64_t nb = n_q - t0 < batch ? n_q - t0 : batch;
+        const dim3 g1((unsigned) n_chunks, (unsigned) s.n_head_kv, (unsigned) nb);
+        const dim3 g2((unsigned) s.n_head_kv, (unsigned) nb);
+        const float* qb = q + (size_t) t0 * s.n_head * HD;
+        const int32_t* ib = ids + (size_t) t0 * cap;
+        const int32_t* sb = steps + (size_t) t0 * kStepCount;
+        float* const ab = attn + (size_t) t0 * s.n_head * HD;
+        ktime::begin(ktime::kAttnScore, st);
+        if (mode >= 2) {
+            ps_score_h_kernel<true><<<g1, SH_T, 0, st>>>(qb, pools, ib, sb, (int) s.n_head_kv, (int) s.page_size, scale, scratch,
+                                                         n_chunks, (int) cap);
+            ktime::begin(ktime::kAttnValue, st);
+            ps_value_h_kernel<<<g2, VH_T, 0, st>>>(pools, sb, scratch, (int) s.n_head_kv, n_chunks, ab);
+        } else {
+            ps_score_h_kernel<false><<<g1, SH_T, 0, st>>>(qb, pools, ib, sb, (int) s.n_head_kv, (int) s.page_size, scale, scratch,
+                                                          n_chunks, (int) cap);
+            ktime::begin(ktime::kAttnValue, st);
+            ps_value_d4_kernel<<<g2, 64, 0, st>>>(pools, sb, scratch, (int) s.n_head_kv, n_chunks, ab);
+        }
+    }
+    ktime::begin(ktime::kOther, st);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr, "strata pattn: STRATA_PF_HFMA_ATTN launch failed (%s); the bit-exact kernels run instead\n",
+                         cudaGetErrorString(e));
+        }
+        h16_left("launch failed");
+        return false;
+    }
+    h16_taken();
+    return true;
+}
+
+void qsa_pattn_h16_report(int64_t tokens) {
+    if (pattn_h16_mode() == 0) return;
+    H16Stats& s = h16_stats();
+    std::lock_guard<std::mutex> lk(s.mu);
+    int prev = 0;
+    cudaGetDevice(&prev);
+    for (int d = 0; d < 64; ++d) {
+        if (!s.used[d]) continue;
+        unsigned long long redo = 0;
+        if (pattn_h16_mode() >= 2 && cudaSetDevice(d) == cudaSuccess) {
+            const unsigned long long zero = 0;
+            if (cudaMemcpyFromSymbol(&redo, g_ph16_value_fb, sizeof redo) == cudaSuccess)
+                cudaMemcpyToSymbol(g_ph16_value_fb, &zero, sizeof zero);
+            else
+                cudaGetLastError();
+        }
+        long long left = 0;
+        std::string by;
+        for (const auto& [what, n] : s.left[d]) {
+            left += n;
+            by += (by.empty() ? " (" : ", ") + what + " x" + std::to_string(n);
+        }
+        std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_ATTN: read of %lld tokens, CUDA%d: %lld attention calls on the FP16 kernels, "
+                             "%lld left to the bit-exact kernels%s%s; %llu value CTAs redone in FP32 (non-finite FP16 sum)\n",
+                     (long long) tokens, d, s.taken[d], left, by.c_str(), by.empty() ? "" : ")", redo);
+        s.taken[d] = 0;
+        s.left[d].clear();
+        s.used[d] = false;
+    }
+    cudaSetDevice(prev);
+}
+
 #else  // not the experimental sm_60 CUDA build
+int pattn_h16_mode() { return 0; }
+bool qsa_pattn_h16_batch_any_arch(const float*, const QsaAttnPools&, const int32_t*, const int32_t*, int64_t, const QsaShapes&,
+                                  float*, uint64_t, float*, int64_t, void*, int) { return false; }
+void qsa_pattn_h16_report(int64_t) {}
 bool qsa_pattn_batch(const float*, const QsaAttnPools&, const int32_t*, const int32_t*, int64_t, const QsaShapes&,
                      float*, uint64_t, float*, int64_t, void*) { return false; }
 bool qsa_pattn_batch_any_arch(const float*, const QsaAttnPools&, const int32_t*, const int32_t*, int64_t, const QsaShapes&,
