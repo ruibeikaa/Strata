@@ -9,6 +9,7 @@
 #include "strata/core/pinned_ring.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -70,9 +71,22 @@ void* g_state_ptr[64] = {};
 // the report - the kernels' own time and so their real G MAC/s
 struct Tm {
     cudaEvent_t a = nullptr, b = nullptr, c = nullptr;
+    cudaEvent_t u = nullptr;                                   // after the pass lists' upload (before the swiglu)
+    cudaEvent_t cs0[3] = {nullptr, nullptr, nullptr};          // the pass-class streams: after the fork wait / after the last class kernel
+    cudaEvent_t cs1[3] = {nullptr, nullptr, nullptr};
     int fmt = 0, tier = 0, r2 = 0;   // r2: 0 the one-row kernel, 1 the two-rows kernel, 2 the pass-class kernels
     double macs = 0.0;
+    bool cls_timed = false;          // the class marks above were recorded for this launch
 };
+// STRATA_PREFILL_TIMING: the host's side around the down's pass classes, per device (summed over a read, reset by the report)
+struct HostT {
+    double plan_ms = 0.0, up_ms = 0.0, prep_ms = 0.0, launch_ms = 0.0;
+    int64_t n_plan = 0, n_up = 0, n_prep = 0, n_launch = 0, idle_prep = 0, idle_launch = 0;
+};
+HostT g_ht[64];
+double host_now_ms() {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 std::vector<Tm> g_tm[64];
 size_t g_tm_n[64] = {};
 bool timing_on() {
@@ -178,17 +192,42 @@ int hfma_cls_down() {
     return on;
 }
 
-// per device: the layer's pass items on the device (uploaded by down_hf_prep on the compute stream, so a layer's lists are rewritten only after the previous layer's kernels),
+// STRATA_PF_HFMA_DOWN_UP2=1 (opt-in, read once, with STRATA_PF_HFMA_DOWN_CLASSES): the pass lists go up from hfma_down_plan on their own stream, into one of two alternating device
+// buffers, and only the class streams wait for them - the compute stream no longer carries the copy between the gate/up and the swiglu.  The buffer a layer fills is the one the layer
+// before the previous one read: the upload waits for the compute stream's mark behind that layer's join.  The same bytes in the same kernels: the outputs are bit-identical.
+int hfma_dn_up2() {
+    static const int on = [] {
+        const char* e = std::getenv("STRATA_PF_HFMA_DOWN_UP2");
+        if (e == nullptr || std::atoi(e) == 0) return 0;
+        if (hfma_cls_down() == 0) {
+            std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_DOWN_UP2=1 needs STRATA_PF_HFMA_DOWN_CLASSES=1: ignored\n");
+            return 0;
+        }
+        std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_DOWN_UP2=1: the down's pass lists upload on their own stream into two alternating device buffers, from the plan "
+                             "(behind the gate/up), and only the class streams wait for them (the same kernels and bytes)\n");
+        return 1;
+    }();
+    return on;
+}
+
+// per device: the layer's pass items on the device (uploaded by down_hf_prep on the compute stream, so a layer's lists are rewritten only after the previous layer's kernels;
+// with STRATA_PF_HFMA_DOWN_UP2 by the plan on up_st into the buffer par of two),
 // the side streams and the fork / join events
 struct Cls {
     std::vector<Chunk> host;          // this layer's items, [full | 17..31 | 1..16], from plan to prep
-    Chunk* d = nullptr;
+    Chunk* d = nullptr;               // UP2: two buffers of d_cap items, back to back
     size_t d_cap = 0;
     strata::core::PinnedRing ring;
     cudaStream_t st[3] = {nullptr, nullptr, nullptr};
     cudaEvent_t e0 = nullptr, ej[3] = {nullptr, nullptr, nullptr};
     bool ready = false;               // the lists are on the device (the upload succeeded)
     bool init = false;
+    cudaStream_t up_st = nullptr;     // UP2: the upload stream
+    cudaEvent_t eu[2] = {nullptr, nullptr};   // UP2: buffer p holds this layer's lists (recorded on up_st)
+    cudaEvent_t ef[2] = {nullptr, nullptr};   // UP2: buffer p is free (recorded on the compute stream behind the join of the layer that read it)
+    int par = 0, next = 0;            // UP2: the buffer of the layer in flight / of the next one
+    Chunk* cur = nullptr;             // the lists of the layer in flight on the device (d, or d + par * d_cap)
+    bool up_init = false;
 };
 Cls* g_cls[64] = {};
 Cls& cls_dev(int dev) {
@@ -224,7 +263,7 @@ const char* cls_plan(Layer& L) {
         if (S.d != nullptr) cudaFree(S.d);
         S.d = nullptr;
         S.d_cap = 0;
-        if (cudaMalloc((void**) &S.d, cap * sizeof(Chunk)) != cudaSuccess) {
+        if (cudaMalloc((void**) &S.d, cap * sizeof(Chunk) * (hfma_dn_up2() != 0 ? 2 : 1)) != cudaSuccess) {
             cudaGetLastError();
             S.d = nullptr;
             return "no device buffer for the pass lists";
@@ -240,7 +279,15 @@ void cls_upload(const Layer& L, cudaStream_t s) {
     S.ready = false;
     const size_t n = (size_t) L.hd_cls_n[0] + (size_t) L.hd_cls_n[1] + (size_t) L.hd_cls_n[2];
     if (n == 0 || n != S.host.size() || S.d == nullptr || n > S.d_cap) return;
+    const double t0 = timing_on() ? host_now_ms() : 0.0;
     S.ready = S.ring.h2d(S.d, S.host.data(), n * sizeof(Chunk), s) == cudaSuccess;
+    S.cur = S.d;
+    if (timing_on()) {
+        std::lock_guard<std::mutex> lk(g_mu);
+        HostT& h = g_ht[cur_dev()];
+        h.up_ms += host_now_ms() - t0;
+        ++h.n_up;
+    }
 }
 
 bool cls_init(Cls& S) {
@@ -255,6 +302,43 @@ bool cls_init(Cls& S) {
     return true;
 }
 
+bool cls_up_init(Cls& S) {
+    if (S.up_init) return true;
+    if (cudaStreamCreateWithFlags(&S.up_st, cudaStreamNonBlocking) != cudaSuccess) { cudaGetLastError(); return false; }
+    for (int i = 0; i < 2; ++i)
+        if (cudaEventCreateWithFlags(&S.eu[i], cudaEventDisableTiming) != cudaSuccess || cudaEventCreateWithFlags(&S.ef[i], cudaEventDisableTiming) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+    S.up_init = true;
+    return true;
+}
+
+// STRATA_PF_HFMA_DOWN_UP2: this layer's lists up on up_st (called by the plan, behind the gate/up already enqueued), into the buffer the layer before the previous one read
+void cls_upload_ahead(const Layer& L) {
+    Cls& S = cls_dev(cur_dev());
+    S.ready = false;
+    const size_t n = (size_t) L.hd_cls_n[0] + (size_t) L.hd_cls_n[1] + (size_t) L.hd_cls_n[2];
+    if (n == 0 || n != S.host.size() || S.d == nullptr || n > S.d_cap) return;
+    if (!cls_init(S) || !cls_up_init(S)) return;
+    const double t0 = timing_on() ? host_now_ms() : 0.0;
+    const int p = S.next;
+    Chunk* dst = S.d + (size_t) p * S.d_cap;
+    if (cudaStreamWaitEvent(S.up_st, S.ef[p], 0) != cudaSuccess) { cudaGetLastError(); return; }   // the layer two back is done with this buffer (an event not yet recorded: no wait)
+    if (S.ring.h2d(dst, S.host.data(), n * sizeof(Chunk), S.up_st) != cudaSuccess) return;
+    if (cudaEventRecord(S.eu[p], S.up_st) != cudaSuccess) { cudaGetLastError(); return; }
+    S.par = p;
+    S.next = p ^ 1;
+    S.cur = dst;
+    S.ready = true;
+    if (timing_on()) {
+        std::lock_guard<std::mutex> lk(g_mu);
+        HostT& h = g_ht[cur_dev()];
+        h.up_ms += host_now_ms() - t0;
+        ++h.n_up;
+    }
+}
+
 // the three class kernels of a layer, each on a side stream that forks from the compute stream and joins back to it; nullptr: launched; else why it was not (nothing, or all but a
 // failed part, is enqueued: the caller runs the one-row kernel after the join, which rewrites every output behind them on the compute stream)
 const char* cls_launch(const Layer& L, cudaStream_t s) {
@@ -262,13 +346,25 @@ const char* cls_launch(const Layer& L, cudaStream_t s) {
     if (!S.ready) return "the pass lists' upload failed";
     if (!cls_init(S)) return "the side streams could not be created";
     const int nf = L.hd_cls_n[0], nm = L.hd_cls_n[1], ns = L.hd_cls_n[2];
-    const Chunk* pf = S.d;
+    const bool up2 = hfma_dn_up2() != 0;
+    const Chunk* pf = up2 ? S.cur : S.d;
     const Chunk* pm = pf + nf;
     const Chunk* ps = pm + nm;
     const char* w = (const char*) L.w;
     const uint4* hb = (const uint4*) L.gu;
+    Tm* tm = nullptr;   // STRATA_PREFILL_TIMING: this launch's marks on the class streams (the vector is only grown by this thread, in down_hf_prep)
+    if (timing_on()) {
+        const int dev = cur_dev();
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (g_tm_n[dev] > 0) tm = &g_tm[dev][g_tm_n[dev] - 1];
+    }
     cudaEventRecord(S.e0, s);
     for (int i = 0; i < 3; ++i) cudaStreamWaitEvent(S.st[i], S.e0, 0);
+    if (up2) for (int i = 0; i < 3; ++i) cudaStreamWaitEvent(S.st[i], S.eu[S.par], 0);   // the lists are in (the upload has had the gate/up and the swiglu to finish)
+    if (tm != nullptr) {
+        for (int i = 0; i < 3; ++i) cudaEventRecord(tm->cs0[i], S.st[i]);
+        tm->cls_timed = true;
+    }
     if (L.d_type == GGML_TYPE_Q2_0) {
         if (nf > 0) dn::cls::q::kernel<32, true, 2><<<(unsigned) nf * dn::P2, dn::NT, 0, S.st[2]>>>(pf, w, L.xoff, L.down_off, hb, L.dm);
         if (nm > 0) dn::cls::q::kernel<32, false, 2><<<(unsigned) nm * dn::P2, dn::NT, 0, S.st[1]>>>(pm, w, L.xoff, L.down_off, hb, L.dm);
@@ -279,12 +375,16 @@ const char* cls_launch(const Layer& L, cudaStream_t s) {
         if (ns > 0) dn::cls::n::kernel<16, false, 2><<<(unsigned) ns * dn::P2, dn::NT, 0, S.st[0]>>>(ps, w, L.xoff, L.down_off, hb, L.dm);
     } else {
         for (int i = 0; i < 3; ++i) { cudaEventRecord(S.ej[i], S.st[i]); cudaStreamWaitEvent(s, S.ej[i], 0); }
+        if (up2) cudaEventRecord(S.ef[S.par], s);
         return "no class kernel for the format";
     }
+    if (tm != nullptr)
+        for (int i = 0; i < 3; ++i) cudaEventRecord(tm->cs1[i], S.st[i]);
     for (int i = 0; i < 3; ++i) {
         cudaEventRecord(S.ej[i], S.st[i]);
         cudaStreamWaitEvent(s, S.ej[i], 0);
     }
+    if (up2) cudaEventRecord(S.ef[S.par], s);   // behind the join: the next upload into this buffer may go
     return cudaGetLastError() == cudaSuccess ? nullptr : "a class kernel's launch failed";
 }
 }  // namespace
@@ -306,7 +406,23 @@ int hfma_down() {
     return on;
 }
 
+namespace {
+// STRATA_PREFILL_TIMING: the host time in hfma_down_plan (the pass-class split, and with UP2 the upload)
+struct PlanClock {
+    double t0;
+    int dev;
+    PlanClock() : t0(timing_on() ? host_now_ms() : 0.0), dev(cur_dev()) {}
+    ~PlanClock() {
+        if (!timing_on()) return;
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_ht[dev].plan_ms += host_now_ms() - t0;
+        ++g_ht[dev].n_plan;
+    }
+};
+}  // namespace
+
 bool hfma_down_plan(Layer& L) {
+    PlanClock plan_clock;
     L.hd_tier = 0;
     L.hd_r2 = 0;
     L.hd_cls = 0;
@@ -331,7 +447,11 @@ bool hfma_down_plan(Layer& L) {
             r2_stay = true;
         } else if (hfma_cls_down() != 0) {   // the pass-class kernels replace the two-rows kernel where it would have run; the one-row kernel is their counted fallback
             cls_why = cls_plan(L);
-            if (cls_why == nullptr) { L.hd_cls = 1; L.hd_tier = pick; }
+            if (cls_why == nullptr) {
+                L.hd_cls = 1;
+                L.hd_tier = pick;
+                if (hfma_dn_up2() != 0) cls_upload_ahead(L);   // the lists go up now, behind the gate/up that is already queued
+            }
         } else {
             L.hd_r2 = 1;
             L.hd_tier = pick;
@@ -371,6 +491,14 @@ void down_hf_prep(const Layer& L, void* stream) {
     if (L.rows <= 0) return;
     const cudaStream_t s = (cudaStream_t) stream;
     (void) state_ptr(cur_dev());
+    const double th0 = timing_on() ? host_now_ms() : 0.0;
+    if (timing_on() && L.hd_cls != 0) {   // is the compute stream already idle? then the host is what the GPU waits for from here
+        const bool idle = cudaStreamQuery(s) == cudaSuccess;
+        cudaGetLastError();
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_ht[cur_dev()].idle_prep += idle ? 1 : 0;
+        ++g_ht[cur_dev()].n_prep;
+    }
     if (timing_on()) {
         const int dev = cur_dev();
         std::lock_guard<std::mutex> lk(g_mu);
@@ -380,6 +508,11 @@ void down_hf_prep(const Layer& L, void* stream) {
             ck(cudaEventCreate(&t.a), "hfma_down: event");
             ck(cudaEventCreate(&t.b), "hfma_down: event");
             ck(cudaEventCreate(&t.c), "hfma_down: event");
+            ck(cudaEventCreate(&t.u), "hfma_down: event");
+            for (int i = 0; i < 3; ++i) {
+                ck(cudaEventCreate(&t.cs0[i]), "hfma_down: event");
+                ck(cudaEventCreate(&t.cs1[i]), "hfma_down: event");
+            }
             v.push_back(t);
         }
         Tm& t = v[g_tm_n[dev]++];
@@ -387,15 +520,22 @@ void down_hf_prep(const Layer& L, void* stream) {
         t.tier = L.hd_tier;
         t.r2 = L.hd_cls != 0 ? 2 : L.hd_r2;
         t.macs = (double) L.rows * kMacsPerRow;
+        t.cls_timed = false;
         cudaEventRecord(t.a, s);
     }
-    if (L.hd_cls != 0) cls_upload(L, s);   // STRATA_PF_HFMA_DOWN_CLASSES: this layer's pass lists up on the compute stream, behind the previous layer's kernels
+    if (L.hd_cls != 0 && hfma_dn_up2() == 0) cls_upload(L, s);   // STRATA_PF_HFMA_DOWN_CLASSES: this layer's pass lists up on the compute stream, behind the previous layer's kernels
+    if (timing_on()) {
+        const int dev = cur_dev();
+        std::lock_guard<std::mutex> lk(g_mu);
+        cudaEventRecord(g_tm[dev][g_tm_n[dev] - 1].u, s);
+    }
     dn::swiglu_h16_kernel<<<(unsigned) L.rows, 160, 0, s>>>(L.gu, L.hd_layer);
     ck(cudaGetLastError(), "down FP16: swiglu");
     if (timing_on()) {
         const int dev = cur_dev();
         std::lock_guard<std::mutex> lk(g_mu);
         cudaEventRecord(g_tm[dev][g_tm_n[dev] - 1].b, s);
+        g_ht[dev].prep_ms += host_now_ms() - th0;
     }
 }
 
@@ -411,7 +551,21 @@ void down_hf(const Layer& L, void* stream) {
     const uint4* hb = (const uint4*) L.gu;
     const char* w = (const char*) L.w;
     const char* cls_why = nullptr;
-    if (L.hd_cls != 0) cls_why = cls_launch(L, s);   // STRATA_PF_HFMA_DOWN_CLASSES: three class kernels; nullptr = launched
+    if (L.hd_cls != 0) {
+        const double tl0 = timing_on() ? host_now_ms() : 0.0;
+        if (timing_on()) {
+            const bool idle = cudaStreamQuery(s) == cudaSuccess;
+            cudaGetLastError();
+            std::lock_guard<std::mutex> lk(g_mu);
+            g_ht[cur_dev()].idle_launch += idle ? 1 : 0;
+            ++g_ht[cur_dev()].n_launch;
+        }
+        cls_why = cls_launch(L, s);   // STRATA_PF_HFMA_DOWN_CLASSES: three class kernels; nullptr = launched
+        if (timing_on()) {
+            std::lock_guard<std::mutex> lk(g_mu);
+            g_ht[cur_dev()].launch_ms += host_now_ms() - tl0;
+        }
+    }
     if (cls_why != nullptr) {   // the one-row kernel at the tier its own rule gives (everything the class kernels wrote is rewritten behind them on this stream)
         const int dev = cur_dev();
         const int f = fmt_idx(L.d_type);
@@ -472,9 +626,10 @@ void hfma_down_report(const int64_t tokens) {
             if (cudaMemcpyToSymbol(dn::g_dn, &zero, sizeof zero) != cudaSuccess) cudaGetLastError();
         }
         // the kernels' own time by format and tier (STRATA_PREFILL_TIMING): swiglu (prep) and down
-        std::string kt;
+        std::string kt, cl_t;
         if (g_tm_n[dev] > 0) {
             struct Acc { double prep = 0.0, dn = 0.0, macs = 0.0; int64_t n = 0; };
+            struct ClsAcc { double up = 0.0, swi = 0.0, fork = 0.0, span = 0.0, join = 0.0, kern[3] = {0.0, 0.0, 0.0}, ksum = 0.0; int64_t n = 0; } ca;   // the pass-class launches
             std::map<std::pair<int, int>, Acc> acc;   // (format, tier + 100 for the two-rows kernel, + 200 for the pass-class kernels)
             Acc all;
             cudaSetDevice(dev);
@@ -485,6 +640,26 @@ void hfma_down_report(const int64_t tokens) {
                     Acc& a = acc[{g_tm[dev][i].fmt, g_tm[dev][i].tier + 100 * g_tm[dev][i].r2}];
                     a.prep += p; a.dn += q; a.macs += g_tm[dev][i].macs; ++a.n;
                     all.prep += p; all.dn += q; all.macs += g_tm[dev][i].macs; ++all.n;
+                    if (g_tm[dev][i].cls_timed && g_tm[dev][i].r2 == 2) {   // a..u upload, u..b swiglu, b..cs0 fork, cs0..cs1 the class kernels, cs1..c join
+                        const Tm& t = g_tm[dev][i];
+                        float up = 0.0f, sw = 0.0f, f0 = 1e30f, f1 = -1e30f, ksum = 0.0f, kk[3] = {0.0f, 0.0f, 0.0f};
+                        bool ok = cudaEventElapsedTime(&up, t.a, t.u) == cudaSuccess && cudaEventElapsedTime(&sw, t.u, t.b) == cudaSuccess;
+                        for (int k = 0; k < 3 && ok; ++k) {
+                            float x = 0.0f, y = 0.0f;
+                            ok = cudaEventElapsedTime(&x, t.b, t.cs0[k]) == cudaSuccess && cudaEventElapsedTime(&y, t.b, t.cs1[k]) == cudaSuccess &&
+                                 cudaEventElapsedTime(&kk[k], t.cs0[k], t.cs1[k]) == cudaSuccess;
+                            f0 = std::min(f0, x);
+                            f1 = std::max(f1, y);
+                            ksum += kk[k];
+                        }
+                        if (ok) {
+                            ca.up += up; ca.swi += sw; ca.fork += f0; ca.span += f1 - f0; ca.join += q - f1; ca.ksum += ksum;
+                            for (int k = 0; k < 3; ++k) ca.kern[k] += kk[k];
+                            ++ca.n;
+                        } else {
+                            cudaGetLastError();
+                        }
+                    }
                 } else {
                     cudaGetLastError();
                 }
@@ -497,6 +672,15 @@ void hfma_down_report(const int64_t tokens) {
                               a.prep + a.dn > 0 ? a.macs / (a.prep + a.dn) * 1e-6 : 0.0);
                 kt += b;
             };
+            if (ca.n > 0 || g_ht[dev].n_plan > 0) {
+                const HostT& h = g_ht[dev];
+                char b[900];
+                std::snprintf(b, sizeof b, "; down pass classes, GPU (x%lld): upload %.1f ms, swiglu %.1f ms, fork %.1f ms, class kernels span %.1f ms (full %.1f / mid %.1f / small %.1f ms, sum %.1f), join %.1f ms; "
+                                           "host: plan %.1f ms (x%lld), upload %.1f ms (x%lld), prep %.1f ms (x%lld), launch %.1f ms (x%lld); compute stream already idle at prep %lld, at launch %lld",
+                              (long long) ca.n, ca.up, ca.swi, ca.fork, ca.span, ca.kern[2], ca.kern[1], ca.kern[0], ca.ksum, ca.join, h.plan_ms, (long long) h.n_plan, h.up_ms, (long long) h.n_up,
+                              h.prep_ms, (long long) h.n_prep, h.launch_ms, (long long) h.n_launch, (long long) h.idle_prep, (long long) h.idle_launch);
+                cl_t = b;
+            }
             for (const auto& [key, a] : acc) line(std::string(key.first == 0 ? "Q2_0" : "IQ4_NL") + " t" + std::to_string(key.second % 100) + (key.second >= 200 ? "cls" : key.second >= 100 ? "r2" : ""), a);
             line("all", all);
         }
@@ -563,6 +747,8 @@ void hfma_down_report(const int64_t tokens) {
             cls_s = b;
             cls_s += "; by format: " + (cb.empty() ? std::string("-") : cb) + "; left: " + (cl.empty() ? std::string("nothing") : cl);
         }
+        cls_s += cl_t;
+        g_ht[dev] = HostT{};
         auto f32 = [](unsigned bits) { float f; std::memcpy(&f, &bits, 4); return f; };
         std::string lm;
         for (int l = 0; l < 64; ++l)
