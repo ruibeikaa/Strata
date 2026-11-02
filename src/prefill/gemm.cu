@@ -1131,6 +1131,71 @@ void hfma_left(int dev, const char* name, const char* why) {
     ++g_hf_left[dev][w + ": " + why];
 }
 
+// ---- STRATA_PF_ROUTER_F16=1 (gemm.hpp: router_f16): what the router ran on and what it left to the FP32 router, per device since the last report; with
+// STRATA_PF_ROUTER_F16_CHECK=1 the device's counters of the ids that differ from the FP32 router's (rf_cmp_kernel), read and zeroed by the report
+std::atomic<int64_t> g_rf_taken[64], g_rf_sass[64], g_rf_chk[64];
+std::mutex g_rf_mu;
+std::map<std::string, int64_t> g_rf_left[64];   // reasons the FP32 router ran
+std::map<std::string, int64_t> g_rf_cc[64];     // reasons the compiler's HFMA2 kernel ran instead of the hand-scheduled one
+__device__ unsigned long long g_rf_cnt[8];      // tokens, tokens with another id set, ids outside the FP32 router's set, tokens in another order only, tokens with another top-1, max |dw| (float bits), sum |dw| * 1e9
+__global__ void rf_cmp_kernel(const int32_t* __restrict__ a, const int32_t* __restrict__ b, const float* __restrict__ wa, const float* __restrict__ wb, int64_t T) {
+    const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= T) return;
+    int diff = 0;
+    bool same_order = true;
+    float wd = 0.0f;
+    for (int i = 0; i < 10; ++i) {
+        const int x = a[t * 10 + i];
+        bool found = false;
+        for (int j = 0; j < 10; ++j) found = found || (b[t * 10 + j] == x);
+        if (!found) ++diff;
+        if (x != b[t * 10 + i]) same_order = false;
+        wd = fmaxf(wd, fabsf(wa[t * 10 + i] - wb[t * 10 + i]));
+    }
+    atomicAdd(&g_rf_cnt[0], 1ull);
+    if (diff != 0) { atomicAdd(&g_rf_cnt[1], 1ull); atomicAdd(&g_rf_cnt[2], (unsigned long long) diff); }
+    else if (!same_order) atomicAdd(&g_rf_cnt[3], 1ull);
+    if (a[t * 10] != b[t * 10]) atomicAdd(&g_rf_cnt[4], 1ull);
+    atomicMax(&g_rf_cnt[5], (unsigned long long) __float_as_uint(wd));
+    atomicAdd(&g_rf_cnt[6], (unsigned long long) ((double) wd * 1e9));
+}
+void rf_report(int64_t tokens) {
+    for (int d = 0; d < 64; ++d) {
+        const int64_t taken = g_rf_taken[d].exchange(0), via_sass = g_rf_sass[d].exchange(0), chk = g_rf_chk[d].exchange(0);
+        int64_t left = 0;
+        std::string by_left, by_cc;
+        {
+            std::lock_guard<std::mutex> lk(g_rf_mu);
+            for (const auto& [what, n] : g_rf_left[d]) { left += n; by_left += (by_left.empty() ? "" : ", ") + what + " x" + std::to_string(n); }
+            for (const auto& [what, n] : g_rf_cc[d]) by_cc += (by_cc.empty() ? "" : ", ") + what + " x" + std::to_string(n);
+            g_rf_left[d].clear();
+            g_rf_cc[d].clear();
+        }
+        if (taken == 0 && left == 0 && chk == 0) continue;
+        std::fprintf(stderr, "strata prefill: STRATA_PF_ROUTER_F16: read of %lld tokens, CUDA%d: %lld router products on the HFMA2 kernels (%lld on the hand-scheduled one; compiler kernel: %s), "
+                             "%lld left to the FP32 router (%s)\n", (long long) tokens, d, (long long) taken, (long long) via_sass, by_cc.empty() ? "-" : by_cc.c_str(), (long long) left,
+                     by_left.empty() ? "-" : by_left.c_str());
+        if (chk > 0) {
+            unsigned long long c[8] = {}, z[8] = {};
+            int prev = 0;
+            cudaGetDevice(&prev);
+            cudaSetDevice(d);
+            cudaDeviceSynchronize();
+            cudaMemcpyFromSymbol(c, g_rf_cnt, sizeof c);
+            cudaMemcpyToSymbol(g_rf_cnt, z, sizeof z);
+            cudaSetDevice(prev);
+            const uint32_t mxb = (uint32_t) c[5];
+            float mx = 0.0f;
+            std::memcpy(&mx, &mxb, 4);
+            const double nt = (double) std::max<unsigned long long>(c[0], 1ull);
+            std::fprintf(stderr, "strata prefill: STRATA_PF_ROUTER_F16_CHECK: read of %lld tokens, CUDA%d: %llu routed tokens against the FP32 router's: %llu with another top-10 set (%.4f%%), "
+                                 "%llu ids outside the FP32 router's set (%.5f%% of %llu), %llu more in another order only, %llu with another top-1 id; routing weights: max |dw| %.3e, mean per token of the max |dw| %.3e\n",
+                         (long long) tokens, d, c[0], c[1], 100.0 * (double) c[1] / nt, c[2], 100.0 * (double) c[2] / (10.0 * nt), (unsigned long long) (10.0 * nt), c[3], c[4], (double) mx,
+                         (double) c[6] * 1e-9 / nt);
+        }
+    }
+}
+
 // ---- GP100, opt-in (STRATA_PF_HFMA_SASS=1, with STRATA_PF_HFMA and / or STRATA_PF_HFMA_HC): the hand-scheduled SASS kernels of gemm_sass.cuh
 // in place of the compiler's gemm_kernel / gemm_sk_kernel where they cover the call; the rest keeps the compiler kernel, counted by what and
 // why (printed with the read's reports).  The outputs are the same bits.
@@ -1499,6 +1564,7 @@ bool Gemm::native_hfma(const uint16_t* X, int ggml_type, const void* W_blocks, f
     return true;
 }
 void gemm_hfma_report(int64_t tokens) {
+    rf_report(tokens);   // STRATA_PF_ROUTER_F16 (nothing printed without it)
     std::lock_guard<std::mutex> lk(g_hf_mu);
     for (int d = 0; d < 64; ++d) {
         const int64_t taken = g_hf_taken[d].exchange(0);
@@ -1836,6 +1902,10 @@ void gemm_hfma_hc_report(int64_t) {}
 bool Gemm::bf16_router_gate(const uint16_t*, const uint16_t*, const uint16_t*, bool, float*, int64_t, const uint16_t*, float*, int64_t, int64_t) {
     return false;   // not the experimental sm_60 CUDA build: bf16() runs
 }
+bool Gemm::router_f16(const uint16_t*, const uint16_t*, float*, int64_t, int64_t, int64_t, bool) {
+    return false;   // not the experimental sm_60 CUDA build: the FP32 router runs
+}
+void Gemm::router_f16_cmp(const int32_t*, const int32_t*, const float*, const float*, int64_t, void*) {}
 #endif
 bool Gemm::bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K) {
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
@@ -2131,6 +2201,60 @@ bool Gemm::bf16_router_gate(const uint16_t* X, const uint16_t* X_lo, const uint1
     }
     pf2_launched(kPf2Router);
     return true;
+}
+// STRATA_PF_ROUTER_F16: see gemm.hpp.  The router weight's FP16 copy is hc_weight's (the BF16 weight is exact in FP16 inside the range; a weight outside it, or non-finite, is refused and the
+// FP32 router runs); the product is the attn_k / attn_v shape (N 512, K 2560) on the hand-scheduled kernel, or the compiler's HFMA2 kernel (the same bits) for a call the hand-scheduled one does not cover.
+bool Gemm::router_f16(const uint16_t* Xh, const uint16_t* Wr, float* Y, int64_t T, int64_t N, int64_t K, bool x_lo) {
+    using namespace strata::prefill;
+    if (!pf_router_f16()) return false;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
+    if (T <= 0 || N <= 0) return false;
+    const cudaStream_t st = (cudaStream_t) stream_;
+    const char* why = nullptr;
+    if (current_cc() != 60) why = "not a GP100";
+    else if (x_lo) why = "the BF16X2 low part (a second product)";
+    else if (K <= 0 || K % 32 != 0) why = "K is not a multiple of 32";
+    else if (N < 64) why = "N below 64";
+    else if (T > INT_MAX || N > INT_MAX || K > INT_MAX) why = "a size past 2^31";
+    else if (((uintptr_t) Xh & 15) != 0) why = "X not 16-byte aligned";
+    else if (((uintptr_t) Wr & 15) != 0) why = "W not 16-byte aligned";
+    HcW hw;
+    if (why == nullptr) {
+        hw = hc_weight(Wr, N, K, st, dev);
+        if (hw.p == nullptr) why = hw.why != nullptr ? hw.why : "no FP16 copy";
+    }
+    if (why != nullptr) {
+        std::lock_guard<std::mutex> lk(g_rf_mu);
+        ++g_rf_left[dev][why];
+        return false;
+    }
+    static bool said = false;
+    if (!said) {
+        said = true;
+        std::fprintf(stderr, "prefill gemm: STRATA_PF_ROUTER_F16=1: the router's logits run as FP16 HFMA2 GEMMs on the layer input's FP16 image and the router weight's FP16 copy "
+                             "(FP16 sums of 64 products widened to FP32, not bitwise the FP32 router's: a near-tied expert id can change)\n");
+    }
+    const char* r = "STRATA_PF_HFMA_SASS is off";
+    int k = -1;
+    if (sass_on()) r = strata::prefill::sass::dense(Xh, K, hw.p, Y, T, N, K, N, st, dev, &k);
+    if (r == nullptr) {
+        ++g_rf_sass[dev];
+    } else {
+        {
+            std::lock_guard<std::mutex> lk(g_rf_mu);
+            ++g_rf_cc[dev][r];
+        }
+        strata::prefill::hfma::gemm(Xh, K, hw.p, Y, T, N, K, N, st);
+    }
+    ++g_rf_taken[dev];
+    return true;
+}
+void Gemm::router_f16_cmp(const int32_t* ids, const int32_t* ids_ref, const float* w, const float* w_ref, int64_t T, void* stream) {
+    int dev = 0;
+    if (T <= 0 || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return; }
+    rf_cmp_kernel<<<(unsigned) ((T + 127) / 128), 128, 0, (cudaStream_t) stream>>>(ids, ids_ref, w, w_ref, T);
+    ++g_rf_chk[dev];
 }
 #endif
 

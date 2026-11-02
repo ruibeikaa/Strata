@@ -2842,6 +2842,47 @@ bool router_gate_v2(Gemm& gm, const core::WeightRef* wr, const core::WeightRef* 
     if (wgi->kind != core::WeightKind::Bf16InF32 || !wgi->data || wr->ne0 != N || wgi->ne0 != N) return false;
     return gm.bf16_router_gate(X, X_lo, (const uint16_t*) wr->data, true, logits, wr->ne1 > 0 ? wr->ne1 : 1, (const uint16_t*) wgi->data, sg, T, N);
 }
+// STRATA_PF_ROUTER_F16=1 (gemm.cu, GP100 + STRATA_PF_HFMA_SASS): the router's logits from the layer input's FP16 image (mixed_h, the rows the shared expert's projections read) and the router
+// weight's resident FP16 copy on the dense HFMA2 kernel; false = nothing launched, the FP32 router (router_gate_v2 / bf16_proj) runs.  The shared expert's scalar gate then takes its own route.
+bool router_f16_logits(Gemm& gm, const core::WeightRef* wr, const uint16_t* Xh, const uint16_t* X_lo, float* logits, int64_t T, int64_t N) {
+    if (!strata::prefill::pf_router_f16()) return false;
+    if (wr->kind != core::WeightKind::Bf16InF32 || !wr->data || wr->q8_scale != nullptr || wr->hc_q8 != nullptr || wr->ne0 != N) return false;
+    return gm.router_f16(Xh, (const uint16_t*) wr->data, logits, T, wr->ne1 > 0 ? wr->ne1 : 1, N, X_lo != nullptr);
+}
+// STRATA_PF_ROUTER_F16_CHECK=1 (diagnostic): the FP32 router (bf16_proj on the BF16 image, as the switch-off path runs it) into scratch and routed, and the chunk's routed ids / weights
+// (`ids`, `w`, already routed from the FP16 router's logits) compared with those on the device (gemm.cu counts, the read's report prints)
+bool router_f16_check(Gemm& gm, const core::WeightRef* wr, const uint16_t* Xbf, const uint16_t* X_lo, const int32_t* ids, const float* w, int64_t T, int64_t n_expert,
+                      void* cs, const std::string& name, std::string& err) {
+    struct Ref { float* lg = nullptr; int32_t* ids = nullptr; float* w = nullptr; int64_t cap = 0; };
+    static std::mutex mu;
+    static std::map<int, Ref> refs;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    Ref r;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        Ref& b = refs[dev];
+        if (b.cap < T) {
+            cudaStreamSynchronize((cudaStream_t) cs);   // the earlier check's kernels may still read them
+            if (b.lg) cudaFree(b.lg);
+            if (b.ids) cudaFree(b.ids);
+            if (b.w) cudaFree(b.w);
+            b = Ref{};
+            if (cudaMalloc((void**) &b.lg, (size_t) T * (size_t) n_expert * 4) != cudaSuccess || cudaMalloc((void**) &b.ids, (size_t) T * 40) != cudaSuccess ||
+                cudaMalloc((void**) &b.w, (size_t) T * 40) != cudaSuccess) {
+                cudaGetLastError();
+                err = "prefill: STRATA_PF_ROUTER_F16_CHECK: no room for the FP32 router's scratch";
+                return false;
+            }
+            b.cap = T;
+        }
+        r = b;
+    }
+    if (!bf16_proj(gm, wr, Xbf, r.lg, T, name, err, 0, X_lo)) return false;
+    route(r.lg, r.ids, r.w, T, n_expert, cs);
+    gm.router_f16_cmp(ids, r.ids, w, r.w, T, cs);
+    return true;
+}
 // STRATA_PF_HFMA_HC=1 (gemm.cu, GP100 only): the hyper-connection read's down and up projections on FP16 HFMA2 pairs and the
 // BF16 weight's resident FP16 copy; a call the kernel cannot take is counted under `name` and runs bf16_proj
 bool hc_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
@@ -2866,11 +2907,12 @@ namespace {
 enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn, kPfRouter, kPfHostGroup, kPfGather,
                kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfKvStage, kPfGdnConv, kPfGdnRec, kPfGdnOut, kPfHcWrite,
                kPfHfPre,   // STRATA_PF_HFMA_EXP's max-reduce of the layer input (no mark without the switch: never printed)
+               kPfRouterF16,   // STRATA_PF_ROUTER_F16's router logits product (no mark without the switch: never printed; the rest of the router+shared phase keeps kPfRouter)
                kPfCount };
 const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa select",
                                         "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
                                         "gemm gate/up", "gemm down", "combine", "ple", "kv stage", "gdn conv+gates",
-                                        "gdn recurrence", "gdn out proj", "hc write", "hfma pre-pass"};
+                                        "gdn recurrence", "gdn out proj", "hc write", "hfma pre-pass", "router logits f16"};
 struct PfTimer {
     bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
     std::vector<cudaEvent_t> ev;
@@ -4265,10 +4307,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           *wsd = need(v, "ffn_down_shexp.weight", err);
                     if (!wr || !wgi || !wsg || !wsu || !wsd) return false;
                     pt.mark(kPfRouter, cs);
+                    // STRATA_PF_ROUTER_F16=1: the router's logits on the FP16 HFMA2 kernel (the shared gate then takes the old route below); false = as before
+                    if (strata::prefill::pf_router_f16()) pt.mark(kPfRouterF16, cs);
+                    const bool r16 = router_f16_logits(m.gemm, wr, m.mixed_h, m.mixed_bf_lo, m.logits, T, N);
+                    if (strata::prefill::pf_router_f16()) pt.mark(kPfRouter, cs);
                     // STRATA_PF_ROUTER_V2=1: the router's logits and the shared gate's sums from one widening of X a slice (bit-identical); false = the calls as before
-                    const bool sg_done = router_gate_v2(m.gemm, wr, wgi, m.mixed_bf, m.mixed_bf_lo, m.logits, m.sg, T, N);
-                    if (!sg_done && !bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
+                    const bool sg_done = !r16 && router_gate_v2(m.gemm, wr, wgi, m.mixed_bf, m.mixed_bf_lo, m.logits, m.sg, T, N);
+                    if (!r16 && !sg_done && !bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
+                    if (r16 && strata::prefill::pf_router_f16_check() &&
+                        !router_f16_check(m.gemm, wr, m.mixed_bf, m.mixed_bf_lo, m.ids, m.w, T, m.g->n_expert, m.cs, v.name("ffn_gate_inp.weight"), err)) return false;
                     // RESEARCH HOOK (141-research, opt-in, never on by default): STRATA_DBG_FEAT=<file> dumps, per MoE layer and chunk,
                     // the routed ids + weights (and for the layers in STRATA_DBG_FEAT_LAYERS the router-input hidden state, bf16);
                     // STRATA_DBG_ROUTE_OVERRIDE=<file> replaces the routing of the layers listed in that file with the file's ids + weights.
@@ -7213,10 +7261,16 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                                               *wsd = need(v, "ffn_down_shexp.weight", err);
                         if (!wr || !wgi || !wsg || !wsu || !wsd) return false;
                         pt.mark(kPfRouter, cs);
+                        // STRATA_PF_ROUTER_F16=1: the router's logits on the FP16 HFMA2 kernel (the shared gate then takes the old route below); false = as before
+                        if (strata::prefill::pf_router_f16()) pt.mark(kPfRouterF16, cs);
+                        const bool r16 = router_f16_logits(m.gemm, wr, m.mixed_h, m.mixed_bf_lo, m.logits, T, N);
+                        if (strata::prefill::pf_router_f16()) pt.mark(kPfRouter, cs);
                         // STRATA_PF_ROUTER_V2=1: the router's logits and the shared gate's sums from one widening of X a slice (bit-identical); false = the calls as before
-                        const bool sg_done = router_gate_v2(m.gemm, wr, wgi, m.mixed_bf, m.mixed_bf_lo, m.logits, m.sg, T, N);
-                        if (!sg_done && !bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
+                        const bool sg_done = !r16 && router_gate_v2(m.gemm, wr, wgi, m.mixed_bf, m.mixed_bf_lo, m.logits, m.sg, T, N);
+                        if (!r16 && !sg_done && !bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                         route(m.logits, lb.ids + t0 * K, lb.w + t0 * K, T, m.g->n_expert, cs);
+                        if (r16 && strata::prefill::pf_router_f16_check() &&
+                            !router_f16_check(m.gemm, wr, m.mixed_bf, m.mixed_bf_lo, lb.ids + t0 * K, lb.w + t0 * K, T, m.g->n_expert, cs, v.name("ffn_gate_inp.weight"), err)) return false;
                         if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
                         if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
                         swiglu_pair(m.sgate, m.sup, m.sh_h, T, cs);

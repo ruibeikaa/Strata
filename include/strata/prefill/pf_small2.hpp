@@ -31,6 +31,11 @@ inline bool pf_gdn_fused() { static const bool on = pf_env_on("STRATA_PF_GDN_FUS
 inline bool pf_combine_v2() { static const bool on = pf_env_on("STRATA_PF_COMBINE_V2"); return on; }
 inline bool pf_sel_exact() { static const bool on = pf_env_on("STRATA_PF_SEL_EXACT"); return on; }
 inline bool pf_router_v2() { static const bool on = pf_env_on("STRATA_PF_ROUTER_V2"); return on; }
+// STRATA_PF_ROUTER_F16=1 (default off, GP100 + STRATA_PF_HFMA_SASS): the MoE router's logits on the hand-scheduled dense HFMA2 kernel (N 512, K 2560) from the layer input's FP16 image and the
+// router weight's resident FP16 copy, instead of cublasSgemm on the BF16-rounded input widened to FP32.  NOT bitwise the FP32 router's: the logits change by rounding and a near-tied expert id can
+// change.  STRATA_PF_ROUTER_F16_CHECK=1 (diagnostic, only with the switch above): also runs the FP32 router into scratch after every chunk and layer and counts the ids that differ.
+inline bool pf_router_f16() { static const bool on = pf_env_on("STRATA_PF_ROUTER_F16"); return on; }
+inline bool pf_router_f16_check() { static const bool on = pf_router_f16() && pf_env_on("STRATA_PF_ROUTER_F16_CHECK"); return on; }
 
 enum Pf2Switch { kPf2Sel = 0, kPf2Topk, kPf2Gdn, kPf2Comb, kPf2SelX, kPf2Router, kPf2Count };
 enum Pf2Reason { kPf2Arch = 0, kPf2Geometry, kPf2Align, kPf2Length, kPf2ReasonCount };

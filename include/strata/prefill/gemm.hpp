@@ -90,6 +90,12 @@ public:
     /// beta 1) + bf16(X, Wg, Yg, T, 1, K) + bf16(X_lo, ..., beta 1).  `r_resident`: Wr is the pack's own resident tensor.  False = nothing launched (the path, the room or the residency
     /// is not the one bf16() would take whole): the caller runs the two bf16_proj / bf16 calls.
     bool bf16_router_gate(const uint16_t* X, const uint16_t* X_lo, const uint16_t* Wr, bool r_resident, float* Yr, int64_t Nr, const uint16_t* Wg, float* Yg, int64_t T, int64_t K);
+    /// STRATA_PF_ROUTER_F16=1, GP100: the router's logits Y [T, N] = Xh . Wr^T on the hand-scheduled dense HFMA2 kernel (the compiler's HFMA2 kernel, the same bits, where the SASS one does not cover the
+    /// call), Xh the layer input's FP16 image (row stride K), Wr the router's BF16 weight (its FP16 copy is made once; BF16 -> FP16 is exact in range).  Not bitwise bf16()'s.  `x_lo`: a BF16X2 low part
+    /// follows (a second product this route does not do).  False = nothing launched (counted by reason): the caller runs the FP32 router.
+    bool router_f16(const uint16_t* Xh, const uint16_t* Wr, float* Y, int64_t T, int64_t N, int64_t K, bool x_lo);
+    /// STRATA_PF_ROUTER_F16_CHECK=1: compares the routed ids/weights of this chunk (a, b = the FP32 router's) and adds to the device's counters (printed by gemm_hfma_report).
+    void router_f16_cmp(const int32_t* ids, const int32_t* ids_ref, const float* w, const float* w_ref, int64_t T, void* stream);
 
     /// HIP gfx103x (prompt_f16()): bf16() takes X as the FP16 image the prompt path's kernels write (set_act_f16),
     /// and bf16() / f16() / native() run the GEMM with FP16 out (rocBLAS's tuned kernels there), widened in place in
