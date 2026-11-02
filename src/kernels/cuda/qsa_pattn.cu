@@ -12,6 +12,7 @@
 // qsa_pattn_parity compares the outputs with qsa_decode_attn_batch's byte for byte on synthetic selections.
 // Only the default variant of the contributor's PR (#3943) is kept: ps_score_x_kernel + ps_value_d4_kernel.
 #include "strata/kernels/qsa_pattn.hpp"
+#include "strata/kernels/ktime.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/core/geometry.hpp"
 
@@ -430,11 +431,14 @@ bool qsa_pattn_batch_any_arch(const float* q, const QsaAttnPools& pools, const i
         const float* qb = q + (size_t) t0 * s.n_head * HD;
         const int32_t* ib = ids + (size_t) t0 * cap;
         const int32_t* sb = steps + (size_t) t0 * kStepCount;
+        ktime::begin(ktime::kAttnScore, st);
         ps_score_x_kernel<1><<<g1, THREADS, 0, st>>>(qb, pools, ib, sb, (int) s.n_head_kv, (int) s.page_size, scale,
                                                      scratch, n_chunks, (int) cap);
+        ktime::begin(ktime::kAttnValue, st);
         ps_value_d4_kernel<<<g2, 64, 0, st>>>(pools, sb, scratch, (int) s.n_head_kv, n_chunks,
                                               attn + (size_t) t0 * s.n_head * HD);
     }
+    ktime::begin(ktime::kOther, st);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         // a launch that did not start: say so once, and let the caller run the usual attention over the whole chunk

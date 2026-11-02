@@ -40,6 +40,7 @@
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_pattn.hpp"
+#include "strata/kernels/ktime.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/prefill/gemm.hpp"
@@ -4023,9 +4024,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                              m.cs, active))
                             strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
                                                               m.max_blocks, s, m.sel_scores, m.cs, active);
+                        strata::kernels::ktime::begin(strata::kernels::ktime::kSelTopk, m.cs);
                         strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                         m.sel_ids + t0 * m.cap, m.cs, active);
                     }
+                    strata::kernels::ktime::begin(strata::kernels::ktime::kOther, m.cs);
                     // STRATA_SEL_OVERLAP (debug, D-1's question): how much do neighbouring queries' selections share?
                     // Per tile of 16 queries: the union of their selected cells against the sum of their widths.
                     if (static const bool ovl = std::getenv("STRATA_SEL_OVERLAP") != nullptr; ovl && qsa_index == 0) {
@@ -5912,6 +5915,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         int stage_dev = -1;   // (which stage's line it is: a layer split prints one per stage and chunk)
         cudaGetDevice(&stage_dev);
+        strata::kernels::ktime::print_line((long long) n, stage_dev);   // STRATA_PREFILL_TIMING=2: the kernels of select / attn / gdn recurrence
         std::fprintf(stderr, "strata prefill timing: %lld tokens, GPU timeline %.0f ms, wall %.0f ms, host staging %.0f ms:%s (CUDA%d)\n",
                      (long long) n, total, ms_since(t_start), stats_.ms_experts_host, line.c_str(), stage_dev);
         std::fprintf(stderr, "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
