@@ -147,7 +147,7 @@ template <bool REC>
 __global__ void gr_norm_rs_kernel(const float* __restrict__ R, const float* __restrict__ w, float eps,
                                   float* __restrict__ rs_out, uint16_t* __restrict__ xn16,
                                   uint16_t* __restrict__ xn16_lo, int64_t ldx, int f16img,
-                                  uint16_t* __restrict__ xh, unsigned* __restrict__ xmax) {
+                                  uint16_t* __restrict__ xh, unsigned* __restrict__ xmax, int keep) {
     __shared__ float sh[32];
     const int64_t row = blockIdx.x;                 // t * 4 + c
     const int c = (int) (row % HC);
@@ -161,7 +161,7 @@ __global__ void gr_norm_rs_kernel(const float* __restrict__ R, const float* __re
     for (int d = threadIdx.x; d < N; d += blockDim.x) {
         const float v = r[d] * rs * w[c * N + d];
         const uint16_t h = act16(v);
-        xn16[xo + d] = f16img ? bf_to_hf_conv(h) : h;
+        if (!REC || keep) xn16[xo + d] = f16img ? bf_to_hf_conv(h) : h;
         if (xn16_lo) xn16_lo[xo + d] = bf_lo(v, h);
         if constexpr (REC) { xh[xo + d] = hc_img16(h); mx = max(mx, (unsigned) (h & 0x7FFFu)); }
     }
@@ -251,7 +251,7 @@ __global__ void __launch_bounds__(256) gr_write_norm_rs_kernel(float* __restrict
                                                                const float* __restrict__ w, float eps,
                                                                float* __restrict__ rs_out, uint16_t* __restrict__ xn16,
                                                                uint16_t* __restrict__ xn16_lo, int64_t ldx, int f16img,
-                                                               uint16_t* __restrict__ xh, unsigned* __restrict__ xmax) {
+                                                               uint16_t* __restrict__ xh, unsigned* __restrict__ xmax, int keep) {
     __shared__ float sh[32];
     const int64_t row = blockIdx.x;                 // t * 4 + c
     const int64_t t = row / HC;
@@ -277,7 +277,7 @@ __global__ void __launch_bounds__(256) gr_write_norm_rs_kernel(float* __restrict
     for (int d = threadIdx.x; d < N; d += 256, ++k) {
         const float x = v[k] * rs * w[c * N + d];
         const uint16_t h = act16(x);
-        xn16[xo + d] = f16img ? bf_to_hf_conv(h) : h;
+        if (!REC || keep) xn16[xo + d] = f16img ? bf_to_hf_conv(h) : h;
         if (xn16_lo) xn16_lo[xo + d] = bf_lo(x, h);
         if constexpr (REC) { xh[xo + d] = hc_img16(h); mx = max(mx, (unsigned) (h & 0x7FFFu)); }
     }
@@ -349,15 +349,40 @@ template <bool REC>
 __global__ void gr_silu_kernel(const float* __restrict__ lo, uint16_t* __restrict__ lo16, uint16_t* __restrict__ lo16_lo,
                                int64_t n, uint16_t* __restrict__ xh, unsigned* __restrict__ xmax) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;   // (n = T * 320 is a multiple of 32: whole warps leave)
-    const float x = lo[i] / (float) HC;
-    const float v = x / (1.0f + __expf(-x));
-    const uint16_t h = act16(v);
-    lo16[i] = h;
-    if (lo16_lo) lo16_lo[i] = bf_lo(v, h);
     if constexpr (REC) {
-        xh[i] = hc_img16(h);
-        hc_rec_max(xmax, (int) ((i / LR) >> 10), (unsigned) (h & 0x7FFFu));   // a warp's 32 values lie in one row (320 = 10 x 32)
+        // one check of the slot a block (its 256 values lie in one 1024-row slice: 327680 = 1280 blocks): a check a warp made 23 thousand reads of one word queue in the L2
+        __shared__ unsigned sm[8];
+        unsigned m = 0;
+        if (i < n) {
+            const float x = lo[i] / (float) HC;
+            const float v = x / (1.0f + __expf(-x));
+            const uint16_t h = act16(v);
+            lo16[i] = h;
+            if (lo16_lo) lo16_lo[i] = bf_lo(v, h);
+            xh[i] = hc_img16(h);
+            m = (unsigned) (h & 0x7FFFu);
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) m = max(m, (unsigned) __shfl_xor_sync(0xFFFFFFFFu, (int) m, o));
+        if ((threadIdx.x & 31) == 0) sm[threadIdx.x >> 5] = m;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            unsigned b = 0;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) b = max(b, sm[w]);
+            if (b != 0) {
+                const unsigned v = b << 16;
+                unsigned* slot = xmax + (((blockIdx.x * 256u) / (unsigned) LR) >> 10);
+                if (v > *(volatile unsigned*) slot) atomicMax(slot, v);
+            }
+        }
+    } else {
+        if (i >= n) return;
+        const float x = lo[i] / (float) HC;
+        const float v = x / (1.0f + __expf(-x));
+        const uint16_t h = act16(v);
+        lo16[i] = h;
+        if (lo16_lo) lo16_lo[i] = bf_lo(v, h);
     }
 }
 __global__ void gr_mix_kernel(const float* __restrict__ xn, const float* __restrict__ g, float* __restrict__ mixed,
@@ -2396,7 +2421,7 @@ __global__ void __launch_bounds__(256) moe_combine_write_norm_rs_kernel(
     const float* __restrict__ shared, const float* __restrict__ sg, float* __restrict__ R,
     const float* __restrict__ inj, int64_t inj_ld, const float* __restrict__ wn, float eps, float* __restrict__ rs_out,
     uint16_t* __restrict__ xn16, uint16_t* __restrict__ xn16_lo, int64_t ldx, int f16img,
-    uint16_t* __restrict__ xh, unsigned* __restrict__ xmax) {
+    uint16_t* __restrict__ xh, unsigned* __restrict__ xmax, int keep) {
     __shared__ float sh[32];
     __shared__ int64_t s_row[10];
     __shared__ float s_w[10];
@@ -2440,7 +2465,7 @@ __global__ void __launch_bounds__(256) moe_combine_write_norm_rs_kernel(
         for (int d = threadIdx.x; d < N; d += 256, ++k) {
             const float x = v[k] * rs * wn[c * N + d];
             const uint16_t h = act16(x);
-            xn16[xo + d] = f16img ? bf_to_hf_conv(h) : h;
+            if (!REC || keep) xn16[xo + d] = f16img ? bf_to_hf_conv(h) : h;
             if (xn16_lo) xn16_lo[xo + d] = bf_lo(x, h);
             if constexpr (REC) { xh[xo + d] = hc_img16(h); mx = max(mx, (unsigned) (h & 0x7FFFu)); }
         }
@@ -2456,7 +2481,7 @@ template <bool REC>
 __global__ void __launch_bounds__(256) moe_combine_write_norm_rs_v2_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot, const float* __restrict__ w, const float* __restrict__ shared,
                                                             const float* __restrict__ sg, float* __restrict__ R, const float* __restrict__ inj, int64_t inj_ld, const float* __restrict__ wn,
                                                             float eps, float* __restrict__ rs_out, uint16_t* __restrict__ xn16, uint16_t* __restrict__ xn16_lo, int64_t ldx, int f16img,
-                                                            uint16_t* __restrict__ xh, unsigned* __restrict__ xmax) {
+                                                            uint16_t* __restrict__ xh, unsigned* __restrict__ xmax, int keep) {
     __shared__ float sh[HC][32];
     __shared__ int64_t s_row[10];
     __shared__ float s_w[10];
@@ -2551,7 +2576,7 @@ __global__ void __launch_bounds__(256) moe_combine_write_norm_rs_v2_kernel(const
             const int d = tid + 256 * k;
             const float x = r[c][k] * rsv[c] * wcur[k];
             const uint16_t hh = act16(x);
-            xn16[xo + d] = f16img ? bf_to_hf_conv(hh) : hh;
+            if (!REC || keep) xn16[xo + d] = f16img ? bf_to_hf_conv(hh) : hh;
             if (xn16_lo) xn16_lo[xo + d] = bf_lo(x, hh);
             if constexpr (REC) { xh[xo + d] = hc_img16(hh); mx = max(mx, (unsigned) (hh & 0x7FFFu)); }
         }
@@ -2886,20 +2911,25 @@ __global__ void __launch_bounds__(256, 2) gr_upmix_cuda_kernel(const uint16_t* _
 // ---- STRATA_PF_HC_NOCVT: the records of the images the hyper-connection read's products take (pf_hc_nocvt.hpp)
 namespace {
 struct HcImgRec {
-    int dev = -1;
     uint16_t* xh = nullptr;
     unsigned* slots = nullptr;
     int64_t cap = 0;          // xh capacity in elements
     int64_t rows = 0, k = 0;
+    const float *R = nullptr, *rs = nullptr, *wn = nullptr;
     void* stream = nullptr;
-    bool valid = false;
+    bool valid = false, bf_ok = true;
 };
 std::mutex g_img_mu;
 std::map<std::pair<int, const void*>, HcImgRec> g_img;
+long long g_img_materialized = 0;
+// xn16 = bf16(R * rs * wn), element i = (t * 4 + c) * 2560 + d: the writers' expression in their order (x * rs, then * w)
+__global__ void hc_rebuild_kernel(const float* __restrict__ R, const float* __restrict__ rs, const float* __restrict__ wn, uint16_t* __restrict__ xn16, unsigned n) {
+    for (unsigned i = blockIdx.x * 256u + threadIdx.x; i < n; i += gridDim.x * 256u) xn16[i] = act16(R[i] * rs[i / N] * wn[i % D]);
+}
 }  // namespace
-bool hc_img_begin(const void* x, int64_t rows, int64_t k, void* stream, HcImg* out) {
+bool hc_img_begin(const void* x, int64_t rows, int64_t k, void* stream, HcImg* out, const float* R, const float* rs, const float* wn) {
 #if defined(__HIPCC__) || !defined(STRATA_EXPERIMENTAL_SM60)
-    (void) x; (void) rows; (void) k; (void) stream; (void) out;
+    (void) x; (void) rows; (void) k; (void) stream; (void) out; (void) R; (void) rs; (void) wn;
     return false;
 #else
     int dev = 0;
@@ -2916,10 +2946,11 @@ bool hc_img_begin(const void* x, int64_t rows, int64_t k, void* stream, HcImg* o
         if (cudaMalloc((void**) &r.xh, (size_t) (rows * k) * 2) != cudaSuccess) { (void) cudaGetLastError(); r.xh = nullptr; return false; }
         r.cap = rows * k;
     }
-    r.dev = dev;
     if (cudaMemsetAsync(r.slots, 0, kHcImgSlots * sizeof(unsigned), (cudaStream_t) stream) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+    const bool keep = R == nullptr || rs == nullptr || wn == nullptr || k != 10240 || pf_hc_nocvt_check();   // the BF16 image is skipped for xn16 only
     r.rows = rows; r.k = k; r.stream = stream; r.valid = true;
-    out->xh = r.xh; out->slots = r.slots;
+    r.R = R; r.rs = rs; r.wn = wn; r.bf_ok = keep;
+    out->xh = r.xh; out->slots = r.slots; out->R = R; out->rs = rs; out->wn = wn; out->bf16_ok = keep; out->keep = keep ? 1 : 0;
     return true;
 #endif
 }
@@ -2940,14 +2971,40 @@ bool hc_img_take(const void* x, int64_t rows, int64_t k, void* stream, HcImg* ou
     if (!r.valid) { *why = "the record is dropped (a writer that does not record, or the writer declined)"; return false; }
     if (r.rows != rows || r.k != k) { *why = "the record is for other sizes"; return false; }
     if (r.stream != stream) { *why = "the writer ran on another stream"; return false; }
-    out->xh = r.xh; out->slots = r.slots;
+    out->xh = r.xh; out->slots = r.slots; out->R = r.R; out->rs = r.rs; out->wn = r.wn; out->bf16_ok = r.bf_ok; out->keep = r.bf_ok ? 1 : 0;
     return true;
+}
+void hc_img_materialize(const void* x, void* stream) {
+    if (!pf_hc_nocvt()) return;
+#if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) { (void) cudaGetLastError(); return; }
+    std::lock_guard<std::mutex> lk(g_img_mu);
+    auto it = g_img.upper_bound({dev, x});
+    if (it == g_img.begin()) return;
+    --it;
+    if (it->first.first != dev) return;
+    HcImgRec& r = it->second;
+    const char* base = (const char*) it->first.second;
+    if (!r.valid || r.bf_ok || (const char*) x >= base + (size_t) (r.rows * r.k) * 2) return;
+    const unsigned n = (unsigned) (r.rows * r.k);
+    hc_rebuild_kernel<<<std::min<unsigned>((n + 255) / 256, 4096u), 256, 0, (cudaStream_t) stream>>>(r.R, r.rs, r.wn, (uint16_t*) base, n);
+    check("hc_img_materialize");
+    r.bf_ok = true;
+    ++g_img_materialized;
+#else
+    (void) x; (void) stream;
+#endif
+}
+long long hc_img_materialized() {
+    std::lock_guard<std::mutex> lk(g_img_mu);
+    return g_img_materialized;
 }
 namespace {
 // the writers' side: the record of x for this call (true: the REC kernel runs with *im), else x's record is dropped
-bool hc_nocvt_writer(const void* x, int64_t T, int64_t k, int64_t ldx, bool f16img, const void* x_lo, void* stream, HcImg* im) {
+bool hc_nocvt_writer(const void* x, int64_t T, int64_t k, int64_t ldx, bool f16img, const void* x_lo, void* stream, HcImg* im, const float* R, const float* rs, const float* wn) {
     if (!pf_hc_nocvt()) return false;
-    if (T > 0 && !f16img && x_lo == nullptr && (ldx == 0 || ldx == k) && hc_img_begin(x, T, k, stream, im)) return true;
+    if (T > 0 && !f16img && x_lo == nullptr && (ldx == 0 || ldx == k) && hc_img_begin(x, T, k, stream, im, R, rs, wn)) return true;
     hc_img_drop(x);
     return false;
 }
@@ -3026,12 +3083,12 @@ void gr_norm(const float* R, const float* w_norm, float eps, float* xn, uint16_t
 void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint16_t* xn16, int64_t T, void* stream,
                 uint16_t* xn16_lo, int64_t ldx, bool f16img) {
     HcImg im;
-    if (hc_nocvt_writer(xn16, T, D, ldx, f16img, xn16_lo, stream, &im))   // STRATA_PF_HC_NOCVT: the FP16 image and the slice maxima too
+    if (hc_nocvt_writer(xn16, T, D, ldx, f16img, xn16_lo, stream, &im, R, rs, w_norm))   // STRATA_PF_HC_NOCVT: the FP16 image and the slice maxima too
         gr_norm_rs_kernel<true><<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, w_norm, eps, rs, xn16, xn16_lo,
-                                                                                          ldx > 0 ? ldx : D, f16img ? 1 : 0, im.xh, im.slots);
+                                                                                          ldx > 0 ? ldx : D, f16img ? 1 : 0, im.xh, im.slots, im.keep);
     else
         gr_norm_rs_kernel<false><<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, w_norm, eps, rs, xn16, xn16_lo,
-                                                                                           ldx > 0 ? ldx : D, f16img ? 1 : 0, nullptr, nullptr);
+                                                                                           ldx > 0 ? ldx : D, f16img ? 1 : 0, nullptr, nullptr, 1);
     check("gr_norm_rs");
 }
 void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float* gated, float* mixed, uint16_t* mixed16,
@@ -3081,14 +3138,14 @@ bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const 
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
                       float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo, int64_t ldx, bool f16img) {
     HcImg im;
-    if (hc_nocvt_writer(xn16, T, D, ldx, f16img, xn16_lo, stream, &im))
+    if (hc_nocvt_writer(xn16, T, D, ldx, f16img, xn16_lo, stream, &im, R, rs, w_norm_next))
         gr_write_norm_rs_kernel<true><<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, bo, inj, inj_ld, w_norm_next, eps,
                                                                                                 rs, xn16, xn16_lo,
-                                                                                                ldx > 0 ? ldx : D, f16img ? 1 : 0, im.xh, im.slots);
+                                                                                                ldx > 0 ? ldx : D, f16img ? 1 : 0, im.xh, im.slots, im.keep);
     else
         gr_write_norm_rs_kernel<false><<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, bo, inj, inj_ld, w_norm_next, eps,
                                                                                                  rs, xn16, xn16_lo,
-                                                                                                 ldx > 0 ? ldx : D, f16img ? 1 : 0, nullptr, nullptr);
+                                                                                                 ldx > 0 ? ldx : D, f16img ? 1 : 0, nullptr, nullptr, 1);
     check("gr_write_norm_rs");
 }
 void gr_write_cvec_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* v_l,
@@ -3101,7 +3158,7 @@ void gr_write_cvec_norm_rs(float* R, const float* bo, const float* inj, int64_t 
 }
 void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t* lo16_lo) {
     HcImg im;
-    if (hc_nocvt_writer(lo16, T, LR, LR, false, lo16_lo, stream, &im))
+    if (hc_nocvt_writer(lo16, T, LR, LR, false, lo16_lo, stream, &im, nullptr, nullptr, nullptr))
         gr_silu_kernel<true><<<blocks_for(T * LR), 256, 0, (cudaStream_t) stream>>>(lo, lo16, lo16_lo, T * LR, im.xh, im.slots);
     else
         gr_silu_kernel<false><<<blocks_for(T * LR), 256, 0, (cudaStream_t) stream>>>(lo, lo16, lo16_lo, T * LR, nullptr, nullptr);
@@ -3506,27 +3563,27 @@ bool moe_combine_write_norm_rs(const float* Dm, const int32_t* slot, const float
     if (((reinterpret_cast<uintptr_t>(Dm) | reinterpret_cast<uintptr_t>(shared)) & 15) == 0) {
         if (T > 0) {
             HcImg im;
-            const bool rec = hc_nocvt_writer(xn16, T, D, ldx, f16img, xn16_lo, stream, &im);   // STRATA_PF_HC_NOCVT
+            const bool rec = hc_nocvt_writer(xn16, T, D, ldx, f16img, xn16_lo, stream, &im, R, rs, w_norm_next);   // STRATA_PF_HC_NOCVT
             if (strata::prefill::pf_combine_v2() && pf2_cc6_here()) {   // STRATA_PF_COMBINE_V2 (same bits)
                 if (rec)
                     moe_combine_write_norm_rs_v2_kernel<true><<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(
                         Dm, slot, w, shared, sg, R, inj, inj_ld, w_norm_next, eps, rs, xn16, xn16_lo, ldx > 0 ? ldx : D,
-                        f16img ? 1 : 0, im.xh, im.slots);
+                        f16img ? 1 : 0, im.xh, im.slots, im.keep);
                 else
                     moe_combine_write_norm_rs_v2_kernel<false><<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(
                         Dm, slot, w, shared, sg, R, inj, inj_ld, w_norm_next, eps, rs, xn16, xn16_lo, ldx > 0 ? ldx : D,
-                        f16img ? 1 : 0, nullptr, nullptr);
+                        f16img ? 1 : 0, nullptr, nullptr, 1);
                 strata::prefill::pf2_launched(strata::prefill::kPf2Comb);
             } else {
                 if (strata::prefill::pf_combine_v2()) strata::prefill::pf2_fallback(strata::prefill::kPf2Comb, strata::prefill::kPf2Arch);
                 if (rec)
                     moe_combine_write_norm_rs_kernel<true><<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(
                         Dm, slot, w, shared, sg, R, inj, inj_ld, w_norm_next, eps, rs, xn16, xn16_lo, ldx > 0 ? ldx : D,
-                        f16img ? 1 : 0, im.xh, im.slots);
+                        f16img ? 1 : 0, im.xh, im.slots, im.keep);
                 else
                     moe_combine_write_norm_rs_kernel<false><<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(
                         Dm, slot, w, shared, sg, R, inj, inj_ld, w_norm_next, eps, rs, xn16, xn16_lo, ldx > 0 ? ldx : D,
-                        f16img ? 1 : 0, nullptr, nullptr);
+                        f16img ? 1 : 0, nullptr, nullptr, 1);
             }
             check("moe_combine_write_norm_rs");
         }

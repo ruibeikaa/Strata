@@ -36,13 +36,14 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "strata/prefill/pf_hc_nocvt.hpp"   // STRATA_PF_HC_NOCVT
+
 #if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
 #include "gemm_hfma.cuh"   // STRATA_PF_HFMA
 #include "gemm_hfma_hc.cuh"   // STRATA_PF_HFMA_HC
 #include "gemm_sass.cuh"   // STRATA_PF_HFMA_SASS
 #include "strata/prefill/pf_small.hpp"   // STRATA_PF_HFMA_SMALL
 #include "strata/prefill/pf_small2.hpp"   // STRATA_PF_ROUTER_V2
-#include "strata/prefill/pf_hc_nocvt.hpp"   // STRATA_PF_HC_NOCVT
 #include "strata/kernels/ktime.hpp"   // STRATA_PREFILL_TIMING=2: the hyper-connection products' kernels
 #include <cctype>
 #include <cmath>
@@ -1820,6 +1821,7 @@ bool Gemm::bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y,
             g_hcd[dev].seen = true;
         }
     }
+    if (!nocvt && pf_hc_nocvt()) hc_img_materialize(X, st);   // the old route below reads the BF16 image
     if (hc_timing_on()) {
         std::lock_guard<std::mutex> lk(g_hcd_mu);
         auto& v = g_hctm[dev];
@@ -1866,15 +1868,22 @@ bool Gemm::bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y,
         if (nocvt) {
             xg = nimg.xh + t0 * K;
             const unsigned fix_blocks = std::min<unsigned>(blocks, 4u * (unsigned) nsm);
-            if (pf_hc_nocvt_check()) {   // the old route beside it, into the scratch (its counts are added to the read's: the slices show twice)
+            if (pf_hc_nocvt_check() && nimg.bf16_ok) {   // the old route beside it, into the scratch (its counts are added to the read's: the slices show twice)
                 cudaMemsetAsync(sp, 0, sizeof(unsigned), st);
                 hcn::xcvt_kernel<false><<<blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(x16), (unsigned) n8, (unsigned) K8, (unsigned) ldx8);
                 hcn::cvt_fix_kernel<false><<<fix_blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(x16), (unsigned) n8, (unsigned) K8, (unsigned) ldx8, wm);
                 hcn::nc_save_kernel<<<1, 1, 0, st>>>();
             }
-            hcn::cvt_slot_kernel<<<fix_blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(nimg.xh) + t0 * K8, (unsigned) n8, wm, nimg.slots + (t0 >> 10));
-            if (pf_hc_nocvt_check())
+            if (nimg.bf16_ok)
+                hcn::cvt_slot_kernel<<<fix_blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(nimg.xh) + t0 * K8, (unsigned) n8, wm, nimg.slots + (t0 >> 10));
+            else   // no BF16 image: a slice that needs a shift is made from R, rs and wn (the kernel returns at once for a slice that does not)
+                hcn::cvt_slot_r_kernel<<<fix_blocks, 256, 0, st>>>(nimg.R + t0 * K, nimg.rs + (t0 * K) / 2560, nimg.wn, reinterpret_cast<uint4*>(nimg.xh) + t0 * K8,
+                                                                   (unsigned) n8, wm, nimg.slots + (t0 >> 10));
+            if (pf_hc_nocvt_check()) {
                 hcn::nc_cmp_kernel<<<fix_blocks, 256, 0, st>>>(reinterpret_cast<const uint4*>(x16), reinterpret_cast<const uint4*>(xg), (unsigned) n8, wm);
+                if (nimg.R != nullptr)
+                    hcn::nc_bf_cmp_kernel<<<blocks, 256, 0, st>>>(nimg.R + t0 * K, nimg.rs + (t0 * K) / 2560, nimg.wn, X + t0 * K, (unsigned) (rows * K));
+            }
         } else {
         cudaMemsetAsync(sp, 0, sizeof(unsigned), st);   // HcState::cur is its first member
         if (small) {   // STRATA_PF_HFMA_SMALL: one pass takes the max and writes the image at shift 0; the second kernel counts the slice and redoes the image only for a shift > 0
@@ -2030,15 +2039,15 @@ void gemm_hfma_hc_report(int64_t tokens) {
             int64_t n_old = 0;
             for (const auto& [what, n] : d.ncv_left) { nl += (nl.empty() ? " (" : ", ") + what + " x" + std::to_string((long long) n); n_old += n; }
             std::fprintf(stderr, "strata prefill: STRATA_PF_HC_NOCVT: read of %lld tokens, CUDA%d: %lld slices on the writers' max and FP16 image (no max-reduce, no conversion pass), "
-                                 "%lld products on the old route%s%s\n", (long long) tokens, dev, (long long) d.ncv_taken, (long long) n_old, nl.c_str(), nl.empty() ? "" : ")");
+                                 "%lld products on the old route%s%s (BF16 images rebuilt so far: %lld)\n", (long long) tokens, dev, (long long) d.ncv_taken, (long long) n_old, nl.c_str(), nl.empty() ? "" : ")", hc_img_materialized());
         }
         if (pf_hc_nocvt_check()) {
-            unsigned c[4] = {};
+            unsigned c[5] = {};
             cudaSetDevice(dev);
             if (cudaMemcpyFromSymbol(c, hcn::g_nc_chk, sizeof c) == cudaSuccess) {
                 std::fprintf(stderr, "strata prefill: STRATA_PF_HC_NOCVT_CHECK: read of %lld tokens, CUDA%d: %u slices compared with the old route's, %u with another max, %u 16-bit words "
-                                     "of the image differ, %u slices had a shift above 0\n", (long long) tokens, dev, c[0], c[1], c[2], c[3]);
-                unsigned z[4] = {};
+                                     "of the image differ, %u slices had a shift above 0, %u BF16 words differ from bf16(R * rs * w)\n", (long long) tokens, dev, c[0], c[1], c[2], c[3], c[4]);
+                unsigned z[5] = {};
                 cudaMemcpyToSymbol(hcn::g_nc_chk, z, sizeof z);
             } else {
                 cudaGetLastError();
@@ -2202,6 +2211,7 @@ __global__ void f16_to_bf16_kernel(const __half* __restrict__ in, uint16_t* __re
 }
 void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                 float beta, int64_t ldx, bool x_f16, bool w_resident) {
+    if (pf_hc_nocvt()) hc_img_materialize(X, stream_);   // STRATA_PF_HC_NOCVT: the hyper-connection image's BF16 form, if only its FP16 form was written
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
     if (ldx <= K) ldx = 0;

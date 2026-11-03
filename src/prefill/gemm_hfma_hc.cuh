@@ -350,11 +350,45 @@ __global__ void __launch_bounds__(256) cvt_slot_kernel(const uint4* __restrict__
         out[i] = make_uint4(o[0], o[1], o[2], o[3]);
     }
 }
+// The same where the BF16 image of the down side was not written (xn16 = bf16(R * rs * wn), the writers' expression in their order): the slice's elements
+// are rebuilt from the FP32 residual R (slice start), the row scales rs and the norm weights wn, then scaled and converted as above.  Element e of the
+// slice: row t = e / 10240, stream c = (e % 10240) / 2560, so rs[e / 2560] and wn[e % 10240].
+__device__ __forceinline__ unsigned bf16_rn_bits(float f) {
+    unsigned u = __float_as_uint(f);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return u >> 16;
+}
+__global__ void __launch_bounds__(256) cvt_slot_r_kernel(const float* __restrict__ R, const float* __restrict__ rs, const float* __restrict__ wn,
+                                                         uint4* __restrict__ out, const unsigned n8, const float wmax, const unsigned* __restrict__ slot) {
+    const unsigned cur = *(volatile const unsigned*) slot;
+    const int k = shift_k(cur, wmax);
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        *(volatile unsigned*) &g_hc.cur = cur;
+        atomicAdd(&g_hc.slices, 1u);
+        atomicMax(&g_hc.xmax_all, cur);
+        atomicAdd(&g_hc.khist[k], 1u);
+        if (cur >= 0x7F800000u) atomicAdd(&g_hc.bad_x, 1u);
+    }
+    if (k == 0) return;
+    const float sc = pow2i(-k);
+    const unsigned step = gridDim.x * 256u;
+    for (unsigned i = blockIdx.x * 256u + threadIdx.x; i < n8; i += step) {
+        unsigned o[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const unsigned e = i * 8u + 2u * j;
+            const unsigned hlo = bf16_rn_bits(R[e] * rs[e / 2560u] * wn[e % 10240u]), hhi = bf16_rn_bits(R[e + 1] * rs[(e + 1) / 2560u] * wn[(e + 1) % 10240u]);
+            const float lo = __uint_as_float(hlo << 16) * sc, hi = __uint_as_float(hhi << 16) * sc;
+            o[j] = (unsigned) __half_as_ushort(__float2half_rn(lo)) | ((unsigned) __half_as_ushort(__float2half_rn(hi)) << 16);
+        }
+        out[i] = make_uint4(o[0], o[1], o[2], o[3]);
+    }
+}
 // STRATA_PF_HC_NOCVT_CHECK=1: the old route's image (xcvt_kernel + cvt_fix_kernel, into the scratch `ref`) and max (saved in g_nc_ref_cur by
 // nc_save_kernel right after) against the new route's (`img`, g_hc.cur): the counts of slices, of slices with a different max, of different 16-bit
 // words and of slices with a shift (every one of them compared)
 __device__ unsigned g_nc_ref_cur;
-__device__ unsigned g_nc_chk[4];   // slices, max differs, words differ, shifted slices
+__device__ unsigned g_nc_chk[5];   // slices, max differs, words differ, shifted slices, rebuilt BF16 words that differ
 __global__ void nc_save_kernel() { g_nc_ref_cur = *(volatile unsigned*) &g_hc.cur; }
 __global__ void __launch_bounds__(256) nc_cmp_kernel(const uint4* __restrict__ ref, const uint4* __restrict__ img, const unsigned n8, const float wmax) {
     if (blockIdx.x == 0 && threadIdx.x == 0) {
@@ -369,6 +403,15 @@ __global__ void __launch_bounds__(256) nc_cmp_kernel(const uint4* __restrict__ r
         bad += (a.x != b.x) + (a.y != b.y) + (a.z != b.z) + (a.w != b.w);
     }
     if (bad != 0) atomicAdd(&g_nc_chk[2], bad);
+}
+
+// the BF16 image the writers kept (CHECK keeps it) against bf16(R * rs * wn) for the slice's n elements (R, rs at the slice start)
+__global__ void __launch_bounds__(256) nc_bf_cmp_kernel(const float* __restrict__ R, const float* __restrict__ rs, const float* __restrict__ wn,
+                                                        const uint16_t* __restrict__ xn16, const unsigned n) {
+    unsigned bad = 0;
+    for (unsigned i = blockIdx.x * 256u + threadIdx.x; i < n; i += gridDim.x * 256u)
+        bad += (unsigned) xn16[i] != bf16_rn_bits(R[i] * rs[i / 2560u] * wn[i % 10240u]);
+    if (bad != 0) atomicAdd(&g_nc_chk[4], bad);
 }
 
 // The inject product (N 4, K 10240: the 4 columns of one hyper-connection read) on FP16 HFMA2 pairs: Y[t][n] = 2^k * sum_j x16[t][j] w16[n][j],
