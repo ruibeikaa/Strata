@@ -7385,6 +7385,29 @@ bool Prefill::drain_pipeline(std::string& err) {
     return ok;
 }
 
+bool Prefill::run_nodrain(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
+    // STRATA_PF_ROOT_JOIN: the first stage's body alone (the chunk is forced, so no layer-major walk): its last chunks are
+    // still on the later stages when this returns, and the next run of the read follows at once
+    return run_impl(tokens, n, pos0, err);
+}
+
+bool Prefill::drain(std::string& err) { return drain_pipeline(err); }
+
+bool Prefill::join_ok(std::string& why) const {
+    // (the layer-major walk never takes a read whose chunks are forced - force_chunk, a --prefill-pipe plan: "a --prefill-pipe
+    // plan sets the chunks of this read" - and the engine forces both parts of a joined read; run_nodrain does not look at it)
+#if defined(STRATA_GPU_METAL)
+    why = "a Metal build";
+    return false;
+#else
+    if (!impl_ || hand_in_ != nullptr || next_ == nullptr) {
+        why = "not the first stage of a layer split";
+        return false;
+    }
+    return true;
+#endif
+}
+
 bool Prefill::reserve_uploads(int64_t T) {
     bool ok = true;
     if (impl_ != nullptr && T > 0) {

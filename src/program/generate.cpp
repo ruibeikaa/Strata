@@ -11456,6 +11456,9 @@ int main(int argc, char** argv) {
         };
         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
         bool pp_tail_saved = false;
+        // STRATA_PF_ROOT_JOIN: the position of the root checkpoint taken from the stages' parts while the read goes on (a layer
+        // split reads the root's part and the part after it in one pipelined run); -1 when the root is cut the usual way
+        int64_t root_ckpt_at = -1;
         // #471: the position the prompt pass has read up to (a chunk's or a window's end): what a request cancelled
         // mid-read reports as read, instead of the whole prompt
         int64_t pp_reached = 0;
@@ -11769,13 +11772,14 @@ int main(int argc, char** argv) {
             // layer-major prefill: a sub-chunk before its super-chunk's end has the super-chunk's state - the
             // checkpoint is taken at that end instead
             const bool periodic_checkpoint = o.prompt_cache_every > 0 && done >= pp_next_check && !sp.layer_major_mid();
+            const bool root_checkpoint = root_ckpt_at >= 0 && done == root_ckpt_at && o.prompt_cache > 0;   // STRATA_PF_ROOT_JOIN
             // Keep the prefill's existing chunk geometry. One extra near-tail checkpoint
             // can serve a branch whose shared prefix ends before the final cached state.
             const bool tail_checkpoint = o.prompt_cache_tail && o.prompt_cache > 0 && o.prompt_cache_every > 0 &&
                 !multi_gpu && !pp_tail_saved && pp_total - done > std::max<int64_t>(1, o.short_read) &&
                 pp_total - done <= T &&   // this chunk's real size (--prefill auto chunks differ from o.prefill_chunk)
                 !sp.layer_major_mid();
-            if (periodic_checkpoint || tail_checkpoint) {
+            if (periodic_checkpoint || tail_checkpoint || root_checkpoint) {
                 bool saved = false;
                 if (multi_gpu) {   // the stages' parts, saved when each of them read this chunk
                     std::vector<ConvCheckpoint> parts;
@@ -11812,8 +11816,10 @@ int main(int argc, char** argv) {
                 strata::prefill::Prefill& stage_sp = i == 0 ? sp : stages[i - 1]->sp;
                 strata::core::SessionState& stage_ss = i == 0 ? ss : stages[i - 1]->ss;
                 stage_sp.on_stage_chunk = [&, i](int64_t done, std::string& e) -> bool {
-                    if (o.prompt_cache <= 0 || o.prompt_cache_every <= 0 || done < part_next[i]) return true;
-                    part_next[i] = done + o.prompt_cache_every;
+                    const bool root_part = root_ckpt_at >= 0 && done == root_ckpt_at;   // STRATA_PF_ROOT_JOIN
+                    const bool periodic_part = o.prompt_cache_every > 0 && done >= part_next[i];
+                    if (o.prompt_cache <= 0 || (!periodic_part && !root_part)) return true;
+                    if (periodic_part) part_next[i] = done + o.prompt_cache_every;
                     ConvCheckpoint part;   // this stage's state at `done` (its stream is synchronized)
                     part.ids.assign(cur.begin(), cur.begin() + done);
                     if (!checkpoint_save(part, stage_ss, g)) {
@@ -16799,6 +16805,45 @@ int main(int argc, char** argv) {
                 if (pr_on) { pr_prev_end = Clock::now(); pr_have_prev = true; }   // for the next read's lead-in
                 return true;
             };
+            // STRATA_PF_ROOT_JOIN=1 (opt-in, default off): a cold read of a layer split that is cut at the system prompt's end (the
+            // root checkpoint) and at the turn boundary read the two parts as two runs, each planned on its own length and each
+            // ending with the whole chain drained: the root's part in small chunks (7145 tokens: 512-token chunks) with its own
+            // fill and drain (~1.4 s of a 141K read).  Here the root's part is read in the chunks of the part after it, in the
+            // same pipelined chain (the second run follows the first at once: Prefill::run_nodrain), and the root checkpoint
+            // is taken from the stages' parts when each reaches it, as the periodic ones are.  Only the chunk grouping inside
+            // the root's tokens changes (bits, once); the checkpoints keep their positions and the part after the root keeps its
+            // plan (so a cached re-read goes on in the same chunks).  Counted: a read that cannot go this way takes the cuts as before.
+            auto read_joined = [&](int64_t a0, int64_t mid, int64_t b0, const ConvCheckpoint::PromptPlan& plan,
+                                   std::string& e) -> bool {
+                seg_plan = plan;   // the periodic checkpoints inside [mid, b0) keep it; the root, at plan.from, takes none
+                if (b0 - mid > req_chunk_len) {
+                    req_chunk_len = b0 - mid;
+                    req_chunk = std::min(plan.chunk, b0 - mid);
+                }
+                struct JoinScope {
+                    ConvCheckpoint::PromptPlan& p;
+                    int64_t& r;
+                    ~JoinScope() { p = {}; r = -1; }
+                } join_scope{seg_plan, root_ckpt_at};
+                root_ckpt_at = mid;
+                sp.force_chunk(plan.chunk, false, plan.chunked);
+                bool ok = sp.run_nodrain(ids.data() + a0, mid - a0, a0, e);
+                if (ok) {
+                    sp.force_chunk(plan.chunk, plan.single, plan.chunked);
+                    ok = sp.run(ids.data() + mid, b0 - mid, mid, e);
+                } else {
+                    std::string de;
+                    (void) sp.drain(de);   // the chunks in flight on the later stages end before the error is reported
+                }
+                if (use_mtp) {   // STRATA_MTP_PF_BATCH: the draft layer's queued prompt K/V has run (a no-op when none was queued)
+                    std::string je;
+                    if (!mtp.prefill_join(je) && ok) {
+                        e = je;
+                        return false;
+                    }
+                }
+                return ok;
+            };
             apply_pending(true);
             const auto drain_t0 = Clock::now();
             const bool drained_ok = adapt_tick(true);
@@ -16926,6 +16971,40 @@ int main(int argc, char** argv) {
                 std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
             }
             int64_t at = read_from;
+            // STRATA_PF_ROOT_JOIN (see read_joined): the cut after the root that its part is read together with, and the plan
+            // of that part, or -1 and the reason this read keeps its cuts apart (counted, one line each)
+            static const bool root_join_env = [] {
+                const char* v = std::getenv("STRATA_PF_ROOT_JOIN");
+                return v != nullptr && std::atoi(v) != 0;
+            }();
+            static int64_t root_join_n = 0, root_join_fb = 0;
+            int64_t join_to = -1;
+            ConvCheckpoint::PromptPlan join_plan;
+            if (root_join_env && root_at > 0) {
+                int64_t nxt = -1;
+                for (const int64_t c : cuts)
+                    if (c > root_at) { nxt = c; break; }
+                std::string jw;
+                const char* why = nullptr;
+                if (read_from != 0 || resumed_from0 || reread_to > 0) why = "the read does not start at token 0 on a fresh session";
+                else if (message_at >= 0 || pin_at >= 0) why = "a message or pin cut";
+                else if (stages.empty() || o.batch != 0) why = "no layer split, or batch slots";
+                else if (!req_imgs.empty()) why = "picture rows";
+                else if (nxt <= root_at || windows_ok(root_at, nxt)) why = "the part after the root is a short read";
+                else if (resume_plan.chunk > 0) why = "a read going on from a checkpoint's plan";
+                else if (pp_next_check <= root_at) why = "a periodic checkpoint falls inside the root's part";
+                else if (use_mtp && mtp.cell_floor_enabled()) why = "KVA";
+                else if (std::getenv("STRATA_PIPED_CONCURRENT") != nullptr || std::getenv("STRATA_PIPED_READ_PIECE") != nullptr)
+                    why = "a read in pieces beside decoding slots";
+                else if (!sp.join_ok(jw)) why = jw.c_str();
+                else if (!(strata::prefill::Prefill::pipe_setting() > 0.0)) why = "no --prefill-pipe plan";
+                if (why == nullptr) join_to = nxt;   // (the plan of the part after the root is made after the loan, as read_part does)
+                if (why != nullptr) {
+                    ++root_join_fb;
+                    std::fprintf(stderr, "strata prefill: STRATA_PF_ROOT_JOIN: not for this read (%s): the root is cut as before "
+                                         "(%lld joined, %lld not)\n", why, (long long) root_join_n, (long long) root_join_fb);
+                }
+            }
             // STRATA_ADMIT_MERGE_FIRST: the last part, when it goes through the windows, leaves its last tokens (up to
             // max_t with the last prompt token) to the first window, which starts at merge_at (-1: the first window
             // holds the last prompt token alone).  Only where every window row is the same in any window: a batch
@@ -16948,8 +17027,11 @@ int main(int argc, char** argv) {
                 if (mt < 2) return -1;
                 return std::max(a0, n - mt);
             };
-            for (const int64_t to : cuts) {
-                if (to <= at) continue;
+            for (const int64_t to_cut : cuts) {
+                if (to_cut <= at) continue;
+                // STRATA_PF_ROOT_JOIN: the root's cut and the one after it are one read (read_joined), up to that cut
+                bool joined = join_to >= 0 && to_cut == root_at && at == read_from;
+                const int64_t to = joined ? join_to : to_cut;
                 err.clear();
                 const bool win = windows_ok(at, to);
                 if (win && !refill(err)) {
@@ -16964,12 +17046,44 @@ int main(int argc, char** argv) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
                     return 1;
                 }
+                if (joined) {   // the plan of the part after the root, on its own length and the buffers the loan left (as read_part)
+                    const int64_t c = sp.plan_chunk(to - root_at);
+                    if (c > 0) {
+                        join_plan = ConvCheckpoint::PromptPlan{};
+                        join_plan.chunk = c;
+                        join_plan.from = root_at;
+                        join_plan.to = to;
+                        join_plan.lend = seg_lend;
+                        join_plan.pipe = strata::prefill::Prefill::pipe_setting();
+                        join_plan.single = to - root_at <= c;
+                        join_plan.chunked = c < std::min(to - root_at, sp.chunk());
+                        if (join_plan.chunked) strata::prefill::Prefill::log_plan(to - root_at, c, sp.stage_count());
+                    } else {
+                        joined = false;   // not expected (the pipe is on): the span is read as one segment
+                        ++root_join_fb;
+                        std::fprintf(stderr, "strata prefill: STRATA_PF_ROOT_JOIN: no chunk plan after the loan: the span is read as one "
+                                             "part, without the root checkpoint\n");
+                    }
+                }
                 if (win) merge_at = merge_from(at, to);   // (after the refill: the loans are back)
                 const int64_t read_to = merge_at >= 0 ? merge_at : to;   // (merge_at > at: the part's windows before it)
                 const auto tsp = Clock::now();
                 pp_exact = false;   // a batched or pipelined part is in flight: a cancel may leave the state past pp_reached
-                const bool sp_ok = read_to <= at || (win ? read_windows(at, read_to, err) : read_part(at, to, err));
+                const bool sp_ok = read_to <= at || (win ? read_windows(at, read_to, err)
+                                                         : joined ? read_joined(at, root_at, to, join_plan, err)
+                                                                  : read_part(at, to, err));
                 if (sp_ok) pp_exact = true;
+                if (joined && sp_ok) {
+                    ++root_join_n;
+                    bool have_root = false;
+                    for (const ConvCheckpoint& c : checks) have_root = have_root || (int64_t) c.ids.size() == root_at;
+                    std::fprintf(stderr, "strata prefill: STRATA_PF_ROOT_JOIN: the root (%lld tokens) and the %lld tokens after it were "
+                                         "read in one pipelined run, %lld-token chunks, in %.0f ms; root checkpoint %s (%lld joined, "
+                                         "%lld not)\n", (long long) root_at, (long long) (to - root_at), (long long) join_plan.chunk,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - tsp).count(),
+                                 have_root ? "taken from the stages' parts" : "NOT taken (a part was incomplete)",
+                                 (long long) root_join_n, (long long) root_join_fb);
+                }
                 if (trace) {
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - tsp).count();
                     (win ? req_times.windows_ms : req_times.read_ms) += ms;

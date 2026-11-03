@@ -178,6 +178,17 @@ public:
     /// first, -1 for none) and is advanced to the last two of these.
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
 
+    /// STRATA_PF_ROOT_JOIN: `run` without the drain at its end, for the FIRST stage of a layer split.  The later stages go on
+    /// with its last chunks after it returns; the caller starts the next run of the read (the next segment, same chunk
+    /// grid) at once and ends the read with `run` (which drains the whole chain) or, after a failure, `drain`.  The rows
+    /// are read exactly as `run` reads them (the chunk of a force_chunk plan); only the idle chain between two runs goes.
+    bool run_nodrain(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
+    /// Waits for every stage's chunks in flight (what `run` ends with); the error of a failed chunk, if any, in `err`.
+    bool drain(std::string& err);
+    /// Whether `run_nodrain` applies to this stage: false with the reason in `why` when it is not the first stage of a
+    /// layer split.  (A read whose chunk is forced, as the engine's plan does, is never taken by the layer-major walk.)
+    bool join_ok(std::string& why) const;
+
     const PrefillStats& stats() const { return stats_; }
 
     /// multi-GPU: the experts the peer GPU holds are computed THERE for every prompt chunk (up to `cap_rows` routed
