@@ -322,6 +322,14 @@ private:
     /// STRATA_PF_HFMA_SMALL: the previous stage (the other die of the same board) already copied the chunk's rows into this stage's R over
     /// NVLink: the upload from hand_in_ is skipped (hand_in_ stays set - it marks a later stage)
     bool hand_direct_ = false;
+    /// STRATA_PF_HAND_EARLY: the previous stage (across boards, through the host) already uploaded the chunk's rows into this
+    /// stage's second R buffer `hand_early_` (0 or 1; -1: none) on a copy stream, while this stage read the chunk before:
+    /// the chunk then starts with a device copy into R instead of the 94 MB upload on the compute stream
+    int hand_early_ = -1;
+    /// STRATA_PF_HAND_EARLY, called on the RECEIVING stage by the stage before: uploads `floats` floats of the pinned
+    /// hand-off buffer `host` into this stage's R buffer `b` on its copy stream (making the buffers at the first call);
+    /// false when that could not be done (the caller leaves the chunk to the upload on the compute stream)
+    bool hand_early_upload(const float* host, std::size_t floats, std::size_t cap_floats, int b);
 
     std::string next_err_;
     std::future<bool> next_run_;

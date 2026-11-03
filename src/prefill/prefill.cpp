@@ -498,6 +498,17 @@ static bool hand_peer_ok(int a, int b) {
                  ok ? "directly over NVLink" : (std::string("through the host (") + why + ")").c_str());
     return ok;
 }
+// STRATA_PF_HAND_EARLY=1 (default off): a layer-split hand-off through the host (between two boards: no NVLink) uploads the
+// chunk's rows into the next stage's SECOND R buffer on a copy stream of that stage's device as soon as the download has
+// landed - while the next stage still reads the chunk before - and the next stage starts the chunk with a device copy into R
+// (~0.5 ms for the 94 MB) in place of the upload on its compute stream (29 ms a chunk, the stage's whole critical path when
+// it is the slowest).  The same bytes land in the same R before the chunk's first kernel: bit-identical.  Counted: a hand-off
+// that could not go this way (no room for the buffers, a failed call) takes the upload on the compute stream.
+static bool pf_hand_early() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_PF_HAND_EARLY"); return e != nullptr && std::atoi(e) != 0; }();
+    return v;
+}
+static std::atomic<int64_t> g_hand_early_used{0}, g_hand_early_fb{0};
 // STRATA_HANDOFF_PIPE: the next stage's chunks run on one thread of the stage's own, started once and pinned once
 // (std::async started a thread per chunk: ~1 ms from the hand-off to the next stage's first call, measured with nsys).
 // The futures are the same (run_impl's result, or what it threw), so the chain's waits do not change.
@@ -1217,6 +1228,15 @@ struct Prefill::Impl {
     cudaEvent_t hand_done[2] = {};
     cudaEvent_t hand_ev[2][kHandPiecesMax] = {};
     std::unique_ptr<HandWorker> hand_worker;   // STRATA_HANDOFF_PIPE: the next stage's chunks' thread (lazily)
+    // STRATA_PF_HAND_EARLY, this stage as the RECEIVER of a hand-off through the host: two device buffers the previous
+    // stage uploads a chunk's rows into (T x D floats) on a copy stream of this device while the stage reads the chunk
+    // before, an "uploaded" event per buffer (recorded on that stream) and a "consumed" event (recorded on cs after the
+    // device copy into R).  Made at the first hand-off; rin_failed: it did not work and is not tried again
+    float* rin[2] = {};
+    std::size_t rin_cap = 0;   // floats in each (a later relayout to a larger chunk does not fit them: that chunk takes the upload on cs)
+    cudaStream_t s_in = nullptr;
+    cudaEvent_t rin_ready[2] = {}, rin_free[2] = {};
+    bool rin_failed = false;
     // C-4: the chunk's token ids on the device, for one batched embedding gather
     int32_t* tok_dev = nullptr;
     std::vector<int32_t> tok_host;
@@ -1335,6 +1355,13 @@ void Prefill::release() {
         if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) cudaFreeHost(impl_->ple_emb_host[b]);
         if (b == 0 && impl_->ple_raw_dev) { (void) cudaFree(impl_->ple_raw_dev); impl_->ple_raw_dev = nullptr; }
     }
+    if (impl_->s_in) (void) cudaStreamSynchronize(impl_->s_in);   // STRATA_PF_HAND_EARLY
+    for (int b = 0; b < 2; ++b) {
+        if (impl_->rin_ready[b]) (void) cudaEventDestroy(impl_->rin_ready[b]);
+        if (impl_->rin_free[b]) (void) cudaEventDestroy(impl_->rin_free[b]);
+        if (impl_->rin[b]) { (void) cudaFree(impl_->rin[b]); impl_->rin[b] = nullptr; }
+    }
+    if (impl_->s_in) (void) cudaStreamDestroy(impl_->s_in);
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
     if (impl_->kv_copy) cudaStreamDestroy(impl_->kv_copy);
     if (impl_->ple_copy) (void) cudaStreamDestroy(impl_->ple_copy);
@@ -3340,7 +3367,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 return false;
             }
         } else if (hand_in_ != nullptr) {
-            if (cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice, m.cs) !=
+            // STRATA_PF_HAND_EARLY: the stage before already uploaded this chunk into rin[b] on a copy stream; wait for it on
+            // the GPU and copy it into R (the same bytes, in place before layer 0's first kernel)
+            bool early_ok = false;
+            if (hand_early_ >= 0) {
+                const int b = std::exchange(hand_early_, -1);
+                if (c0 == 0 && T == n && m.rin[b] != nullptr) {
+                    early_ok = cudaStreamWaitEvent(m.cs, m.rin_ready[b], 0) == cudaSuccess &&
+                               cudaMemcpyAsync(m.R, m.rin[b], (size_t) T * D * 4, cudaMemcpyDeviceToDevice, m.cs) == cudaSuccess &&
+                               cudaEventRecord(m.rin_free[b], m.cs) == cudaSuccess;
+                    if (!early_ok) (void) cudaGetLastError();
+                }
+                (early_ok ? g_hand_early_used : g_hand_early_fb).fetch_add(1);
+            }
+            if (!early_ok &&
+                cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice, m.cs) !=
                 cudaSuccess) {
                 err = "prefill: the layer split's hand-off upload failed";
                 return false;
@@ -5956,6 +5997,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
+            // STRATA_PF_HAND_EARLY: the rows are in `h` (downloaded, the stream synchronized): upload them into the next
+            // stage's second R buffer NOW, on a copy stream of its device, so the upload overlaps the chunk that stage is
+            // still reading (it is started below only once that chunk is done) and its chunk starts with a device copy
+            next_->hand_early_ = -1;
+            if (!landed && hp == 0 && pf_hand_early() && !helped && next_->impl_ && T <= next_->impl_->T) {
+                if (next_->hand_early_upload(h, (size_t) T * D, (size_t) next_->impl_->T * D, hand_buf_)) next_->hand_early_ = hand_buf_;
+                else g_hand_early_fb.fetch_add(1);
+            }
             // Wait only for the DIRECT successor's previous chunk. That successor
             // may already have forwarded its older chunk to later GPUs.
             if (!direct) {   // (the direct hand-off did both before its copy)
@@ -7408,6 +7457,40 @@ bool Prefill::join_ok(std::string& why) const {
 #endif
 }
 
+bool Prefill::hand_early_upload(const float* host, std::size_t floats, std::size_t cap_floats, int b) {
+    Impl& nm = *impl_;
+    if (nm.rin_failed || b < 0 || b > 1 || floats > cap_floats || (nm.rin[0] != nullptr && floats > nm.rin_cap)) return false;
+    const core::OnDevice on(nm.device);   // this stage's device, for the call (the sender's thread runs on its own)
+    if (nm.rin[0] == nullptr) {
+        bool ok = nm.s_in != nullptr || cudaStreamCreateWithFlags(&nm.s_in, cudaStreamNonBlocking) == cudaSuccess;
+        for (int i = 0; ok && i < 2; ++i) {
+            ok = (nm.rin_ready[i] != nullptr || cudaEventCreateWithFlags(&nm.rin_ready[i], cudaEventDisableTiming) == cudaSuccess) &&
+                 (nm.rin_free[i] != nullptr || cudaEventCreateWithFlags(&nm.rin_free[i], cudaEventDisableTiming) == cudaSuccess) &&
+                 cudaMalloc((void**) &nm.rin[i], cap_floats * sizeof(float)) == cudaSuccess;
+        }
+        if (!ok) {
+            (void) cudaGetLastError();
+            for (float*& p : nm.rin)
+                if (p) { (void) cudaFree(p); p = nullptr; }
+            nm.rin_failed = true;
+            nm.rin_cap = 0;
+            std::fprintf(stderr, "strata prefill: STRATA_PF_HAND_EARLY: CUDA%d has no room for two %.0f MB receive buffers: the hand-offs "
+                                 "to it go up on the compute stream\n", nm.device, (double) cap_floats * sizeof(float) / 1048576.0);
+            return false;
+        }
+        nm.rin_cap = cap_floats;
+    }
+    // (the buffer's last reader, an earlier chunk's device copy into R, has finished: the stage before waited for that
+    // chunk's run before it came here; an event never recorded counts as reached)
+    if (cudaStreamWaitEvent(nm.s_in, nm.rin_free[b], 0) != cudaSuccess ||
+        cudaMemcpyAsync(nm.rin[b], host, floats * sizeof(float), cudaMemcpyHostToDevice, nm.s_in) != cudaSuccess ||
+        cudaEventRecord(nm.rin_ready[b], nm.s_in) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
 bool Prefill::reserve_uploads(int64_t T) {
     bool ok = true;
     if (impl_ != nullptr && T > 0) {
@@ -7482,6 +7565,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     if (!drain_ok) {
         err = drain_err;
         return false;
+    }
+    if (hand_in_ == nullptr && pf_hand_early()) {   // STRATA_PF_HAND_EARLY: what the hand-offs through the host did (counted, not assumed)
+        static int64_t said_u = -1, said_f = -1;
+        const int64_t u = g_hand_early_used.load(), f = g_hand_early_fb.load();
+        if (u != said_u || f != said_f) {
+            said_u = u;
+            said_f = f;
+            std::fprintf(stderr, "strata prefill: STRATA_PF_HAND_EARLY: %lld hand-off chunks went up ahead into the next stage's second R "
+                                 "buffer, %lld fell back to the upload on its compute stream (totals)\n", (long long) u, (long long) f);
+        }
     }
     // STRATA_MMQ_DIRECT=1 with STRATA_MMQ_DIRECT_LOG=1 (a check, not a default): each stage's totals so far - how many
     // resident experts its prompt MMQ read in their slots, of all its resident and streamed ones
