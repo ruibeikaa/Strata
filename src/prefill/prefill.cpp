@@ -559,6 +559,53 @@ struct HandWorker {
     }
 };
 
+// STRATA_PF_HAND_AHEAD=1 (default off): the layer split's chain gets one chunk of buffer.  Without it a stage that has finished
+// chunk c waits until its successor has FINISHED chunk c-1 before it hands c on (and only then goes on to c+1): a blocking flow
+// shop, where every cycle is the longest of the four stages' times for that chunk and a short chunk (the root's 233-token
+// tail) stalls the first stage for the successor's whole chain.  Here the stage waits only until the successor has STARTED
+// chunk c-1 - taken its rows out of the second R buffer into R - then queues c on the successor's FIFO worker and goes on to
+// c+1.  Per stage the chunks still run in the same order on the same bytes: bit-identical.
+//   * the rows travel in the successor's SECOND R buffer rin[b] (b = the hand-off slot, alternating): over NVLink by a peer
+//     copy into it, through the host by the download into the pinned slot and the early upload (STRATA_PF_HAND_EARLY's); the
+//     chunk starts with a device copy rin[b] -> R, after which the job is "taken" and the slot may be refilled two chunks on;
+//   * the fields that describe one chunk (hand_in_, hand_early_, single_chunk_, pipe_chunked_ ...) travel with the job and are
+//     set when it starts, not when it is queued;
+//   * the pinned slot h[b] is free again when the upload out of it has landed (rin_ready[b], waited on the host before the
+//     next download into it), rin[b] when the device copy out of it has run (rin_free[b]);
+//   * a hand-off that cannot use the buffers (the buffers do not fit, STRATA_HANDOFF_PIPE's pieces, a chunk larger than the
+//     buffers) waits as before: the chain is settled first, then the old code hands the chunk on.  Counted.
+static bool pf_hand_ahead() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_PF_HAND_AHEAD"); return e != nullptr && std::atoi(e) != 0; }();
+    return v;
+}
+struct HandAhead {   // the SENDING stage's side of its edge (stage -> next stage)
+    std::mutex mu;
+    std::condition_variable cv;
+    int64_t seq = 0;       // jobs queued on this edge so far
+    int64_t taken = 0;     // jobs whose rows the next stage has taken (or that ended): the first `taken` of them
+    bool failed = false;   // a job of this edge failed: the stages behind it stop
+    std::string msg;
+    std::future<bool> old_run;                       // the job before Prefill::next_run_, not yet reaped
+    std::shared_ptr<std::string> old_err, cur_err;   // their error texts (cur_err null: the old launch's next_err_)
+    bool legacy = false;                             // next_run_ is a job the old launch made (counted as taken when it ends)
+    int64_t n_ahead = 0, n_fb = 0, n_na = 0;         // handed ahead / took the old wait / not applicable (a one-chunk read)
+    double wait_ms = 0;                              // the sending stage's wait for the successor to take the chunk before
+    int64_t p_ahead = 0, p_fb = 0, p_na = 0;         // as last printed
+    double p_wait = 0;
+};
+struct HandAheadIn {   // the RECEIVING stage's side: which edge and job the chunk it runs belongs to
+    Prefill* from = nullptr;
+    int64_t seq = -1;
+    bool nohost = false;   // the rows came over NVLink into the second R buffer: the pinned slot holds nothing
+};
+static void ha_mark(HandAhead& ha, int64_t taken_upto) {
+    {
+        std::lock_guard<std::mutex> lk(ha.mu);
+        if (taken_upto > ha.taken) ha.taken = taken_upto;
+    }
+    ha.cv.notify_all();
+}
+
 // S23 (opt-in STRATA_HC_UPMIX=1): the hyper-connection read's up projection and gr_mix_r as one kernel (gr_upmix: gfx11,
 // and CUDA sm_80+ on chunks of 33+ tokens - there, with CUDA 13.3 on an RTX 5090, cuBLAS's up GEMM sums K in the fused
 // kernel's order and the read is the default pair's bits: gr_upmix_parity, STRATA_HC_UPMIX_CHECK);
@@ -1228,6 +1275,8 @@ struct Prefill::Impl {
     cudaEvent_t hand_done[2] = {};
     cudaEvent_t hand_ev[2][kHandPiecesMax] = {};
     std::unique_ptr<HandWorker> hand_worker;   // STRATA_HANDOFF_PIPE: the next stage's chunks' thread (lazily)
+    HandAhead ha;       // STRATA_PF_HAND_AHEAD: this stage as the sender of an edge
+    HandAheadIn ha_in;  // STRATA_PF_HAND_AHEAD: this stage as the receiver of the job it runs
     // STRATA_PF_HAND_EARLY, this stage as the RECEIVER of a hand-off through the host: two device buffers the previous
     // stage uploads a chunk's rows into (T x D floats) on a copy stream of this device while the stage reads the chunk
     // before, an "uploaded" event per buffer (recorded on that stream) and a "consumed" event (recorded on cs after the
@@ -3380,11 +3429,29 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 }
                 (early_ok ? g_hand_early_used : g_hand_early_fb).fetch_add(1);
             }
+            // STRATA_PF_HAND_AHEAD: a chunk that came over NVLink exists only in the second R buffer (the pinned slot holds nothing)
+            if (!early_ok && m.ha_in.from != nullptr && m.ha_in.nohost) {
+                err = "prefill: the layer split's NVLink hand-off: the rows in the second R buffer could not be taken";
+                return false;
+            }
             if (!early_ok &&
                 cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice, m.cs) !=
                 cudaSuccess) {
                 err = "prefill: the layer split's hand-off upload failed";
                 return false;
+            }
+            if (m.ha_in.from != nullptr) {
+                // STRATA_PF_HAND_AHEAD: this chunk's rows are out of the second R buffer (the device copy and rin_free[b] are
+                // queued) - or, if they were not there, out of the pinned slot (the copy has run): the stage before may refill the
+                // slot for the chunk two on, and queue the next one
+                if (!early_ok && cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                    err = std::string("prefill: the layer split's hand-off upload failed: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                HandAhead& sender_ha = m.ha_in.from->impl_->ha;
+                const int64_t upto = m.ha_in.seq + 1;
+                m.ha_in.from = nullptr;
+                ha_mark(sender_ha, upto);
             }
         }
         // C-4: the whole chunk's rows in one gather (the same per-element arithmetic as the per-token path, so the
@@ -5955,6 +6022,151 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             // successor has finished the chunk before, its R is free and the copy is ~1.3 ms for 94 MB instead of 2 x 28 ms through the host
             const bool direct = pf_hfma_small() && hp == 0 && !helped && next_->impl_ && next_->impl_->R != nullptr &&
                                 T <= next_->impl_->T && hand_peer_ok(m.device, next_->impl_->device);
+            // STRATA_PF_HAND_AHEAD (see HandAhead): hand the chunk on without waiting for the next stage to FINISH the chunk before
+            // - only until it has TAKEN that chunk's rows.  Whatever it cannot do settles the chain and takes the old code below.
+            if (pf_hand_ahead()) {
+                HandAhead& ha = m.ha;
+                auto settle = [&]() -> bool {   // every job of this edge has ended (what the old wait for the last one meant), errors reaped
+                    bool ok = true;
+                    if (ha.old_run.valid() && !ha.old_run.get()) {
+                        err = ha.old_err && !ha.old_err->empty() ? *ha.old_err : std::string("prefill: a layer split's hand-off chunk failed");
+                        ok = false;
+                    }
+                    if (next_run_.valid() && !next_run_.get()) {
+                        if (ok) err = ha.cur_err && !ha.cur_err->empty() ? *ha.cur_err : next_err_;
+                        ok = false;
+                    }
+                    ha.old_err.reset();
+                    ha.cur_err.reset();
+                    ha.legacy = false;
+                    std::lock_guard<std::mutex> lk(ha.mu);
+                    ha.taken = ha.seq;
+                    ha.failed = false;
+                    ha.msg.clear();
+                    return ok;
+                };
+                static std::atomic<uint32_t> said_why{0};
+                auto say = [&](int bit, const char* msg) {
+                    if ((said_why.fetch_or(1u << bit) & (1u << bit)) == 0)
+                        std::fprintf(stderr, "strata prefill: STRATA_PF_HAND_AHEAD: %s: such a hand-off waits for the next stage to finish "
+                                             "the chunk before, as before (counted, said once)\n", msg);
+                };
+                const char* why = nullptr;
+                int why_bit = -1;
+                bool na = false;   // not a case for the buffer: a one-chunk read (nothing to overlap)
+                if (helped || single_chunk || !next_->impl_) na = true;
+                else if (hp != 0) { why_bit = 0; why = "STRATA_HANDOFF_PIPE hands the chunk on in pieces"; }
+                else if (T > next_->impl_->T) { why_bit = 1; why = "the chunk is larger than the next stage's chunk"; }
+                else if (!next_->hand_early_upload(nullptr, 0, (size_t) next_->impl_->T * D, hand_buf_)) {
+                    why_bit = 2; why = "the next stage has no room for its second R buffers";
+                } else if ((size_t) T * D > next_->impl_->rin_cap) {
+                    why_bit = 3; why = "the chunk does not fit the next stage's second R buffers";
+                }
+                bool handed = false;
+                if (!na && why == nullptr) {
+                    if (ha.legacy && !settle()) return false;
+                    Impl& nm = *next_->impl_;
+                    const int b = hand_buf_;
+                    const int64_t j = ha.seq;   // this chunk's job number on the edge
+                    // wait until `need` jobs of the edge have been taken (false: one of them failed)
+                    auto wait_taken = [&](int64_t need) -> bool {
+                        std::unique_lock<std::mutex> lk(ha.mu);
+                        if (ha.taken < need && !ha.failed) {
+                            const auto tw = Clock::now();
+                            ha.cv.wait(lk, [&] { return ha.taken >= need || ha.failed; });
+                            ha.wait_ms += std::chrono::duration<double, std::milli>(Clock::now() - tw).count();
+                        }
+                        if (ha.failed) { err = ha.msg; return false; }
+                        return true;
+                    };
+                    // slot b (the pinned slot and the second R buffer) was last used by job j-2: its rows must be out of both
+                    if (!wait_taken(j - 1)) return false;
+                    bool landed_a = false;
+                    if (direct) {   // the two dies of a board: straight over NVLink into the second R buffer (the chunk is done: sync first)
+                        if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                            err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
+                            return false;
+                        }
+                        { const core::OnDevice on(nm.device); (void) cudaEventSynchronize(nm.rin_free[b]); }   // job j-2's device copy out of it has run
+                        landed_a = cudaMemcpyPeerAsync(nm.rin[b], nm.device, m.R, m.device, (size_t) T * D * 4, m.cs) == cudaSuccess &&
+                                   cudaStreamSynchronize(m.cs) == cudaSuccess;
+                        if (!landed_a) {
+                            say(4, std::string(std::string("the NVLink copy into the second R buffer failed (") + cudaGetErrorString(cudaGetLastError()) + ")").c_str());
+                            (void) cudaGetLastError();
+                        }
+                    }
+                    if (!landed_a) {   // through the host: download into the pinned slot (its last upload has landed), early upload
+                        { const core::OnDevice on(nm.device); (void) cudaEventSynchronize(nm.rin_ready[b]); }
+                        if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
+                            cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                            err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
+                            return false;
+                        }
+                        if (!next_->hand_early_upload(h, (size_t) T * D, (size_t) nm.T * D, b)) {
+                            why_bit = 5; why = "the upload into the next stage's second R buffer failed";
+                        }
+                    }
+                    if (why == nullptr) {
+                        if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
+                        if (!wait_taken(j)) return false;   // the one chunk of buffer: job j-1 has taken its rows
+                        if (ha.old_run.valid() && !ha.old_run.get()) {   // job j-2 has ended (the worker runs them in order)
+                            err = ha.old_err && !ha.old_err->empty() ? *ha.old_err : std::string("prefill: a layer split's hand-off chunk failed");
+                            return false;
+                        }
+                        auto je = std::make_shared<std::string>();
+                        ha.old_run = std::move(next_run_);
+                        ha.old_err = std::move(ha.cur_err);
+                        ha.cur_err = je;
+                        if (!m.hand_worker) m.hand_worker = std::make_unique<HandWorker>();
+                        Prefill* const rx = next_;
+                        const bool nohost = landed_a;
+                        next_run_ = m.hand_worker->submit(std::packaged_task<bool()>(
+                            [this, rx, tokens, c0, T, p0, h, b, nohost, single_chunk, pipe_chunked, j, je] {
+                            HandAhead& hs = impl_->ha;
+                            struct TakenGuard {   // however the job ends, the stage before is not left waiting for it
+                                HandAhead& hs;
+                                int64_t upto;
+                                ~TakenGuard() { ha_mark(hs, upto); }
+                            } guard{hs, j + 1};
+                            {
+                                std::lock_guard<std::mutex> lk(hs.mu);
+                                if (hs.failed) { *je = "prefill: the layer split's hand-off: an earlier chunk of it failed"; return false; }
+                            }
+                            // the fields that describe THIS chunk, set as it starts (the previous job has ended: the worker is one thread)
+                            rx->hand_in_ = h;
+                            rx->hand_direct_ = false;
+                            rx->hand_ev_ = nullptr;
+                            rx->hand_pieces_ = 0;
+                            rx->single_chunk_ = single_chunk;
+                            rx->pipe_chunked_ = pipe_chunked;
+                            rx->hand_early_ = b;
+                            rx->impl_->ha_in = HandAheadIn{this, j, nohost};
+                            const bool r = rx->run_impl(tokens + c0, T, p0, *je);
+                            rx->impl_->ha_in.from = nullptr;
+                            (void) cudaGetLastError();   // clear what a thread's end cleared (std::async)
+                            if (!r) {
+                                {
+                                    std::lock_guard<std::mutex> lk(hs.mu);
+                                    hs.failed = true;
+                                    hs.msg = *je;
+                                }
+                                hs.cv.notify_all();
+                            }
+                            return r;
+                        }));
+                        ++ha.seq;
+                        ++ha.n_ahead;
+                        ha.legacy = false;
+                        handed = true;
+                    }
+                }
+                if (handed) {
+                    hand_buf_ ^= 1;
+                    continue;   // the last stage reports the chunk (on_chunk)
+                }
+                if (na) ++ha.n_na; else { ++ha.n_fb; say(why_bit, why); }
+                if (!settle()) return false;
+            }
             bool landed = false;
             if (direct) {
                 if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
@@ -6018,6 +6230,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             next_->hand_pieces_ = hp;
             next_->single_chunk_ = single_chunk;
             next_->pipe_chunked_ = pipe_chunked;
+            if (pf_hand_ahead()) {   // the old launch (the chain was settled above): the next hand-off settles it before it uses the buffers
+                m.ha.legacy = true;
+                m.ha.cur_err.reset();
+            }
             if (handoff_pipe_worker()) {
                 if (!m.hand_worker) m.hand_worker = std::make_unique<HandWorker>();
                 next_run_ = m.hand_worker->submit(std::packaged_task<bool()>([this, tokens, c0, T, p0] {
@@ -6462,7 +6678,7 @@ int64_t Prefill::lm_prepare_chain(int64_t n, std::string& why) {
     // with no hand-off in flight that is stale, not in use (a short prompt first would otherwise turn layer-major off
     // for every later prompt)
     for (Prefill* p = this; p->next_ != nullptr; p = p->next_)
-        if (p->next_run_.valid()) { why = "a layer split's chunk hand-off is in flight"; return 0; }
+        if (p->next_run_.valid() || (p->impl_ && p->impl_->ha.old_run.valid())) { why = "a layer split's chunk hand-off is in flight"; return 0; }
     for (Prefill* p = next_; p != nullptr; p = p->next_) {
         p->hand_in_ = nullptr;
         p->hand_ev_ = nullptr;
@@ -7416,7 +7632,26 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
 bool Prefill::drain_pipeline(std::string& err) {
     bool ok = true;
 
-    if (next_run_.valid()) {
+    if (impl_) {   // STRATA_PF_HAND_AHEAD: the job before the last one first (the worker runs them in order)
+        HandAhead& ha = impl_->ha;
+        if (ha.old_run.valid() && !ha.old_run.get()) {
+            err = ha.old_err && !ha.old_err->empty() ? *ha.old_err : std::string("prefill: a layer split's hand-off chunk failed");
+            ok = false;
+        }
+        if (next_run_.valid()) {
+            if (!next_run_.get()) {
+                if (ok) err = ha.cur_err && !ha.cur_err->empty() ? *ha.cur_err : next_err_;
+                ok = false;
+            }
+        }
+        ha.old_err.reset();
+        ha.cur_err.reset();
+        ha.legacy = false;
+        std::lock_guard<std::mutex> lk(ha.mu);   // everything of the edge has ended: nothing is in flight, nothing has failed any more
+        ha.taken = ha.seq;
+        ha.failed = false;
+        ha.msg.clear();
+    } else if (next_run_.valid()) {
         if (!next_run_.get()) {
             err = next_err_;
             ok = false;
@@ -7480,8 +7715,10 @@ bool Prefill::hand_early_upload(const float* host, std::size_t floats, std::size
         }
         nm.rin_cap = cap_floats;
     }
+    if (host == nullptr) return nm.rin[0] != nullptr && nm.rin[1] != nullptr;   // STRATA_PF_HAND_AHEAD: only the buffers (NVLink hand-offs fill them by a peer copy)
     // (the buffer's last reader, an earlier chunk's device copy into R, has finished: the stage before waited for that
-    // chunk's run before it came here; an event never recorded counts as reached)
+    // chunk's run before it came here - or, with STRATA_PF_HAND_AHEAD, until that chunk's job had taken its rows; an event
+    // never recorded counts as reached)
     if (cudaStreamWaitEvent(nm.s_in, nm.rin_free[b], 0) != cudaSuccess ||
         cudaMemcpyAsync(nm.rin[b], host, floats * sizeof(float), cudaMemcpyHostToDevice, nm.s_in) != cudaSuccess ||
         cudaEventRecord(nm.rin_ready[b], nm.s_in) != cudaSuccess) {
@@ -7575,6 +7812,29 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             std::fprintf(stderr, "strata prefill: STRATA_PF_HAND_EARLY: %lld hand-off chunks went up ahead into the next stage's second R "
                                  "buffer, %lld fell back to the upload on its compute stream (totals)\n", (long long) u, (long long) f);
         }
+    }
+    if (hand_in_ == nullptr && pf_hand_ahead() && impl_) {   // STRATA_PF_HAND_AHEAD: what this read's hand-offs did (counted, not assumed)
+        int64_t da = 0, df = 0, dn = 0;
+        std::string waits;
+        char wb[64];
+        int edge = 0;
+        for (Prefill* p = this; p != nullptr && p->next_ != nullptr && p->impl_; p = p->next_, ++edge) {
+            HandAhead& ha = p->impl_->ha;
+            da += ha.n_ahead - ha.p_ahead;
+            df += ha.n_fb - ha.p_fb;
+            dn += ha.n_na - ha.p_na;
+            std::snprintf(wb, sizeof wb, "%s%d->%d %.0f", edge ? ", " : "", edge, edge + 1, ha.wait_ms - ha.p_wait);
+            waits += wb;
+            ha.p_ahead = ha.n_ahead;
+            ha.p_fb = ha.n_fb;
+            ha.p_na = ha.n_na;
+            ha.p_wait = ha.wait_ms;
+        }
+        if (da != 0 || df != 0 || dn != 0)
+            std::fprintf(stderr, "strata prefill: STRATA_PF_HAND_AHEAD: this read %lld hand-off chunks went ahead (the stage waited only for "
+                                 "the chunk before to be taken), %lld took the old wait, %lld not applicable (one-chunk reads); time stages "
+                                 "waited for the chunk before to be taken (ms): %s\n", (long long) da, (long long) df, (long long) dn,
+                         waits.c_str());
     }
     // STRATA_MMQ_DIRECT=1 with STRATA_MMQ_DIRECT_LOG=1 (a check, not a default): each stage's totals so far - how many
     // resident experts its prompt MMQ read in their slots, of all its resident and streamed ones
