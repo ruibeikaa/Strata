@@ -96,6 +96,13 @@ public:
     bool router_f16(const uint16_t* Xh, const uint16_t* Wr, float* Y, int64_t T, int64_t N, int64_t K, bool x_lo);
     /// STRATA_PF_ROUTER_F16_CHECK=1: compares the routed ids/weights of this chunk (a, b = the FP32 router's) and adds to the device's counters (printed by gemm_hfma_report).
     void router_f16_cmp(const int32_t* ids, const int32_t* ids_ref, const float* w, const float* w_ref, int64_t T, void* stream);
+    /// STRATA_PF_PLE_F16=1, GP100: the PLE block's two projections (the first stage's layer 1) on the dense HFMA2 kernels.  ple_f16_image writes the FP16 image y[i] = fp16(x[i]) of n FP32 values (the
+    /// dequantized n-gram rows; counts the largest |x| and the values past the FP16 range or not finite, printed with the read's report); ple_f16 then computes Y [T, N] = Xh . W^T, Xh the image (row stride K),
+    /// W the BF16 key (prod 0, N 10240) or value (prod 1, N 2560) weight of the pack (its FP16 copy is made once; BF16 -> FP16 is exact in range), on the hand-scheduled kernel where it covers the call (the
+    /// key: N 10240 K 2560) and the compiler's HFMA2 kernel (the same bits) elsewhere.  Not bitwise the BF16-rounded activation and cublasSgemm route's.  False = nothing launched (counted by reason): the caller
+    /// runs bf16() on a BF16 image.
+    void ple_f16_image(const float* x, uint16_t* y, int64_t n);
+    bool ple_f16(const uint16_t* Xh, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int prod);
 
     /// HIP gfx103x (prompt_f16()): bf16() takes X as the FP16 image the prompt path's kernels write (set_act_f16),
     /// and bf16() / f16() / native() run the GEMM with FP16 out (rocBLAS's tuned kernels there), widened in place in

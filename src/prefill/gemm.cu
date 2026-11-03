@@ -1196,6 +1196,74 @@ void rf_report(int64_t tokens) {
     }
 }
 
+// ---- STRATA_PF_PLE_F16=1 (gemm.hpp: ple_f16_image, ple_f16): the PLE block's key and value projections on the dense HFMA2 kernels.  Per device since the last report: the products taken (and how many on the
+// hand-scheduled kernel), the calls left to the old route by reason, and the activation image's range counters (device words: the largest |x| as float bits, the values past the FP16 range or not finite)
+std::atomic<int64_t> g_pl_taken[64][2], g_pl_sass[64][2];
+std::mutex g_pl_mu;
+std::map<std::string, int64_t> g_pl_left[64];   // "key: reason" -> calls the old route ran
+std::map<std::string, int64_t> g_pl_cc[64];     // reasons the compiler's HFMA2 kernel ran instead of the hand-scheduled one
+float g_pl_wmax[64][2];                         // max |w| of the two weights' FP16 copies (under g_pl_mu)
+__device__ unsigned long long g_pl_x[4];        // max |x| bits, bad values
+__global__ void pl_image_kernel(const float4* __restrict__ x, uint2* __restrict__ y, int64_t n4) {
+    float mx = 0.0f;
+    unsigned bad = 0;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (int64_t) gridDim.x * blockDim.x) {
+        const float4 v = x[i];
+        const float a[4] = {v.x, v.y, v.z, v.w};
+        unsigned short h[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float f = fabsf(a[j]);
+            if (!(f <= 65504.0f)) ++bad; else mx = fmaxf(mx, f);
+            h[j] = __half_as_ushort(__float2half_rn(a[j]));
+        }
+        y[i] = make_uint2((unsigned) h[0] | ((unsigned) h[1] << 16), (unsigned) h[2] | ((unsigned) h[3] << 16));
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+        bad += __shfl_xor_sync(0xffffffffu, bad, o);
+    }
+    if ((threadIdx.x & 31) == 0) {
+        atomicMax(&g_pl_x[0], (unsigned long long) __float_as_uint(mx));
+        if (bad != 0) atomicAdd(&g_pl_x[1], (unsigned long long) bad);
+    }
+}
+void pl_report(int64_t tokens) {
+    for (int d = 0; d < 64; ++d) {
+        int64_t taken = 0, via_sass = 0;
+        for (int p = 0; p < 2; ++p) { taken += g_pl_taken[d][p].exchange(0); via_sass += g_pl_sass[d][p].exchange(0); }
+        int64_t left = 0;
+        std::string by_left, by_cc;
+        float wk = 0.0f, wv = 0.0f;
+        {
+            std::lock_guard<std::mutex> lk(g_pl_mu);
+            for (const auto& [what, n] : g_pl_left[d]) { left += n; by_left += (by_left.empty() ? "" : ", ") + what + " x" + std::to_string(n); }
+            for (const auto& [what, n] : g_pl_cc[d]) by_cc += (by_cc.empty() ? "" : ", ") + what + " x" + std::to_string(n);
+            g_pl_left[d].clear();
+            g_pl_cc[d].clear();
+            wk = g_pl_wmax[d][0];
+            wv = g_pl_wmax[d][1];
+        }
+        if (taken == 0 && left == 0) continue;
+        unsigned long long c[4] = {}, z[4] = {};
+        int prev = 0;
+        cudaGetDevice(&prev);
+        cudaSetDevice(d);
+        cudaDeviceSynchronize();
+        cudaMemcpyFromSymbol(c, g_pl_x, sizeof c);
+        cudaMemcpyToSymbol(g_pl_x, z, sizeof z);
+        cudaSetDevice(prev);
+        const uint32_t mxb = (uint32_t) c[0];
+        float mx = 0.0f;
+        std::memcpy(&mx, &mxb, 4);
+        std::fprintf(stderr, "strata prefill: STRATA_PF_PLE_F16: read of %lld tokens, CUDA%d: %lld PLE products (key, value) on the HFMA2 kernels (%lld on the hand-scheduled one; compiler kernel: %s), "
+                             "%lld left to the FP32 route (%s); activation image: max |x| %.4g, %llu values past the FP16 range or not finite; FP16 weight copies: max |w| key %.4g, value %.4g "
+                             "(bound of one 64-product FP16 sum: %.4g of 65504)\n",
+                     (long long) tokens, d, (long long) taken, (long long) via_sass, by_cc.empty() ? "-" : by_cc.c_str(), (long long) left, by_left.empty() ? "-" : by_left.c_str(), (double) mx,
+                     c[1], (double) wk, (double) wv, 64.0 * (double) mx * (double) std::max(wk, wv));
+    }
+}
+
 // ---- GP100, opt-in (STRATA_PF_HFMA_SASS=1, with STRATA_PF_HFMA and / or STRATA_PF_HFMA_HC): the hand-scheduled SASS kernels of gemm_sass.cuh
 // in place of the compiler's gemm_kernel / gemm_sk_kernel where they cover the call; the rest keeps the compiler kernel, counted by what and
 // why (printed with the read's reports).  The outputs are the same bits.
@@ -1565,6 +1633,7 @@ bool Gemm::native_hfma(const uint16_t* X, int ggml_type, const void* W_blocks, f
 }
 void gemm_hfma_report(int64_t tokens) {
     rf_report(tokens);   // STRATA_PF_ROUTER_F16 (nothing printed without it)
+    pl_report(tokens);   // STRATA_PF_PLE_F16 (nothing printed without it)
     std::lock_guard<std::mutex> lk(g_hf_mu);
     for (int d = 0; d < 64; ++d) {
         const int64_t taken = g_hf_taken[d].exchange(0);
@@ -1906,6 +1975,10 @@ bool Gemm::router_f16(const uint16_t*, const uint16_t*, float*, int64_t, int64_t
     return false;   // not the experimental sm_60 CUDA build: the FP32 router runs
 }
 void Gemm::router_f16_cmp(const int32_t*, const int32_t*, const float*, const float*, int64_t, void*) {}
+void Gemm::ple_f16_image(const float*, uint16_t*, int64_t) {}
+bool Gemm::ple_f16(const uint16_t*, const uint16_t*, float*, int64_t, int64_t, int64_t, int) {
+    return false;   // not the experimental sm_60 CUDA build: the FP32 route runs
+}
 #endif
 bool Gemm::bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K) {
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
@@ -2255,6 +2328,63 @@ void Gemm::router_f16_cmp(const int32_t* ids, const int32_t* ids_ref, const floa
     if (T <= 0 || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return; }
     rf_cmp_kernel<<<(unsigned) ((T + 127) / 128), 128, 0, (cudaStream_t) stream>>>(ids, ids_ref, w, w_ref, T);
     ++g_rf_chk[dev];
+}
+// STRATA_PF_PLE_F16: see gemm.hpp.  The image is the plain FP16 rounding of the dequantized rows (no scale: the counters say how far inside the range they are); the product is router_f16's - the weight's FP16 copy
+// is hc_weight's, the hand-scheduled kernel where it covers the call (N 10240, K 2560, T >= 128), else the compiler's HFMA2 kernel with the same bits.
+void Gemm::ple_f16_image(const float* x, uint16_t* y, int64_t n) {
+    if (n <= 0) return;
+    const int64_t n4 = n / 4;
+    const unsigned blocks = (unsigned) std::min<int64_t>(4096, (n4 + 255) / 256);
+    pl_image_kernel<<<blocks, 256, 0, (cudaStream_t) stream_>>>(reinterpret_cast<const float4*>(x), reinterpret_cast<uint2*>(y), n4);
+}
+bool Gemm::ple_f16(const uint16_t* Xh, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int prod) {
+    using namespace strata::prefill;
+    prod = prod == 0 ? 0 : 1;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
+    if (T <= 0 || N <= 0) return false;
+    const cudaStream_t st = (cudaStream_t) stream_;
+    const char* why = nullptr;
+    if (current_cc() != 60) why = "not a GP100";
+    else if (K <= 0 || K % 32 != 0) why = "K is not a multiple of 32";
+    else if (N < 64) why = "N below 64";
+    else if (T > INT_MAX || N > INT_MAX || K > INT_MAX) why = "a size past 2^31";
+    else if (((uintptr_t) Xh & 15) != 0) why = "X not 16-byte aligned";
+    else if (((uintptr_t) W & 15) != 0) why = "W not 16-byte aligned";
+    HcW hw;
+    if (why == nullptr) {
+        hw = hc_weight(W, N, K, st, dev);
+        if (hw.p == nullptr) why = hw.why != nullptr ? hw.why : "no FP16 copy";
+    }
+    if (why != nullptr) {
+        std::lock_guard<std::mutex> lk(g_pl_mu);
+        ++g_pl_left[dev][std::string(prod == 0 ? "key: " : "value: ") + why];
+        return false;
+    }
+    static bool said = false;
+    if (!said) {
+        said = true;
+        std::fprintf(stderr, "prefill gemm: STRATA_PF_PLE_F16=1: the PLE block's key and value projections run as FP16 HFMA2 GEMMs on the FP16 image of the dequantized n-gram rows and the weights' resident FP16 copies "
+                             "(FP16 sums of 64 products widened to FP32, not bitwise the BF16-rounded rows and cublasSgemm route's)\n");
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_pl_mu);
+        g_pl_wmax[dev][prod] = hw.wmax;
+    }
+    const char* r = "STRATA_PF_HFMA_SASS is off";
+    int k = -1;
+    if (sass_on()) r = strata::prefill::sass::dense(Xh, K, hw.p, Y, T, N, K, N, st, dev, &k);
+    if (r == nullptr) {
+        ++g_pl_sass[dev][prod];
+    } else {
+        {
+            std::lock_guard<std::mutex> lk(g_pl_mu);
+            ++g_pl_cc[dev][std::string(prod == 0 ? "key: " : "value: ") + r];
+        }
+        strata::prefill::hfma::gemm(Xh, K, hw.p, Y, T, N, K, N, st);
+    }
+    ++g_pl_taken[dev][prod];
+    return true;
 }
 #endif
 

@@ -44,6 +44,13 @@ enum Id : int {
     kEsSteps,      // QSA step records: host fill + upload (+ KV prefetch)
     kEsPlan,       // the chunk's expert stream plan, stager, issuer thread, up to the first layer's hc norm
     kEsTail,       // stage 0 only: from the end of chunk c (hand-off download, waits) to the start of chunk c+1
+    // "ple" (stage 0, layer 1: ple_land and the batched PLE block), in launch order:
+    kPleUp,        // ple_land: the raw rows' upload (+ the compute stream's wait for it) up to the dequant
+    kPleDq,        // ple_iq4nl_dequant: raw IQ4_NL rows -> FP32
+    kPleCvt,       // to_bf16 / to_f16 of the dequantized rows (the key and value GEMMs' activation image)
+    kPleKey,       // the key GEMM (N -> NG_HC_DIM), all of it
+    kPleVal,       // the value GEMM (N x N), all of it
+    kPlePost,      // native_ple_postops_batch (to the next kernel after the PLE block)
     kIdCount
 };
 inline const char* name(int id) {
@@ -51,7 +58,8 @@ inline const char* name(int id) {
                                             "attn value", "gdn recurrence", "gdn out norm",
                                             "hc norm", "hc act max", "hc act->fp16", "hc gemm down", "hc split-K reduce", "hc silu",
                                             "hc gemm up", "hc gemm inject", "hc proj old route", "hc upmix", "hc mix",
-                                            "es embed", "es hand-in", "es broadcast", "es steps", "es plan", "es chunk tail"};
+                                            "es embed", "es hand-in", "es broadcast", "es steps", "es plan", "es chunk tail",
+                                            "ple upload+wait", "ple dequant", "ple act image", "ple key gemm", "ple value gemm", "ple postops"};
     return id >= 0 && id < kIdCount ? n[id] : "?";
 }
 inline bool on() {

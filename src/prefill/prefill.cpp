@@ -606,6 +606,107 @@ static void ha_mark(HandAhead& ha, int64_t taken_upto) {
     ha.cv.notify_all();
 }
 
+// STRATA_PF_PLE_PEER: the PLE block's key projection (N 2560 -> 10240, two thirds of the block's GPU time) for the NEXT chunk is run on the next
+// stage's die - same board, NVLink - one chunk ahead, by this stage's own thread on a stream of that die, and lands in one of two key buffers on this die
+// (cudaMemcpyPeerAsync + an event this stage's compute stream waits for at layer 1).  The same kernels on the same bits (the BF16 weight copied over once,
+// the same rows, the same widening and cublasSgemm): the key is bit for bit what the local product gives.  Its own cuBLAS handle and widening buffers on
+// that die (a second Gemm), nothing shared with the stage that die runs.
+struct PlePeer {
+    bool tried = false, ok = false;
+    int home = -1, dev = -1;
+    int64_t T = 0;
+    cudaStream_t s = nullptr;                // on `dev`, the highest priority: the key is on this stage's critical path
+    std::unique_ptr<Gemm> gemm;              // on `dev`, bound to s
+    uint8_t* raw_dev = nullptr;              // dev: the next chunk's raw IQ4_NL rows
+    float* emb = nullptr;                    // dev: their dequantization
+    uint16_t* e16 = nullptr;                 // dev: its BF16 (or FP16) image
+    float* key = nullptr;                    // dev: the key product
+    uint16_t* wk = nullptr;                  // dev: the key weight (BF16), a copy of this stage's
+    uint8_t* raw_host[2] = {};               // portable pinned: a copy of the gathered raw rows of the chunk going up (the gather's own buffers are not pinned for dev)
+    float* key_rx[2] = {};                   // home: the landed key, by chunk parity
+    cudaEvent_t ready[2] = {}, up_done[2] = {};   // on dev's stream: key_rx[b] landed / raw_host[b] is on the device
+    cudaEvent_t free_ev[2] = {};             // on home's compute stream: the postops of the chunk read key_rx[b]
+    int64_t have[2] = {-1, -1};              // the chunk start (c0) whose key is in or on its way to key_rx[b]
+    bool skipped[2] = {false, false};        // the share (STRATA_PF_PLE_PEER_PCT) left the chunk of this slot to the local product
+    // this read
+    bool active = false;
+    int64_t n_peer = 0, n_local = 0, n_fail = 0;
+    double wait_ms = 0;
+    std::map<std::string, int64_t> why;
+    PlePeer() = default;
+    PlePeer(const PlePeer&) = delete;
+    PlePeer& operator=(const PlePeer&) = delete;
+    ~PlePeer() { release(); }
+    bool init(int home_dev, int peer_dev, int64_t cap_T, const uint16_t* key_home, std::string& err) {
+        tried = true;
+        home = home_dev;
+        dev = peer_dev;
+        T = cap_T;
+        const size_t raw_bytes = (size_t) T * strata::kernels::PLE_N_HEADS * strata::kernels::PLE_ROW_BYTES;
+        constexpr int64_t HD = strata::kernels::NG_HC_DIM;
+        {
+            const core::OnDevice on(dev);
+            int lo = 0, hi = 0;
+            if (cudaDeviceGetStreamPriorityRange(&lo, &hi) != cudaSuccess) { (void) cudaGetLastError(); hi = 0; }
+            if (cudaStreamCreateWithPriority(&s, cudaStreamNonBlocking, hi) != cudaSuccess) { err = "the peer stream"; return false; }
+            gemm = std::make_unique<Gemm>();
+            std::string e;
+            if (!gemm->init(s, 0, e)) { err = "the peer's cuBLAS handle: " + e; return false; }
+            if (cudaMalloc((void**) &raw_dev, raw_bytes) != cudaSuccess || cudaMalloc((void**) &emb, (size_t) T * N * 4) != cudaSuccess ||
+                cudaMalloc((void**) &e16, (size_t) T * N * 2) != cudaSuccess || cudaMalloc((void**) &key, (size_t) T * HD * 4) != cudaSuccess ||
+                cudaMalloc((void**) &wk, (size_t) HD * N * 2) != cudaSuccess) {
+                err = "no room for the peer's buffers";
+                (void) cudaGetLastError();
+                return false;
+            }
+            if (cudaMemcpyPeer(wk, dev, key_home, home, (size_t) HD * N * 2) != cudaSuccess) { err = "the key weight's copy"; (void) cudaGetLastError(); return false; }
+            for (int b = 0; b < 2; ++b)
+                if (cudaEventCreateWithFlags(&ready[b], cudaEventDisableTiming) != cudaSuccess || cudaEventCreateWithFlags(&up_done[b], cudaEventDisableTiming) != cudaSuccess) {
+                    err = "the peer's events";
+                    return false;
+                }
+        }
+        {
+            const core::OnDevice on(home);
+            for (int b = 0; b < 2; ++b) {
+                if (cudaMalloc((void**) &key_rx[b], (size_t) T * HD * 4) != cudaSuccess) { err = "no room for the landed key"; (void) cudaGetLastError(); return false; }
+                if (cudaEventCreateWithFlags(&free_ev[b], cudaEventDisableTiming) != cudaSuccess) { err = "the events"; return false; }
+            }
+        }
+        for (int b = 0; b < 2; ++b)
+            if (cudaHostAlloc((void**) &raw_host[b], raw_bytes, cudaHostAllocPortable) != cudaSuccess) { err = "no pinned memory"; (void) cudaGetLastError(); return false; }
+        ok = true;
+        return true;
+    }
+    void release() {
+        if (dev >= 0) {
+            const core::OnDevice on(dev);
+            if (s) (void) cudaStreamSynchronize(s);
+            gemm.reset();
+            for (void* p : {(void*) raw_dev, (void*) emb, (void*) e16, (void*) key, (void*) wk})
+                if (p) (void) cudaFree(p);
+            for (int b = 0; b < 2; ++b) {
+                if (ready[b]) (void) cudaEventDestroy(ready[b]);
+                if (up_done[b]) (void) cudaEventDestroy(up_done[b]);
+            }
+            if (s) (void) cudaStreamDestroy(s);
+        }
+        if (home >= 0) {
+            const core::OnDevice on(home);
+            for (int b = 0; b < 2; ++b) {
+                if (key_rx[b]) (void) cudaFree(key_rx[b]);
+                if (free_ev[b]) (void) cudaEventDestroy(free_ev[b]);
+            }
+        }
+        for (int b = 0; b < 2; ++b)
+            if (raw_host[b]) (void) cudaFreeHost(raw_host[b]);
+        raw_dev = nullptr; emb = nullptr; e16 = nullptr; key = nullptr; wk = nullptr; s = nullptr;
+        for (int b = 0; b < 2; ++b) { raw_host[b] = nullptr; key_rx[b] = nullptr; ready[b] = up_done[b] = free_ev[b] = nullptr; }
+        ok = false;
+        dev = home = -1;
+    }
+};
+
 // S23 (opt-in STRATA_HC_UPMIX=1): the hyper-connection read's up projection and gr_mix_r as one kernel (gr_upmix: gfx11,
 // and CUDA sm_80+ on chunks of 33+ tokens - there, with CUDA 13.3 on an RTX 5090, cuBLAS's up GEMM sums K in the fused
 // kernel's order and the read is the default pair's bits: gr_upmix_parity, STRATA_HC_UPMIX_CHECK);
@@ -1277,6 +1378,7 @@ struct Prefill::Impl {
     std::unique_ptr<HandWorker> hand_worker;   // STRATA_HANDOFF_PIPE: the next stage's chunks' thread (lazily)
     HandAhead ha;       // STRATA_PF_HAND_AHEAD: this stage as the sender of an edge
     HandAheadIn ha_in;  // STRATA_PF_HAND_AHEAD: this stage as the receiver of the job it runs
+    std::unique_ptr<PlePeer> plp;   // STRATA_PF_PLE_PEER: the key projection of the next chunk on the next stage's die (made at the first read that can use it)
     // STRATA_PF_HAND_EARLY, this stage as the RECEIVER of a hand-off through the host: two device buffers the previous
     // stage uploads a chunk's rows into (T x D floats) on a copy stream of this device while the stage reads the chunk
     // before, an "uploaded" event per buffer (recorded on that stream) and a "consumed" event (recorded on cs after the
@@ -1415,6 +1517,7 @@ void Prefill::release() {
     if (impl_->kv_copy) cudaStreamDestroy(impl_->kv_copy);
     if (impl_->ple_copy) (void) cudaStreamDestroy(impl_->ple_copy);
     if (impl_->ple_raw_free) (void) cudaEventDestroy(impl_->ple_raw_free);
+    if (impl_->plp) impl_->plp.reset();
     if (impl_->kv_released) cudaEventDestroy(impl_->kv_released);
     if (impl_->kv_ready) cudaEventDestroy(impl_->kv_ready);
     if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
@@ -2910,6 +3013,81 @@ bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, 
     if (X_lo) gm.bf16(X_lo, wb, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy, 1.0f, 0, false, resident);
     return true;
 }
+// The PLE block's key (N -> NG_HC_DIM) and value (N x N) projections of `nb` rows of dequantized FP32 `emb` (e16: an nb x N scratch of 2-byte values, e16_lo the BF16X2 remainder's or null).
+// STRATA_PF_PLE_F16=1 (gemm.cu, GP100): both on the FP16 HFMA2 kernels from the FP16 image of `emb` (a product the kernels decline runs the old route below, counted by reason and printed with the read's
+// report); off, or a native (quantized) key, it is what the block always ran: the BF16 image of `emb` and Gemm::bf16 (cublasSgemm on Pascal).
+// STRATA_PF_PLE_PEER: `want_key` false = the key comes from elsewhere (the peer die's product); `want_val` false = only the key is wanted (the peer's launch); `timed` false = no ktime events
+// (the peer die's stream is not the one the timing follows).  With both wanted and `timed`, it is what it was.
+void ple_projections(Gemm& gm, const strata::kernels::PleWeights& pw, const float* emb, uint16_t* e16, uint16_t* e16_lo, float* key, float* val, int64_t nb, void* cs,
+                     bool want_key = true, bool want_val = true, bool timed = true) {
+    namespace ktid = strata::kernels::ktime;
+    constexpr int64_t HD = strata::kernels::NG_HC_DIM;
+    auto kt = [&](int id) { if (timed) ktid::begin(id, cs); };
+    bool key_done = !want_key, val_done = !want_val;
+    if (strata::prefill::pf_ple_f16() && pw.key_bf16 != nullptr && e16_lo == nullptr) {
+        kt(ktid::kPleCvt);
+        gm.ple_f16_image(emb, e16, nb * N);
+        if (want_key) {
+            kt(ktid::kPleKey);
+            key_done = gm.ple_f16(e16, pw.key_bf16, key, nb, HD, N, 0);
+        }
+        if (want_val) {
+            kt(ktid::kPleVal);
+            val_done = gm.ple_f16(e16, pw.value_bf16, val, nb, N, N, 1);
+        }
+        if (key_done && val_done) return;
+    }
+    kt(ktid::kPleCvt);
+    if (pw.key_bf16 != nullptr) {
+        to_bf16(emb, e16, nb * N, cs, e16_lo);   // (after a key product on the image, in stream order: the key kernel has read it)
+        if (!key_done) {
+            kt(ktid::kPleKey);
+            gm.bf16(e16, pw.key_bf16, key, nb, HD, N);
+            if (e16_lo) gm.bf16(e16_lo, pw.key_bf16, key, nb, HD, N, 0, 1.0f);
+        }
+    } else {
+        to_f16(emb, e16, nb * N, cs);
+        kt(ktid::kPleKey);
+        gm.native(e16, pw.key_native_type, pw.key_native_data, key, nb, HD, N);
+        kt(ktid::kPleCvt);
+        to_bf16(emb, e16, nb * N, cs, e16_lo);
+    }
+    if (!val_done) {
+        kt(ktid::kPleVal);
+        gm.bf16(e16, pw.value_bf16, val, nb, N, N);
+        if (e16_lo) gm.bf16(e16_lo, pw.value_bf16, val, nb, N, N, 0, 1.0f);
+    }
+}
+// STRATA_PF_PLE_PEER: the key projection of the chunk at `c0n` (Tn tokens; raw IQ4_NL rows at raw_src) on the peer die, landing in key_rx[bn] on this one.  False = not launched
+// (nothing of it is used: have[bn] stays -1) and the reason is in `why`.
+bool ple_peer_launch(PlePeer& pp, const strata::kernels::PleWeights& pw, const void* raw_src, int64_t Tn, int64_t c0n, int bn, std::string& why) {
+    constexpr int64_t HD = strata::kernels::NG_HC_DIM;
+    pp.have[bn] = -1;
+    if (Tn <= 0 || Tn > pp.T) { why = "a chunk larger than the peer's buffers"; return false; }
+    if (cudaEventSynchronize(pp.up_done[bn]) != cudaSuccess) { (void) cudaGetLastError(); why = "the peer's stream failed"; return false; }
+    const size_t raw_bytes = (size_t) Tn * strata::kernels::PLE_N_HEADS * strata::kernels::PLE_ROW_BYTES;
+    std::memcpy(pp.raw_host[bn], raw_src, raw_bytes);
+    const core::OnDevice on(pp.dev);
+    cudaStream_t st = pp.s;
+    if (cudaMemcpyAsync(pp.raw_dev, pp.raw_host[bn], raw_bytes, cudaMemcpyHostToDevice, st) != cudaSuccess || cudaEventRecord(pp.up_done[bn], st) != cudaSuccess) {
+        (void) cudaGetLastError();
+        why = "the raw rows' upload to the peer failed";
+        return false;
+    }
+    strata::kernels::ple_iq4nl_dequant(pp.raw_dev, Tn * strata::kernels::PLE_N_HEADS, pp.emb, st);
+    strata::kernels::PleWeights pk = pw;
+    pk.key_bf16 = pp.wk;
+    ple_projections(*pp.gemm, pk, pp.emb, pp.e16, nullptr, pp.key, nullptr, Tn, st, true, false, false);
+    if (cudaStreamWaitEvent(st, pp.free_ev[bn], 0) != cudaSuccess ||
+        cudaMemcpyPeerAsync(pp.key_rx[bn], pp.home, pp.key, pp.dev, (size_t) Tn * HD * 4, st) != cudaSuccess || cudaEventRecord(pp.ready[bn], st) != cudaSuccess) {
+        (void) cudaGetLastError();
+        why = "the key's copy home failed";
+        return false;
+    }
+    if (cudaGetLastError() != cudaSuccess) { why = "a launch on the peer failed"; return false; }
+    pp.have[bn] = c0n;
+    return true;
+}
 // STRATA_PF_ROUTER_V2=1 (gemm.cu, Pascal STRATA_DENSE_F32): the router's logits and the shared expert's scalar gate from one FP32 widening of the layer input a slice, bit for bit what
 // bf16_proj(router) + the shared gate's two bf16() calls give; false = nothing launched, the caller runs those
 bool router_gate_v2(Gemm& gm, const core::WeightRef* wr, const core::WeightRef* wgi, const uint16_t* X, const uint16_t* X_lo, float* logits, float* sg, int64_t T, int64_t N) {
@@ -3304,6 +3482,36 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const bool ple_batch = ple_on && ple_batch_env && strata::kernels::ple_native_postops_enabled() &&
                            (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
                            m.region_bytes / ((uint64_t) (3 * strata::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
+    // STRATA_PF_PLE_PEER (see PlePeer): this read's key products one chunk ahead on the next stage's die.  Only the first stage, a read of two chunks or more
+    // that is not a helped one, the NVLink pair, the raw-row gather (STRATA_PLE_COMPACT) and a BF16 key weight; else the block is what it was
+    PlePeer* plp = nullptr;
+    if (strata::prefill::pf_ple_peer() && ple_batch && hand_in_ == nullptr && !helped && n > C && next_ != nullptr && next_->impl_ && next_->impl_->device >= 0 &&
+        ple_compact_on() && m.ple_raw_dev != nullptr && ss.ple.w.key_bf16 != nullptr && ss.ple.w.value_bf16 != nullptr && !bf16x2(m.f16_io) &&
+        hand_peer_ok(m.device, next_->impl_->device)) {
+        if (!m.plp) m.plp = std::make_unique<PlePeer>();
+        if (!m.plp->tried) {
+            std::string perr;
+            if (m.plp->init(m.device, next_->impl_->device, m.T, ss.ple.w.key_bf16, perr)) {
+                std::fprintf(stderr, "strata prefill: STRATA_PF_PLE_PEER=1: the PLE block's key projection runs one chunk ahead on CUDA%d (the next stage's die) and lands in this die's key buffers over NVLink; "
+                                     "the same kernels and bits as the local product\n", m.plp->dev);
+            } else {
+                std::fprintf(stderr, "strata prefill: STRATA_PF_PLE_PEER=1: not usable (%s): the key projection stays on this die\n", perr.c_str());
+            }
+        }
+        if (m.plp->ok && m.plp->dev == next_->impl_->device) {
+            plp = m.plp.get();
+            plp->active = true;
+            plp->have[0] = plp->have[1] = -1;
+            plp->n_peer = plp->n_local = plp->n_fail = 0;
+            plp->wait_ms = 0;
+            plp->why.clear();
+        }
+    }
+    struct PlpDrain {   // no work left on the peer's stream when the call ends (an early return too)
+        PlePeer*& p;
+        ~PlpDrain() { if (p != nullptr && p->s != nullptr) { const core::OnDevice on(p->dev); (void) cudaStreamSynchronize(p->s); } }
+    } plp_drain{plp};
+    int ple_cur = 0;   // the slot (parity) of the chunk whose rows landed last
     const int32_t prev0[2] = {prev[0], prev[1]};
     auto ple_gather = [&m, &ss, tokens, n, prev0, C](int64_t c0, int buf, std::string& e) -> bool {
         const int64_t T = std::min(C, n - c0);
@@ -3531,11 +3739,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         auto ple_land = [&]() -> bool {
             if (!ple_pending) return true;
             ple_pending = false;
+            ple_cur = ple_buf;
             const auto tp = Clock::now();
             if (!ple_next.get()) {
                 err = ple_next_err;
                 return false;
             }
+            kt(ktid::kPleUp);
             // #1996: the pageable fallback (no RAM to pin) goes up through a pinned slot; the pinned buffers as before
             const size_t raw_bytes = (size_t) T * strata::kernels::PLE_N_HEADS * strata::kernels::PLE_ROW_BYTES;
             // STRATA_PLE_COPY_STREAM: the raw rows go up on their own stream once the previous chunk's dequant has read
@@ -3557,6 +3767,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 return false;
             }
             if (m.ple_compact[ple_buf]) {
+                kt(ktid::kPleDq);
                 strata::kernels::ple_iq4nl_dequant(m.ple_raw_dev, T * strata::kernels::PLE_N_HEADS, m.ple_emb, m.cs);
                 if (ple_side && cudaEventRecord(m.ple_raw_free, m.cs) != cudaSuccess) {
                     err = std::string("prefill: the PLE rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
@@ -3573,6 +3784,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     strata::aux_cpus::pin_current_thread();
                     return ple_gather(c1, b, ple_next_err);
                 });
+                // STRATA_PF_PLE_PEER_PCT=P (default 100): P of every 100 chunks (spread evenly: chunk k goes when floor((k+1)P/100) > floor(kP/100)) have their key product on the peer, the rest on this die,
+                // so the next stage's die is loaded with what it can take
+                const int64_t kn = (c0 + C) / C;
+                static const int64_t pct = [] { const char* e = std::getenv("STRATA_PF_PLE_PEER_PCT"); const long v = e != nullptr ? std::atol(e) : 100; return (int64_t) (v < 0 ? 0 : v > 100 ? 100 : v); }();
+                const bool go = plp != nullptr && ((kn + 1) * pct) / 100 > (kn * pct) / 100;
+                if (plp != nullptr) { plp->skipped[ple_buf ^ 1] = !go; plp->have[ple_buf ^ 1] = -1; }
+                if (go) {
+                    // STRATA_PF_PLE_PEER: the next chunk's rows are needed now (one chunk ahead of its layer 1): wait for the gather (the thread has the CPU to itself, the GPU still has this
+                    // chunk's layer 0 queued) and start the chunk's key product on the peer die
+                    const auto tw = Clock::now();
+                    ple_next.wait();
+                    plp->wait_ms += ms_since(tw);
+                    std::string why;
+                    const int64_t c1 = c0 + C;
+                    if (!m.ple_compact[ple_buf ^ 1]) why = "the gather gave no raw rows";
+                    else (void) ple_peer_launch(*plp, ss.ple.w, m.ple_emb_host[ple_buf ^ 1], std::min(C, n - c1), c1, ple_buf ^ 1, why);
+                    if (!why.empty()) { ++plp->n_fail; ++plp->why["launch: " + why]; }
+                }
             }
             ple_buf ^= 1;
             stats_.ms_ple += ms_since(tp);
@@ -3936,6 +4165,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 constexpr int64_t HD = strata::kernels::NG_HC_DIM;
                 const uint64_t per_token = (uint64_t) (3 * HD + N + 4) * 4 + (uint64_t) N * (bf16x2(m.f16_io) ? 4 : 2) + 4096;
                 const int64_t SB = std::min<int64_t>(T, (int64_t) (m.region_bytes / per_token));
+                // STRATA_PF_PLE_PEER: this chunk's key landed (or is landing) in key_rx[slot]; the compute stream waits for it, once
+                const bool peer_key = plp != nullptr && plp->have[ple_cur] == c0;
+                if (peer_key) {
+                    kt(ktid::kPleKey);
+                    if (cudaStreamWaitEvent(m.cs, plp->ready[ple_cur], 0) != cudaSuccess) {
+                        err = std::string("prefill: STRATA_PF_PLE_PEER: the key's event wait failed: ") + cudaGetErrorString(cudaGetLastError());
+                        return false;
+                    }
+                } else if (plp != nullptr) {
+                    ++plp->n_local;
+                    ++plp->why[c0 == 0 ? "the first chunk of the call" : plp->skipped[ple_cur] ? "the share kept it local" : "no key was launched for the chunk"];
+                }
                 for (int64_t s0 = 0; s0 < T; s0 += SB) {
                     const int64_t nb = std::min(SB, T - s0);
                     uint8_t* q = m.region;
@@ -3948,21 +4189,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     uint16_t* e16 = (uint16_t*) carve_f((size_t) nb * N / 2);
                     uint16_t* e16_lo = bf16x2(m.f16_io) ? (uint16_t*) carve_f((size_t) nb * N / 2) : nullptr;
                     const float* emb = m.ple_emb + s0 * N;
-                    if (pw.key_bf16 != nullptr) {
-                        to_bf16(emb, e16, nb * N, m.cs, e16_lo);
-                        m.gemm.bf16(e16, pw.key_bf16, key, nb, HD, N);
-                        if (e16_lo) m.gemm.bf16(e16_lo, pw.key_bf16, key, nb, HD, N, 0, 1.0f);
-                    } else {
-                        to_f16(emb, e16, nb * N, m.cs);
-                        m.gemm.native(e16, pw.key_native_type, pw.key_native_data, key, nb, HD, N);
-                        to_bf16(emb, e16, nb * N, m.cs, e16_lo);
-                    }
-                    m.gemm.bf16(e16, pw.value_bf16, val, nb, N, N);
-                    if (e16_lo) m.gemm.bf16(e16_lo, pw.value_bf16, val, nb, N, N, 0, 1.0f);
+                    ple_projections(m.gemm, pw, emb, e16, e16_lo, key, val, nb, m.cs, !peer_key, true, true);
+                    kt(ktid::kPlePost);
                     try {
-                        strata::kernels::native_ple_postops_batch(key, m.R + s0 * D, val, ss.ple.hist, pw, qn, gated,
+                        strata::kernels::native_ple_postops_batch(peer_key ? plp->key_rx[ple_cur] + s0 * HD : key, m.R + s0 * D, val, ss.ple.hist, pw, qn, gated,
                                                                   gate, (int) nb, m.cs);
                     } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
+                }
+                if (peer_key) {   // the postops have read (and normalized in place) key_rx[slot]: the next product into it may land
+                    if (cudaEventRecord(plp->free_ev[ple_cur], m.cs) != cudaSuccess) {
+                        err = std::string("prefill: STRATA_PF_PLE_PEER: the key buffer's event failed: ") + cudaGetErrorString(cudaGetLastError());
+                        return false;
+                    }
+                    plp->have[ple_cur] = -1;
+                    ++plp->n_peer;
                 }
                 stats_.ms_ple += ms_since(tp);
             } else if (l == 1 && ple_on) {
@@ -7296,17 +7536,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                         uint16_t* e16 = (uint16_t*) carve_f((size_t) nb * N / 2);
                         uint16_t* e16_lo = bf16x2(m.f16_io) ? (uint16_t*) carve_f((size_t) nb * N / 2) : nullptr;
                         const float* emb = m.ple_emb + s0 * N;
-                        if (pw.key_bf16 != nullptr) {
-                            to_bf16(emb, e16, nb * N, cs, e16_lo);
-                            m.gemm.bf16(e16, pw.key_bf16, key, nb, HD, N);
-                            if (e16_lo) m.gemm.bf16(e16_lo, pw.key_bf16, key, nb, HD, N, 0, 1.0f);
-                        } else {
-                            to_f16(emb, e16, nb * N, cs);
-                            m.gemm.native(e16, pw.key_native_type, pw.key_native_data, key, nb, HD, N);
-                            to_bf16(emb, e16, nb * N, cs, e16_lo);
-                        }
-                        m.gemm.bf16(e16, pw.value_bf16, val, nb, N, N);
-                        if (e16_lo) m.gemm.bf16(e16_lo, pw.value_bf16, val, nb, N, N, 0, 1.0f);
+                        ple_projections(m.gemm, pw, emb, e16, e16_lo, key, val, nb, cs);
                         try {
                             strata::kernels::native_ple_postops_batch(key, m.R + s0 * D, val, ss.ple.hist, pw, qn, gated,
                                                                       gate, (int) nb, cs);
@@ -7835,6 +8065,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                  "the chunk before to be taken), %lld took the old wait, %lld not applicable (one-chunk reads); time stages "
                                  "waited for the chunk before to be taken (ms): %s\n", (long long) da, (long long) df, (long long) dn,
                          waits.c_str());
+    }
+    if (hand_in_ == nullptr && impl_ && impl_->plp && impl_->plp->active) {   // STRATA_PF_PLE_PEER: what this read's key products did (counted, not assumed)
+        PlePeer& pp = *impl_->plp;
+        std::string by;
+        for (const auto& [what, k] : pp.why) by += (by.empty() ? "" : ", ") + what + " x" + std::to_string((long long) k);
+        std::fprintf(stderr, "strata prefill: STRATA_PF_PLE_PEER: this read %lld key projections ran one chunk ahead on CUDA%d and landed over NVLink, %lld chunks took the local product, "
+                             "%lld launches failed (%s); the host waited %.0f ms for the next chunk's rows\n", (long long) pp.n_peer, pp.dev, (long long) pp.n_local, (long long) pp.n_fail,
+                     by.empty() ? "-" : by.c_str(), pp.wait_ms);
+        pp.active = false;
     }
     // STRATA_MMQ_DIRECT=1 with STRATA_MMQ_DIRECT_LOG=1 (a check, not a default): each stage's totals so far - how many
     // resident experts its prompt MMQ read in their slots, of all its resident and streamed ones

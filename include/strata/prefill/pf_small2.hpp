@@ -36,6 +36,14 @@ inline bool pf_router_v2() { static const bool on = pf_env_on("STRATA_PF_ROUTER_
 // change.  STRATA_PF_ROUTER_F16_CHECK=1 (diagnostic, only with the switch above): also runs the FP32 router into scratch after every chunk and layer and counts the ids that differ.
 inline bool pf_router_f16() { static const bool on = pf_env_on("STRATA_PF_ROUTER_F16"); return on; }
 inline bool pf_router_f16_check() { static const bool on = pf_router_f16() && pf_env_on("STRATA_PF_ROUTER_F16_CHECK"); return on; }
+// STRATA_PF_PLE_F16=1 (default off, GP100): the PLE block's key (N 10240, K 2560) and value (N 2560, K 2560) projections - the first stage's layer 1, one block per chunk - from the FP16 image of the dequantized
+// n-gram rows and the BF16 weights' resident FP16 copies on the dense HFMA2 kernels (hand-scheduled for the key where STRATA_PF_HFMA_SASS covers it), instead of the BF16-rounded rows widened to FP32 and cublasSgemm
+// on the BF16 weights widened to FP32.  NOT bitwise the FP32 route's: the activation keeps 11 mantissa bits (the FP32 route 8) and the sums are FP16 per 64 products widened to FP32.
+inline bool pf_ple_f16() { static const bool on = pf_env_on("STRATA_PF_PLE_F16"); return on; }
+// STRATA_PF_PLE_PEER=1 (default off, the first stage of a layer split whose next stage's die is its NVLink pair): the PLE block's key projection for the NEXT chunk runs on that die, on a stream of its own
+// (highest priority), while this stage reads the current chunk, and lands in this die's second key buffer over NVLink (cudaMemcpyPeerAsync).  The same raw rows, kernels, cuBLAS calls and weights
+// as the local product: the key is bit for bit the local key.  The first chunk of a call, a read of one chunk, a helped read and any launch that fails keep the local product (counted by reason, printed per read).
+inline bool pf_ple_peer() { static const bool on = pf_env_on("STRATA_PF_PLE_PEER"); return on; }
 
 enum Pf2Switch { kPf2Sel = 0, kPf2Topk, kPf2Gdn, kPf2Comb, kPf2SelX, kPf2Router, kPf2Count };
 enum Pf2Reason { kPf2Arch = 0, kPf2Geometry, kPf2Align, kPf2Length, kPf2ReasonCount };
