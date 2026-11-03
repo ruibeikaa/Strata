@@ -81,3 +81,47 @@ multi-block kernels run at their bench speed in the graph.
 ## Conversations over a restart (2026-10-30)
 
 With `STRATA_PARK_RAMLIKE=1` a graceful stop keeps conversations of 50K tokens or more in RAM for one hour. Checked on the route with two real sessions, a read in flight and the client gone: the stop took 23 s, the keeper was ready in 2.0 s (5.97 GB), and after the restart a 202K-token session went on in 1.9 s (175.5 s from zero) and a 141K-token one in 1.3 s (123.7 s from zero). A stop that hung for 120 s on 2026-10-30 was not reproduced, so its cause is not known; the hand-over is now bounded at 45 s and logs the stack where it blocked.
+
+## r15 - r17 (2026-10-31 .. 2026-11-03)
+
+Three more releases on this branch, in order. r15 and r16 change no reply bit (gated as above). r17 is the one release
+that changes replies on purpose: the prompt read moves to FP16, approved by the owner and gated against a high-precision
+reference instead of against the previous release. Everything r17 adds after the FP16 kernels is bit-identical to them.
+
+| release | commit | what | switches (production value) |
+|---|---|---|---|
+| `ph402-r15-svocab-20261031` | 27bfc5dc6 | dynamic draft candidates: a draft step reads a 192-wide sketch of the 68K draft head, takes the best row of each of 2048 stride classes and computes exact logits on those rows only (head 375 -> 116 us, step 1131 -> 868 us) | `STRATA_SVOCAB=1` plus a sketch file per model |
+| `ph402-r16-f7p-20261101` | d623a3f0d | while thinking, windows of their own: one row at the head of a run, the window behind it sized when its stage 0 can take it, 3 rows at most, floor 0.7; tool and text windows as before; the thinking class keeps its own draft policy | `STRATA_SPEC_CLASS=think:ff=1.01,fa=3,late=1,ld=1,m=1,smtp=3,floor=0.7 STRATA_SPEC_POLICY=1` |
+| `ph402-r17-pf16-20261103` | bad31c768 | the prompt read on FP16 HFMA2 (below) | the 31 switches below |
+
+r17, the prompt path: FP16 HFMA2 products for the dense projections, the 4-bit gate/up experts, down, the hyper-connection
+projections and attention (FP16 sums of 64 products widened to FP32, the activation scaled by a power of two per launch);
+hand-scheduled SASS for the dense and hyper-connection kernels (generated with CuAssembler, the cubins are committed; set
+`CUASSEMBLER` to regenerate them); pass classes for the expert launches; the QSA select on an FP16 filter whose selected ids
+are proven equal to the FP32 scorer's; then exact items: the system prompt's part read in the same pipelined run as the
+rest, a one-chunk buffer per stage hand-off, the hyper-connection conversion pass folded into its writers, the host hand-off
+between the boards downloaded off the stage's loop in 4 pieces, the PLE key projection one chunk ahead on stage 1, the four
+stages parked at once, threaded and asynchronous checkpoints.
+
+    STRATA_PF_HFMA=1 STRATA_PF_HFMA_EXP=1 STRATA_PF_HFMA_DOWN=1 STRATA_PF_HFMA_HC=1 STRATA_PF_HFMA_SASS=1
+    STRATA_PF_HFMA_ATTN=2 STRATA_PF_HFMA_SMALL=1 STRATA_PF_HFMA_R2=1 STRATA_PF_HFMA_R2_DOWN=1 STRATA_PF_HFMA_SEL=1
+    STRATA_PF_TOPK_SEL=1 STRATA_PF_GDN_FUSED=1 STRATA_PF_COMBINE_V2=1 STRATA_PF_SEL_EXACT=1 STRATA_PF_ROUTER_V2=1
+    STRATA_PF_ATTN_PERSIST=1 STRATA_PF_HFMA_CLASSES=1 STRATA_PF_HFMA_CLASSES_UP2=1 STRATA_PF_HFMA_CLASSES_SC4=1
+    STRATA_PLE_COMPACT=1 STRATA_PLE_COPY_STREAM=1 STRATA_PF_ROOT_JOIN=1 STRATA_PF_HAND_EARLY=1 STRATA_PF_HAND_AHEAD=1
+    STRATA_PF_HC_NOCVT=1 STRATA_PF_HAND_DL_OVERLAP=4 STRATA_PF_PLE_PEER=1 STRATA_PF_PLE_PEER_PCT=93 STRATA_PARK_STAGES=1
+    STRATA_CKPT_THREADS=1 STRATA_CKPT_STAGE_ASYNC=1
+
+Every switch is default off; with none of them set the r17 engine equals r16 (29 of 29 cells, content + token + state, on
+both models). Extra VRAM per die with the switches on: about 1.9 GiB (FP16 weight copies, the hyper-connection image, a
+checkpoint snapshot); stage 1 also holds the PLE key weights and a 94 MB staging buffer.
+
+Measured, Swift IQ3_XXS prompt reads r16 -> r17 (tok/s): 1.1K 558 -> 808, 7.5K 925 -> 1414, 33K 1110 -> 1791,
+117K 1163 -> 2001, 141K 1147 -> 2009; a cached re-read of 141K 952 -> 485 ms. SwiftAbl IQ3_S: 117K 1158 -> 1861,
+141K 1133 -> 1896, 202K 1139 -> 1908. Decode unchanged (r17 against r16, geometric mean over 29 cells: 0.995 Swift,
+1.003 SwiftAbl, time per token equal). First-token quality on 33 prompts against the high-precision reference: top-1 31/33,
+KL mean 0.065, p90 0.166, max 0.438 (r16: 31/33, 0.099, 0.305, 0.651). Thinking decode r15 -> r16 over real turns: Swift
+72.7 -> 75.8, SwiftAbl 69.6 -> 72.6 tok/s.
+
+Closed during r17 (measured): PLE projections on FP16 (fails the first-token gate), the MoE router on FP16 (fails it too),
+exact block pruning for the QSA select (bounds keep 90-100% of blocks in 128 dimensions), fusing the hyper-connection up
+projection with its mix (0.3-0.6 s of a 141K read), the down-class kernels (+8% inside down, most of it lost outside).
