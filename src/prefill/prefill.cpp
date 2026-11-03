@@ -591,6 +591,14 @@ static bool pf_hand_dl_overlap() {
     static const bool v = [] { const char* e = std::getenv("STRATA_PF_HAND_DL_OVERLAP"); return e != nullptr && std::atoi(e) != 0; }();
     return v;
 }
+// STRATA_PF_HAND_DL_OVERLAP=P (2..16): the hop is pipelined in P row pieces - the download of the chunk comes down piece by piece (an event after each) and
+// the upload into the next stage's second R buffer waits on the GPU for piece i's event before it copies piece i, so the upload of piece i overlaps the
+// download of piece i+1 (the two links are different boards'): the rows reach the next stage ~28 ms/P after the download ends instead of 28 ms.  1 = the
+// whole chunk in one download and one upload.  The same bytes in the same places, only in P copies each.
+static int pf_hand_dl_pieces() {
+    static const int v = [] { const char* e = std::getenv("STRATA_PF_HAND_DL_OVERLAP"); const int p = e != nullptr ? std::atoi(e) : 0; return p >= 2 ? std::min(p, kHandPiecesMax) : 1; }();
+    return v;
+}
 // STRATA_PF_HAND_DL_OVERLAP_TEST=N (a check of the fallbacks, not a setting): 1 = the staging copy cannot be set up, 2 = every third chunk's
 // queueing "fails" once the staging copy and the download are queued, 3 = every fourth attempt's upload "fails" once it is queued
 static int pf_hand_dl_test() {
@@ -1422,6 +1430,7 @@ struct Prefill::Impl {
     std::size_t dl_cap = 0;
     cudaStream_t s_dl = nullptr;
     cudaEvent_t dl_src = nullptr, dl_ev = nullptr;
+    cudaEvent_t dl_pev[kHandPiecesMax] = {};   // STRATA_PF_HAND_DL_OVERLAP=P: "piece i is in the pinned slot" (on s_dl)
     bool dl_failed = false;
     // ... and as the RECEIVER: a stopwatch (timing events on cs) around the wait for the rows still going up, read at the end of the chunk
     cudaEvent_t upw[2] = {};
@@ -1550,6 +1559,8 @@ void Prefill::release() {
     if (impl_->dl_stage) { (void) cudaFree(impl_->dl_stage); impl_->dl_stage = nullptr; }
     if (impl_->dl_src) (void) cudaEventDestroy(impl_->dl_src);
     if (impl_->dl_ev) (void) cudaEventDestroy(impl_->dl_ev);
+    for (cudaEvent_t& e : impl_->dl_pev)
+        if (e) (void) cudaEventDestroy(e);
     for (cudaEvent_t& e : impl_->upw)
         if (e) (void) cudaEventDestroy(e);
     if (impl_->s_dl) (void) cudaStreamDestroy(impl_->s_dl);
@@ -3419,6 +3430,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
+    // where the stage's wall exceeds its GPU timeline (STRATA_PREFILL_TIMING's "host gaps" line): the host time before the first chunk's first mark, and after the
+    // sync that ends a chunk's GPU work: the receiver's copy wait, the NVLink copy, the checkpoint callback, the wait for the successor, the job submit, the tail
+    double g_pre_ms = 0, g_evw_ms = 0, g_copy_ms = 0, g_cb_ms = 0, g_wait_ms = 0, g_sub_ms = 0;
+    Clock::time_point g_t{};
+    bool g_have = false, g_pre_set = false;
     const int64_t LB = stage_lb_, LE = stage_le_;
     // STRATA_KVA: the approximate-prefix plan of this run, if it qualifies (a cold read of one long prompt, one
     // stage, no capture).  Positions [0, kva_frontier) are approximated in the layers at and after the split.
@@ -3638,6 +3654,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
 #endif
         ++stats_.chunks;
         pt.mark(kPfStart, cs);
+        if (!g_pre_set) { g_pre_set = true; g_pre_ms = ms_since(t_start); }
         // STRATA_PREFILL_TIMING=2: "embed+steps" by what runs - kt(id) starts the segment `id`, which lasts to the next kt()
         auto kt = [&m](int id) { strata::kernels::ktime::begin(id, m.cs); };
         namespace ktid = strata::kernels::ktime;
@@ -6392,24 +6409,31 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
                             return false;
                         }
+                        g_t = Clock::now();
+                        g_have = true;
                         { const core::OnDevice on(nm.device); (void) cudaEventSynchronize(nm.rin_free[b]); }   // job j-2's device copy out of it has run
+                        g_evw_ms += ms_since(g_t);
+                        g_t = Clock::now();
                         landed_a = cudaMemcpyPeerAsync(nm.rin[b], nm.device, m.R, m.device, (size_t) T * D * 4, m.cs) == cudaSuccess &&
                                    cudaStreamSynchronize(m.cs) == cudaSuccess;
+                        g_copy_ms += ms_since(g_t);
+                        g_t = Clock::now();
                         if (!landed_a) {
                             say(4, std::string(std::string("the NVLink copy into the second R buffer failed (") + cudaGetErrorString(cudaGetLastError()) + ")").c_str());
                             (void) cudaGetLastError();
                         }
                     }
-                    bool off_loop = false;   // STRATA_PF_HAND_DL_OVERLAP: the rows were downloaded from a staging copy on s_dl, not on this loop
+                    bool off_loop = false;   // STRATA_PF_HAND_DL_OVERLAP: the rows are downloaded from a staging copy on s_dl, not on this loop
+                    const size_t bytes = (size_t) T * D * 4;
+                    const int np = pf_hand_dl_pieces();   // the hop in np row pieces (1: whole)
+                    auto no_dl = [&](int bit, const char* msg) {   // counted, said once per reason; this chunk downloads on the loop
+                        ++ha.n_dl_fb;
+                        static std::atomic<uint32_t> said_dl{0};
+                        if ((said_dl.fetch_or(1u << bit) & (1u << bit)) == 0)
+                            std::fprintf(stderr, "strata prefill: STRATA_PF_HAND_DL_OVERLAP: %s: such a hand-off downloads on the stage's "
+                                                 "loop, as before (counted, said once)\n", msg);
+                    };
                     if (!landed_a && pf_hand_dl_overlap()) {
-                        const size_t bytes = (size_t) T * D * 4;
-                        auto no_dl = [&](int bit, const char* msg) {   // counted, said once per reason; this chunk downloads on the loop
-                            ++ha.n_dl_fb;
-                            static std::atomic<uint32_t> said_dl{0};
-                            if ((said_dl.fetch_or(1u << bit) & (1u << bit)) == 0)
-                                std::fprintf(stderr, "strata prefill: STRATA_PF_HAND_DL_OVERLAP: %s: such a hand-off downloads on the stage's "
-                                                     "loop, as before (counted, said once)\n", msg);
-                        };
                         const core::OnDevice on_m(m.device);
                         bool ready = true;
                         if (m.dl_failed) {
@@ -6422,10 +6446,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     (m.dl_src != nullptr || cudaEventCreateWithFlags(&m.dl_src, cudaEventDisableTiming) == cudaSuccess) &&
                                     (m.dl_ev != nullptr || cudaEventCreateWithFlags(&m.dl_ev, cudaEventDisableTiming) == cudaSuccess) &&
                                     cudaMalloc((void**) &m.dl_stage, cap * sizeof(float)) == cudaSuccess;
+                            for (int i = 0; ready && np > 1 && i < np; ++i)
+                                ready = m.dl_pev[i] != nullptr || cudaEventCreateWithFlags(&m.dl_pev[i], cudaEventDisableTiming) == cudaSuccess;
                             if (ready) {
                                 m.dl_cap = cap;
                             } else {
                                 (void) cudaGetLastError();
+                                if (m.dl_stage != nullptr) (void) cudaFree(m.dl_stage);
                                 m.dl_stage = nullptr;
                                 m.dl_failed = true;
                                 no_dl(1, "no room for the staging copy of the chunk (or no stream or event)");
@@ -6438,34 +6465,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const auto tw = Clock::now();
                             { const core::OnDevice on(nm.device); (void) cudaEventSynchronize(nm.rin_ready[b]); }   // the pinned slot: its last upload has landed
                             ha.dl_host_ms += std::chrono::duration<double, std::milli>(Clock::now() - tw).count();
-                            // device copy of the chunk (cs waits first for the last download out of the staging copy), then the download on s_dl
+                            // device copy of the chunk (cs waits first for the last download out of the staging copy).  The download and the upload
+                            // follow once the checkpoint callback below has run: its own device-to-host copies would queue behind the 94 MB download on
+                            // the same link (~15 ms more a checkpoint on this stage's loop)
                             off_loop = cudaStreamWaitEvent(m.cs, m.dl_ev, 0) == cudaSuccess &&
                                        cudaMemcpyAsync(m.dl_stage, m.R, bytes, cudaMemcpyDeviceToDevice, m.cs) == cudaSuccess &&
-                                       cudaEventRecord(m.dl_src, m.cs) == cudaSuccess &&
-                                       cudaStreamWaitEvent(m.s_dl, m.dl_src, 0) == cudaSuccess &&
-                                       cudaMemcpyAsync(h, m.dl_stage, bytes, cudaMemcpyDeviceToHost, m.s_dl) == cudaSuccess &&
-                                       cudaEventRecord(m.dl_ev, m.s_dl) == cudaSuccess;
-                            if (off_loop && pf_hand_dl_test() == 2 && j % 3 == 0) off_loop = false;   // (the check: the chunk's staging copy and download are queued)
+                                       cudaEventRecord(m.dl_src, m.cs) == cudaSuccess;
                             if (!off_loop) {
                                 (void) cudaGetLastError();
-                                (void) cudaStreamSynchronize(m.s_dl);   // whatever of it was queued has ended before the download on the loop
-                                (void) cudaGetLastError();
-                                no_dl(3, "the staging copy or its download could not be queued");
-                            }
-                        }
-                        if (off_loop) {   // the upload into the next stage's second R buffer: after the download, on the GPU (across the two dies)
-                            const core::OnDevice on_n(nm.device);
-                            const bool up = cudaStreamWaitEvent(nm.s_in, nm.rin_free[b], 0) == cudaSuccess &&
-                                            cudaStreamWaitEvent(nm.s_in, m.dl_ev, 0) == cudaSuccess &&
-                                            cudaMemcpyAsync(nm.rin[b], h, (size_t) T * D * 4, cudaMemcpyHostToDevice, nm.s_in) == cudaSuccess &&
-                                            cudaEventRecord(nm.rin_ready[b], nm.s_in) == cudaSuccess;
-                            static std::atomic<int64_t> tried_up{0};   // (the check 3: counts attempts, since a failed one does not advance j)
-                            if (!up || (pf_hand_dl_test() == 3 && tried_up.fetch_add(1) % 4 == 3)) {
-                                (void) cudaGetLastError();
-                                off_loop = false;
-                                (void) cudaStreamSynchronize(m.s_dl);
-                                (void) cudaGetLastError();
-                                why_bit = 5; why = "the upload into the next stage's second R buffer failed";
+                                no_dl(3, "the staging copy could not be queued");
                             }
                         }
                     }
@@ -6488,8 +6496,63 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             ++ha.n_dl;
                         }
+                        if (!g_have) { g_t = Clock::now(); g_have = true; }
                         if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
+                        g_cb_ms += ms_since(g_t);
+                        g_t = Clock::now();
+                        if (off_loop) {   // the download out of the staging copy, piece by piece, and the upload behind it (on the GPU, across the two dies)
+                            bool ok = cudaStreamWaitEvent(m.s_dl, m.dl_src, 0) == cudaSuccess;
+                            if (ok && np > 1) {
+                                for (int i = 0; ok && i < np; ++i) {
+                                    int64_t r0 = 0, nr = 0;
+                                    handoff_piece(T, np, i, r0, nr);
+                                    if (nr > 0)
+                                        ok = cudaMemcpyAsync(h + (size_t) r0 * D, m.dl_stage + (size_t) r0 * D, (size_t) nr * D * 4, cudaMemcpyDeviceToHost, m.s_dl) == cudaSuccess;
+                                    ok = ok && cudaEventRecord(m.dl_pev[i], m.s_dl) == cudaSuccess;
+                                }
+                                ok = ok && cudaEventRecord(m.dl_ev, m.s_dl) == cudaSuccess;
+                            } else if (ok) {
+                                ok = cudaMemcpyAsync(h, m.dl_stage, bytes, cudaMemcpyDeviceToHost, m.s_dl) == cudaSuccess &&
+                                     cudaEventRecord(m.dl_ev, m.s_dl) == cudaSuccess;
+                            }
+                            if (ok && pf_hand_dl_test() == 2 && j % 3 == 0) ok = false;   // (the check: the chunk's staging copy and download are queued)
+                            if (ok) {
+                                const core::OnDevice on_n(nm.device);
+                                bool up = cudaStreamWaitEvent(nm.s_in, nm.rin_free[b], 0) == cudaSuccess;
+                                if (np > 1) {   // piece i's upload waits (on the GPU) for piece i's download
+                                    for (int i = 0; up && i < np; ++i) {
+                                        int64_t r0 = 0, nr = 0;
+                                        handoff_piece(T, np, i, r0, nr);
+                                        if (nr > 0)
+                                            up = cudaStreamWaitEvent(nm.s_in, m.dl_pev[i], 0) == cudaSuccess &&
+                                                 cudaMemcpyAsync(nm.rin[b] + (size_t) r0 * D, h + (size_t) r0 * D, (size_t) nr * D * 4, cudaMemcpyHostToDevice, nm.s_in) == cudaSuccess;
+                                    }
+                                } else {
+                                    up = up && cudaStreamWaitEvent(nm.s_in, m.dl_ev, 0) == cudaSuccess &&
+                                         cudaMemcpyAsync(nm.rin[b], h, bytes, cudaMemcpyHostToDevice, nm.s_in) == cudaSuccess;
+                                }
+                                up = up && cudaEventRecord(nm.rin_ready[b], nm.s_in) == cudaSuccess;
+                                static std::atomic<int64_t> tried_up{0};   // (the check 3: counts attempts)
+                                ok = up && !(pf_hand_dl_test() == 3 && tried_up.fetch_add(1) % 4 == 3);
+                            }
+                            if (!ok) {   // not expected: whatever was queued ends, and this chunk goes down on the loop from R (cs is idle: the next chunk has not started)
+                                (void) cudaGetLastError();
+                                (void) cudaStreamSynchronize(m.s_dl);
+                                (void) cudaGetLastError();
+                                off_loop = false;
+                                --ha.n_dl;
+                                no_dl(3, "the download or the upload behind it could not be queued");
+                                { const core::OnDevice on(nm.device); (void) cudaEventSynchronize(nm.rin_ready[b]); }
+                                if (cudaMemcpyAsync(h, m.R, bytes, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess || cudaStreamSynchronize(m.cs) != cudaSuccess ||
+                                    !next_->hand_early_upload(h, (size_t) T * D, (size_t) nm.T * D, b)) {
+                                    err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
+                                    return false;
+                                }
+                            }
+                        }
                         if (!wait_taken(j)) return false;   // the one chunk of buffer: job j-1 has taken its rows
+                        g_wait_ms += ms_since(g_t);
+                        g_t = Clock::now();
                         if (ha.old_run.valid() && !ha.old_run.get()) {   // job j-2 has ended (the worker runs them in order)
                             err = ha.old_err && !ha.old_err->empty() ? *ha.old_err : std::string("prefill: a layer split's hand-off chunk failed");
                             return false;
@@ -6536,6 +6599,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             return r;
                         }));
+                        g_sub_ms += ms_since(g_t);
+                        g_t = Clock::now();
                         ++ha.seq;
                         ++ha.n_ahead;
                         ha.legacy = false;
@@ -6759,6 +6824,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         strata::kernels::ktime::print_line((long long) n, stage_dev);   // STRATA_PREFILL_TIMING=2: the kernels of select / attn / gdn recurrence
         std::fprintf(stderr, "strata prefill timing: %lld tokens, GPU timeline %.0f ms, wall %.0f ms, host staging %.0f ms:%s (CUDA%d)\n",
                      (long long) n, total, ms_since(t_start), stats_.ms_experts_host, line.c_str(), stage_dev);
+        std::fprintf(stderr, "strata prefill timing: host gaps (ms): before the first chunk's mark %.1f; after a chunk's GPU work: wait for the NVLink receiver's copy %.1f + NVLink copy %.1f, "
+                             "checkpoint callback %.1f, wait for the successor to take the chunk before %.1f, job submit %.1f, tail of the call %.1f (CUDA%d)\n",
+                     g_pre_ms, g_evw_ms, g_copy_ms, g_cb_ms, g_wait_ms, g_sub_ms, g_have ? ms_since(g_t) : 0.0, stage_dev);
         std::fprintf(stderr, "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
                              "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
