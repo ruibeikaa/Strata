@@ -249,7 +249,8 @@ bool on_device(const void* p) {
 // STRATA_PARK_TRACE: where conversation_kv_save's time goes since the park's begin (ms): the pointer-attribute
 // queries, the host buffer resizes and the copies (into the stage, or the synchronous ones).  Read by the park trace.
 struct KvSaveTrace { double attrs = 0, resize = 0, copy = 0; };
-KvSaveTrace& kv_save_trace() { static KvSaveTrace t; return t; }
+// (thread_local: STRATA_PARK_STAGES parks the stages on threads of their own; a save and the trace read of it are on one)
+KvSaveTrace& kv_save_trace() { static thread_local KvSaveTrace t; return t; }
 bool park_trace_on() {
     static const bool on = std::getenv("STRATA_PARK_TRACE") != nullptr;
     return on;
@@ -595,6 +596,9 @@ void conversation_kv_save_trace(double& attrs_ms, double& resize_ms, double& cop
 
 bool conversation_park_async_begin(size_t need) {
     if (park_trace_on()) kv_save_trace() = {};   // (the sums cover this park's saves)
+    // Off: nothing below runs for a park (no join is pending, and the fields it resets hold these values already).  First,
+    // so the stages that park on threads of their own (STRATA_PARK_STAGES) do not write the shared stage state.
+    if (!park_async_on()) return false;
     conversation_park_join();   // (the stage is reused)
     ParkAsync& a = park_async();
     a.active = false;

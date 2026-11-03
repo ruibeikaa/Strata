@@ -324,6 +324,76 @@ bool ckpt_threads_env() {
     }();
     return on;
 }
+// STRATA_PARK_STAGES=1 (read once; off by default): a layer split's park saves every stage's image at once - the first on the
+// request's thread, each later stage's on a thread of its own device (kept for the process: the copies' private streams are
+// per thread) - instead of one stage after the other.  A stage's image is the same capture of the same state (its device
+// bytes, its checkpoints' host copies); two stages on one board share the board's host link (3.3 GB/s) and the boards
+// do not, so the K/V and running-state downloads of the two boards overlap.  Not with STRATA_PARK_ASYNC or STRATA_CKPT_ASYNC
+// (one staging buffer for the process): the stages then park one after the other as before.
+bool park_stages_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PARK_STAGES");
+        return v && v[0] != '0';
+    }();
+    return on;
+}
+// STRATA_PARK_STAGES_VERIFY=1 (diagnostic, default off; prints and costs a second park): after a park the stages saved at once,
+// the same park is made again one stage after the other from the same device state and the two images are compared
+// byte for byte (the live state, the checkpoints, every K/V part of every stage)
+bool park_stages_verify_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PARK_STAGES_VERIFY");
+        return v && v[0] != '0';
+    }();
+    return on;
+}
+// the two parks' images compared (park_stages_verify_env): false with `why` at the first difference; `bytes` counts what
+// was compared.  `capture` and `used` are not compared: a capture number is process-unique, and the LRU stamp is the view's
+static bool park_images_equal(const strata::core::SavedConversation& a, const strata::core::SavedConversation& b,
+                              const std::string& at, std::string& why, size_t& bytes) {
+    auto differ = [&](const std::string& what) { why = at + what; return false; };
+    auto same_state = [&](const strata::core::ConversationCheckpoint& x, const strata::core::ConversationCheckpoint& y,
+                          const std::string& name) {
+        if (x.ids != y.ids) return differ(name + " ids");
+        if (!(x.imgs == y.imgs)) return differ(name + " imgs");
+        if (x.gdn != y.gdn) return differ(name + " gdn");
+        if (x.ple != y.ple) return differ(name + " ple");
+        if (x.tails != y.tails) return differ(name + " tails");
+        if (x.dead != y.dead) return differ(name + " dead");
+        if (x.block_pos != y.block_pos) return differ(name + " block_pos");
+        if (x.pinned != y.pinned) return differ(name + " pinned");
+        bytes += x.gdn.size() + x.ple.size() + x.tails.size() + x.dead.size() + x.block_pos.size();
+        return true;
+    };
+    if (a.geometry != b.geometry || a.layer_lo != b.layer_lo || a.layer_hi != b.layer_hi || a.cvec != b.cvec)
+        return differ("geometry / layers / cvec");
+    if (!same_state(a.live, b.live, "live")) return false;
+    if (a.checkpoints.size() != b.checkpoints.size()) return differ("checkpoint count");
+    for (size_t i = 0; i < a.checkpoints.size(); ++i) {
+        if (!same_state(a.checkpoints[i], b.checkpoints[i], "checkpoint " + std::to_string(i))) return false;
+        if (a.checkpoints[i].used != b.checkpoints[i].used) return differ("checkpoint " + std::to_string(i) + " used");
+    }
+    if (a.kv.size() != b.kv.size()) return differ("K/V layer count");
+    for (size_t i = 0; i < a.kv.size(); ++i) {
+        const strata::core::ConversationKv& x = a.kv[i];
+        const strata::core::ConversationKv& y = b.kv[i];
+        const std::string name = "K/V layer " + std::to_string(i) + " ";
+        if (x.format != y.format || x.cells != y.cells || x.heads != y.heads || x.head_dim != y.head_dim ||
+            x.page_size != y.page_size || x.pooled_rows != y.pooled_rows || x.idx_dim != y.idx_dim)
+            return differ(name + "geometry");
+        if (!(x.k == y.k)) return differ(name + "k");
+        if (!(x.v == y.v)) return differ(name + "v");
+        if (!(x.k_scale == y.k_scale)) return differ(name + "k_scale");
+        if (!(x.v_scale == y.v_scale)) return differ(name + "v_scale");
+        if (!(x.pooled == y.pooled)) return differ(name + "pooled");
+        bytes += x.k.size() + x.v.size() + x.k_scale.size() + x.v_scale.size() + x.pooled.size();
+    }
+    if (a.stage_images.size() != b.stage_images.size()) return differ("stage image count");
+    for (size_t i = 0; i < a.stage_images.size(); ++i)
+        if (!park_images_equal(a.stage_images[i], b.stage_images[i], at + "stage " + std::to_string(i + 1) + ": ", why, bytes))
+            return false;
+    return true;
+}
 // STRATA_SLOT_CKPT_MOVE=1 (read once; off by default): a batch admission MOVES its own turn checkpoint into the slot
 // instead of copying it (~112 MB of host vectors).  The main session's chain no longer holds it, so the request path
 // looks for it in the slots' checkpoints too: while the main session's cells still hold its tokens it is restored there
@@ -11165,6 +11235,7 @@ int main(int argc, char** argv) {
         if (park_reuse)
             std::fprintf(stderr, "strata serve: STRATA_CKPT_PARK_REUSE=1: a park moves the checkpoint buffers it already "
                                  "holds (superseded copies, an outgoing chain) instead of copying them\n");
+        StageThreads park_threads;   // STRATA_PARK_STAGES: the later stages' images of a park (started on first use)
         auto park_source = [&](const ParkSource& src, size_t held, bool consume) -> bool {
             const auto tk0 = Clock::now();
             struct ParkClock {   // STRATA_CKPT_TIMING: the whole park, whichever way it returns
@@ -11390,6 +11461,56 @@ int main(int argc, char** argv) {
                     checks.erase(checks.begin() + (std::ptrdiff_t) w, checks.end());
                 }
                 if (park_reuse && consume) merge_back.clear = true;   // from here on the chain's buffers may move
+                // STRATA_PARK_STAGES: every stage's image at once (see park_stages_env); not with the shared staging buffers
+                const bool at_once = n_st > 0 && park_stages_env() && !park_async_env() &&
+                                     std::getenv("STRATA_CKPT_ASYNC") == nullptr;
+                // (STRATA_PARK_STAGES_VERIFY: the images below are compared with a second park of the same state; a
+                // consumed chain has gone into the first, so only a park that leaves the view whole can be made twice)
+                const bool verify = at_once && park_stages_verify_env() && !consume;
+                if (at_once) {
+                    const size_t nj = n_st + 1;   // job 0: stage 0 (this thread); job k: stages[k - 1], on its own thread
+                    std::vector<strata::core::SavedConversation> parts(nj);
+                    std::vector<std::string> why(nj);
+                    std::vector<char> ok(nj, 0);
+                    std::vector<size_t> rb(nj, 0);
+                    std::vector<double> job_ms(nj, 0.0);
+                    std::vector<std::exception_ptr> thrown(nj);
+                    const Clock::time_point tj = Clock::now();
+                    const std::function<void(size_t)> job = [&](size_t k) {
+                        try {
+                            const Clock::time_point j0 = Clock::now();
+                            if (k == 0) {
+                                ok[0] = strata::core::conversation_snapshot_save(parts[0], view, src.session, g, draft0, why[0],
+                                        std::move(reuse), &rb[0], nullptr, nullptr, park_reuse ? &src0 : nullptr, true);
+                            } else {
+                                auto& st = stages[k - 1];
+                                const strata::core::OnDevice on(st->dev);
+                                if (cudaDeviceSynchronize() != cudaSuccess) { why[k] = "stage sync failed"; return; }
+                                const strata::core::ConversationView view_k{src.ids, src.imgs, cs.parts[k - 1], src.cvec};
+                                ok[k] = strata::core::conversation_snapshot_save(parts[k], view_k, *src.stage_sessions[k - 1], g,
+                                        draft_of(k - 1), why[k], std::move(stage_reuse[k - 1]), &rb[k], nullptr, nullptr,
+                                        park_reuse ? &src_k[k - 1] : nullptr, true);
+                            }
+                            job_ms[k] = ms_since(j0);
+                        } catch (...) {
+                            thrown[k] = std::current_exception();
+                        }
+                    };
+                    park_threads.run(nj, job);
+                    if (std::getenv("STRATA_PARK_TRACE") != nullptr) {
+                        std::string each;
+                        for (size_t k = 0; k < nj; ++k) { char b[32]; std::snprintf(b, sizeof b, " %.1f", job_ms[k]); each += b; }
+                        std::fprintf(stderr, "strata parktrace: %zu stages at once: wall %.1f ms, each%s ms\n", nj, ms_since(tj), each.c_str());
+                    }
+                    for (size_t k = 0; k < nj; ++k)
+                        if (thrown[k]) std::rethrow_exception(thrown[k]);   // (the bad_alloc below: nothing was published)
+                    for (size_t k = 0; k < nj; ++k)
+                        if (!ok[k]) { err = why[k]; return false; }
+                    for (size_t k = 0; k < nj; ++k) reused_bytes += rb[k];
+                    image = std::move(parts[0]);
+                    for (size_t k = 1; k < nj; ++k) image.stage_images.push_back(std::move(parts[k]));
+                    pool_topup();   // (returns at once with a layer split)
+                } else {
                 const bool saved = strata::core::conversation_snapshot_save(image, view, src.session, g, draft0, err,
                         std::move(reuse), &reused_bytes, storage.empty() ? nullptr : &storage,
                         moved.empty() ? nullptr : &moved, park_reuse ? &src0 : nullptr);
@@ -11407,6 +11528,32 @@ int main(int argc, char** argv) {
                             park_reuse ? &src_k[k] : nullptr))
                         return false;
                     image.stage_images.push_back(std::move(part));
+                }
+                }
+                if (verify) {
+                    // the same park again, one stage after the other, with no retained K/V and no harvest: a plain capture
+                    // of the device state (which the park did not change) and of the view's checkpoints
+                    const Clock::time_point tv = Clock::now();
+                    strata::core::SavedConversation ref;
+                    std::string vwhy;
+                    bool vok = strata::core::conversation_snapshot_save(ref, view, src.session, g, draft0, vwhy);
+                    for (size_t k = 0; vok && k < n_st; ++k) {
+                        const strata::core::OnDevice on(stages[k]->dev);
+                        if (cudaDeviceSynchronize() != cudaSuccess) { vwhy = "stage sync failed"; vok = false; break; }
+                        const strata::core::ConversationView view_k{src.ids, src.imgs, cs.parts[k], src.cvec};
+                        strata::core::SavedConversation part;
+                        vok = strata::core::conversation_snapshot_save(part, view_k, *src.stage_sessions[k], g, draft_of(k), vwhy);
+                        if (vok) ref.stage_images.push_back(std::move(part));
+                    }
+                    size_t cmp_bytes = 0;
+                    if (!vok)
+                        std::fprintf(stderr, "strata serve: STRATA_PARK_STAGES_VERIFY: the reference park failed (%s)\n", vwhy.c_str());
+                    else if (park_images_equal(image, ref, "", vwhy, cmp_bytes))
+                        std::fprintf(stderr, "strata serve: STRATA_PARK_STAGES_VERIFY: the image of the park (%zu stages at once, %zu "
+                                             "tokens) equals the one-after-the-other park byte for byte: %zu bytes compared "
+                                             "(reference park %.1f ms)\n", n_st + 1, src.ids.size(), cmp_bytes, ms_since(tv));
+                    else
+                        std::fprintf(stderr, "strata serve: STRATA_PARK_STAGES_VERIFY: DIFFERS: %s\n", vwhy.c_str());
                 }
                 if (ckpt_timing) {
                     ckt.save_ms += ms_since(t0);

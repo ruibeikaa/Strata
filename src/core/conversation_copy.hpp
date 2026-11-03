@@ -258,42 +258,54 @@ inline bool same_state_shape(const ConversationCheckpoint& a, const Conversation
 /// STRATA_CKPT_PARK_REUSE: copy_checkpoints_beating, except that a checkpoint whose bytes `src` already holds
 /// (ConversationParkSource) has its buffers moved in.  The result equals the copy: the metadata is copied from the
 /// view's checkpoint as copy_checkpoint_beating copies it, and moved buffers hold the same bytes (the same capture).
+/// STRATA_PARK_STAGES: a layer split's stages park at once, each on a thread, and the harvest is one vector they all
+/// search and take buffers from (each stage's own `src`, view and consume list stay its own).  The search and the move
+/// of a matched checkpoint's buffers (a few pointer swaps) are under this lock; the copy of an unmatched one is not.
+/// Uncontended (and the same code) when the stages park one after the other.
+inline std::mutex& park_harvest_mutex() {
+    static std::mutex m;
+    return m;
+}
+
 inline std::vector<ConversationCheckpoint> park_checkpoints(const std::vector<ConversationCheckpoint>& cs,
                                                             ConversationParkSource& src) {
     std::vector<ConversationCheckpoint> out;
     out.reserve(cs.size());
     for (size_t i = 0; i < cs.size(); ++i) {
         const ConversationCheckpoint& c = cs[i];
-        ConversationCheckpoint* from = nullptr;
-        if (src.harvest != nullptr && c.capture != 0)
-            for (auto& h : *src.harvest)
-                if (h.capture == c.capture && !h.gdn.empty() && same_state_shape(h, c) && h.ids == c.ids &&
-                    h.imgs == c.imgs) { from = &h; break; }
-        if (from == nullptr && src.consume != nullptr && src.consume->size() == cs.size() &&
-            &(*src.consume)[i] == &c && c.stage_parts.empty())
-            from = &(*src.consume)[i];
-        if (from == nullptr) {
-            out.push_back(copy_checkpoint_beating(c));
-            ++src.copied;
-            continue;
+        {
+            std::lock_guard<std::mutex> lk(park_harvest_mutex());
+            ConversationCheckpoint* from = nullptr;
+            if (src.harvest != nullptr && c.capture != 0)
+                for (auto& h : *src.harvest)
+                    if (h.capture == c.capture && !h.gdn.empty() && same_state_shape(h, c) && h.ids == c.ids &&
+                        h.imgs == c.imgs) { from = &h; break; }
+            if (from == nullptr && src.consume != nullptr && src.consume->size() == cs.size() &&
+                &(*src.consume)[i] == &c && c.stage_parts.empty())
+                from = &(*src.consume)[i];
+            if (from != nullptr) {
+                ConversationCheckpoint o;
+                o.ids = c.ids;
+                o.imgs = c.imgs;
+                o.used = c.used;
+                o.pinned = c.pinned;
+                o.capture = c.capture;
+                // (a consumed checkpoint is `c` itself: its metadata is copied above, before its buffers move)
+                o.gdn = std::move(from->gdn);
+                o.ple = std::move(from->ple);
+                o.tails = std::move(from->tails);
+                o.dead = std::move(from->dead);
+                o.block_pos = std::move(from->block_pos);
+                from->gdn.clear(); from->ple.clear(); from->tails.clear(); from->dead.clear(); from->block_pos.clear();
+                ++src.moved;
+                src.moved_bytes += checkpoint_state_bytes(o);
+                core::progress_beat();
+                out.push_back(std::move(o));
+                continue;
+            }
         }
-        ConversationCheckpoint o;
-        o.ids = c.ids;
-        o.imgs = c.imgs;
-        o.used = c.used;
-        o.pinned = c.pinned;
-        o.capture = c.capture;
-        // (a consumed checkpoint is `c` itself: its metadata is copied above, before its buffers move)
-        o.gdn = std::move(from->gdn);
-        o.ple = std::move(from->ple);
-        o.tails = std::move(from->tails);
-        o.dead = std::move(from->dead);
-        o.block_pos = std::move(from->block_pos);
-        from->gdn.clear(); from->ple.clear(); from->tails.clear(); from->dead.clear(); from->block_pos.clear();
-        ++src.moved;
-        src.moved_bytes += checkpoint_state_bytes(o);
-        core::progress_beat();
-        out.push_back(std::move(o));
+        out.push_back(copy_checkpoint_beating(c));
+        ++src.copied;
     }
     return out;
 }

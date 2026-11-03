@@ -183,12 +183,15 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 // copies go into (their pages are in: no fresh pages to fault); the ones not used are left in it.
 // `moved` (optional): checkpoints the caller drops after this, moved into the image after the copies of the view's
 // (the image holds the same checkpoints as with all of them in the view; nothing is copied for these)
+// `overlap_checkpoints` (STRATA_PARK_STAGES): the host copies of the view's checkpoints run on a thread of their own
+// while the running state and the K/V come down from the device (they read no device memory; the link is idle while
+// they run otherwise), and are in the image, in the same order, when this returns.
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view, const SessionState& session,
                                 const ModelGeometry& g, const QsaState* draft, std::string& error,
                                 ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr,
                                 std::vector<ConversationCheckpoint>* storage = nullptr,
                                 std::vector<ConversationCheckpoint>* moved = nullptr,
-                                ConversationParkSource* source = nullptr);
+                                ConversationParkSource* source = nullptr, bool overlap_checkpoints = false);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,

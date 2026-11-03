@@ -522,7 +522,8 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                 const QsaState* draft, std::string& error,
                                 ConversationKvReuse reuse, size_t* reused_bytes,
                                 std::vector<ConversationCheckpoint>* storage,
-                                std::vector<ConversationCheckpoint>* moved, ConversationParkSource* source) {
+                                std::vector<ConversationCheckpoint>* moved, ConversationParkSource* source,
+                                bool overlap_checkpoints) {
     static const bool ptr = std::getenv("STRATA_PARK_TRACE") != nullptr;
     auto now = [] { return std::chrono::steady_clock::now(); };
     auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
@@ -546,13 +547,30 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     const auto p1 = now();
     captured.cvec = view.cvec;
     // STRATA_CKPT_PARK_REUSE: the checkpoints' buffers moved from what the park holds already (ConversationParkSource)
-    captured.checkpoints = source != nullptr ? conversation_detail::park_checkpoints(view.checkpoints, *source)
-                                             : conversation_detail::copy_checkpoints_beating(view.checkpoints, storage);
-    if (moved != nullptr)
-        for (auto& c : *moved) {
-            conversation_checkpoint_join(c.gdn.data());
-            captured.checkpoints.push_back(std::move(c));
-        }
+    auto copy_checkpoints = [&] {
+        return source != nullptr ? conversation_detail::park_checkpoints(view.checkpoints, *source)
+                                 : conversation_detail::copy_checkpoints_beating(view.checkpoints, storage);
+    };
+    // STRATA_PARK_STAGES: the copies are host to host (nothing of the device is read), so they go on beside the downloads
+    // below; the image gets them, then the moved ones, exactly as when they are made here (`get` is also where a failed
+    // allocation shows, as it did here)
+    std::future<std::vector<ConversationCheckpoint>> checkpoint_copies;
+    if (overlap_checkpoints && !view.checkpoints.empty())
+        checkpoint_copies = std::async(std::launch::async, [&] {
+            conversation_detail::background_thread_placement();
+            return copy_checkpoints();
+        });
+    else
+        captured.checkpoints = copy_checkpoints();
+    auto finish_checkpoints = [&] {
+        if (checkpoint_copies.valid()) captured.checkpoints = checkpoint_copies.get();
+        if (moved != nullptr)
+            for (auto& c : *moved) {
+                conversation_checkpoint_join(c.gdn.data());
+                captured.checkpoints.push_back(std::move(c));
+            }
+    };
+    if (!checkpoint_copies.valid()) finish_checkpoints();
     const auto p2 = now();
     const int64_t unchanged = reuse.kv.empty() ? 0 : reuse.unchanged_tokens;
     captured.kv = std::move(reuse.kv);
@@ -603,6 +621,12 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     // reached. Refresh that page even when the main prefix continued unchanged.
     if (draft && !conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error,
                                        std::max<int64_t>(0, unchanged - 1), reused_bytes)) return false;
+    if (checkpoint_copies.valid()) {   // (STRATA_PARK_STAGES) the host copies made beside the downloads
+        const auto w0 = now();
+        finish_checkpoints();
+        if (ptr) std::fprintf(stderr, "strata parktrace: %zu checkpoints copied beside the downloads, waited %.1f ms for them\n",
+                              captured.checkpoints.size(), ms(w0, now()));
+    }
     abandon.on = false;
     if (staged && !conversation_park_async_launch(error)) return false;
     if (staged) {
