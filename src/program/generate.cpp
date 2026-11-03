@@ -2103,6 +2103,14 @@ ConvStateSizes conv_state_sizes(const strata::core::ModelGeometry& g, const stra
     return z;
 }
 
+/// STRATA_CKPT_STAGE_ASYNC / STRATA_CKPT_ASYNC: waits for the copies into a checkpoint's running-state vectors (and its stage
+/// parts') - before the checkpoint is dropped, so no copy still writes into freed memory.  Readers call it through
+/// conversation_checkpoint_join as before.  A no-op without those switches (nothing is in flight).
+void join_checkpoint(const ConvCheckpoint& c) {
+    if (!c.gdn.empty()) strata::core::conversation_checkpoint_join(c.gdn.data());
+    for (const ConvCheckpoint& part : c.stage_parts) join_checkpoint(part);
+}
+
 /// Copies the running state out (this session's carve only).  The caller has synchronized the device.
 bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
     std::string error;
@@ -11053,6 +11061,9 @@ int main(int argc, char** argv) {
         // a reporter's prompts failed there every time and passed with --short-read 0.
         bool nf_prompt_windows = false, short_read_off_once = false;
         std::vector<ConvCheckpoint> checks;
+        // STRATA_CKPT_STAGE_ASYNC: no copy is still writing into a checkpoint's vector when the chain goes (declared after
+        // `checks`, so it runs first)
+        struct CkptJoinAtExit { ~CkptJoinAtExit() { strata::core::conversation_checkpoint_join(nullptr); } } ckpt_join_at_exit;
         // KVA: which prefixes of token ids a KVA read approximated, so the draft layer knows, for whatever state a request
         // continues from, the first cell built from a real row (kva_floor.hpp).  Empty without KVA.
         strata::prefill::KvaFloorRegistry kva_floors;
@@ -11236,8 +11247,11 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: STRATA_CKPT_PARK_REUSE=1: a park moves the checkpoint buffers it already "
                                  "holds (superseded copies, an outgoing chain) instead of copying them\n");
         StageThreads park_threads;   // STRATA_PARK_STAGES: the later stages' images of a park (started on first use)
+        Clock::time_point req_r0 = Clock::now();   // the request's arrival (r0 below), for STRATA_TRACE's park line
         auto park_source = [&](const ParkSource& src, size_t held, bool consume) -> bool {
             const auto tk0 = Clock::now();
+            if (std::getenv("STRATA_TRACE") != nullptr)
+                std::fprintf(stderr, "strata trace: the park starts %.1f ms after the request's arrival\n", ms_since(req_r0));
             struct ParkClock {   // STRATA_CKPT_TIMING: the whole park, whichever way it returns
                 bool on; CkptTiming& t; Clock::time_point t0;
                 ~ParkClock() {
@@ -11405,6 +11419,9 @@ int main(int argc, char** argv) {
                 return true;
             }
             const auto t0 = Clock::now();
+            if (std::getenv("STRATA_TRACE") != nullptr)
+                std::fprintf(stderr, "strata trace: the park's set-up (superseded copies, split, byte estimates, room) took %.1f ms\n",
+                             std::chrono::duration<double, std::milli>(t0 - tk0).count());
             try {
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
                 const size_t retained = reuse.bytes() + stage_retained + reuse_bytes;   // (reuse_bytes: 0 without the switch)
@@ -11785,6 +11802,7 @@ int main(int argc, char** argv) {
             if (as_tail) {   // only one tail checkpoint stays alive: the previous request's goes
                 const int64_t old_tail = tail_ckpt_len;
                 auto old = [&](const ConvCheckpoint& k) { return old_tail >= 0 && (int64_t) k.ids.size() == old_tail; };
+                for (const ConvCheckpoint& k : checks) if (old(k)) join_checkpoint(k);   // (STRATA_CKPT_STAGE_ASYNC)
                 if (ckpt_pool.on())
                     ckpt_pool.erase_if(checks, old);
                 else
@@ -11826,6 +11844,7 @@ int main(int argc, char** argv) {
                                                                  o.prompt_cache, tail_flags.get(), pin_flags.get())
                     : strata::program::conv_cache::eviction_victim(stamps.data(), stamps.size(), o.prompt_cache,
                                                                    tail_flags.get(), pin_flags.get());
+                join_checkpoint(checks[victim]);   // (STRATA_CKPT_STAGE_ASYNC: before it is freed)
                 ckpt_pool.give(std::move(checks[victim]));   // (STRATA_CKPT_POOL; else nothing)
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
             }
@@ -11930,10 +11949,18 @@ int main(int argc, char** argv) {
                 bool saved = false;
                 if (multi_gpu) {   // the stages' parts, saved when each of them read this chunk
                     std::vector<ConvCheckpoint> parts;
+                    // (STRATA_CKPT_STAGE_ASYNC: a part still being filled is waited for before it is freed: the sets it
+                    // leaves behind, and `parts` if the checkpoint is not made from them)
+                    struct JoinParts {
+                        std::vector<ConvCheckpoint>& v;
+                        ~JoinParts() { for (const ConvCheckpoint& p : v) join_checkpoint(p); }
+                    } join_parts{parts};
                     {
                         std::lock_guard<std::mutex> lk(part_mu);
                         auto it = part_at.find(done);
                         if (it != part_at.end()) parts = std::move(it->second);
+                        for (auto jt = part_at.begin(); jt != part_at.upper_bound(done); ++jt)
+                            for (const ConvCheckpoint& p : jt->second) join_checkpoint(p);
                         part_at.erase(part_at.begin(), part_at.upper_bound(done));
                     }
                     bool complete = parts.size() == stages.size() + 1;
@@ -15365,6 +15392,7 @@ int main(int argc, char** argv) {
             }
             cur = ids;
             const Clock::time_point r0 = Clock::now();
+            req_r0 = r0;
             tr("r0");
             ckt = CkptTiming{};   // STRATA_CKPT_TIMING: this request's park and checkpoints
             strata::core::conversation_checkpoint_join(nullptr);   // STRATA_CKPT_ASYNC: the last save's copy has landed
@@ -15386,6 +15414,7 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            tr("commit done");
             if (o.prefill_head_alias && native_head.loaded()) {
                 const auto head_t0 = Clock::now();
                 native_head.unload();
@@ -15405,6 +15434,7 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                     return 1;
                 }
+                tr("K/V ensured", (long long) n);
             }
             nf_hit = false;
             // #879: an earlier window met non-finite logits.  The poison sits in a conversation's K/V and recurrent
@@ -15445,6 +15475,7 @@ int main(int argc, char** argv) {
                              n_checks == 1 ? "" : "s", n_parked, n_parked == 1 ? "" : "s", n_slots,
                              n_slots == 1 ? "" : "s", n_running, n_running == 1 ? "" : "s");
             }
+            tr("before the resume search");
             int64_t resume = 0;
             bool from_live = false;
             if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
@@ -15541,7 +15572,9 @@ int main(int argc, char** argv) {
                                  k + 1, (long long) (k < now.size() ? now[k].start : -1));
                 }
             }
+            tr("before the cache lookup");
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
+            tr("after the cache lookup");
             std::optional<strata::core::SavedConversation> incoming;
             // A checkpoint inside ANOTHER parked conversation (a sibling subagent's system prompt and tools, say) is
             // borrowed: its K/V up to there and the checkpoint come over, and that conversation stays parked for its
@@ -15688,6 +15721,7 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            tr("the park returned");
             if (slot_source >= 0) {
                 lent_slot = -1;   // (a longer start than the main session's)
                 const auto t0 = Clock::now();
@@ -15901,15 +15935,36 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
+            tr("the old chain dropped");
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
             if (resume == 0) {
+                // STRATA_ZERO_AT_ONCE=1 (read once; off by default): every stage's memsets (R, the recurrent state, the whole K/V
+                // pool and the indexer arrays: ~3.4 GB a die at --max-context 1M, 8 ms at the HBM's speed) are queued first and
+                // the streams synchronized after, so the four dies zero at the same time instead of one after the other
+                // (stage 0 + 3 x 8 ms).  The same memsets on the same streams, each stage's before anything else is queued on it.
+                static const bool zero_at_once = [] { const char* v = std::getenv("STRATA_ZERO_AT_ONCE"); return v && v[0] != '0'; }();
                 strata::core::session_zero(ss, g, nullptr, main_cs);
+                if (zero_at_once) {
+                    for (auto& st : stages) {
+                        const strata::core::OnDevice on(st->dev);
+                        strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
+                    }
+                    cudaStreamSynchronize(main_stream);
+                    tr("stage 0 zeroed");
+                    for (auto& st : stages) {
+                        const strata::core::OnDevice on(st->dev);
+                        cudaStreamSynchronize(st->stream);
+                    }
+                } else {
                 cudaStreamSynchronize(main_stream);
+                tr("stage 0 zeroed");
                 for (auto& st : stages) {
                     const strata::core::OnDevice on(st->dev);
                     strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
                     cudaStreamSynchronize(st->stream);
                 }
+                }
+                tr("the later stages zeroed");
                 checks.clear();
             } else if (!from_live) {
                 ConvCheckpoint* c = nullptr;

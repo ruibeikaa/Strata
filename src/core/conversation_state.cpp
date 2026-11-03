@@ -10,8 +10,12 @@
 #include <cstring>
 #include <future>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <limits>
 #include <mutex>
+#include <thread>
+#include <vector>
 
 namespace strata::core {
 namespace {
@@ -268,9 +272,183 @@ int ckpt_gather_small(ConversationCheckpoint& c, const SessionState& ss, const C
     if (block_pos) std::memcpy(c.block_pos.data(), h + ple + tails + dead, block_pos);
     return 1;
 }
+// ---- STRATA_CKPT_STAGE_ASYNC=1 (CUDA, opt-in): a checkpoint's running state (the GDN bytes, 28.5 MiB a stage) comes down off the
+// caller's loop, on every device at once.  The caller takes a device-to-device snapshot of it (0.1 ms; nothing the chunk after
+// writes can reach the snapshot, so nothing needs to wait for the copy), hands the checkpoint's host vector to that device's
+// worker, and goes on; the worker moves the snapshot to the host in 4 MiB pieces through two pinned buffers (the DMA of one
+// piece overlaps the copy of the one before into the vector) and then takes the vector of the NEXT checkpoint ready (sized and
+// faulted in), so the caller does not pay the zero-fill of a fresh 28.5 MiB vector either.  Every reader of a checkpoint's
+// bytes already calls conversation_checkpoint_join(c.gdn.data()) first (STRATA_CKPT_ASYNC's protocol), which now also waits
+// for the worker's copy into that vector.  Unlike STRATA_CKPT_ASYNC (one staging buffer, one pending copy for the process, a
+// thread per copy) this has one of everything per device, so a layer split's stages do not wait for each other.
+// The same bytes: the snapshot is a copy of the state the synchronous path copies out, taken at the same moment.
+bool ckpt_side_on() {
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
+    return false;
+#else
+    static const bool on = [] { const char* v = std::getenv("STRATA_CKPT_STAGE_ASYNC"); return v != nullptr && v[0] != '0'; }();
+    return on;
+#endif
+}
+struct SideJob { const uint8_t* stage; uint8_t* dst; size_t n; int slot; };
+struct SideCkpt {
+    static constexpr int kSlots = 2;
+    static constexpr size_t kPiece = (size_t) 4 << 20;
+    int dev = 0;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<SideJob> queue;            // handed over, not started
+    std::vector<const void*> active;      // the vectors (data()) queued or being filled
+    void* stage[kSlots] = {nullptr, nullptr};
+    bool busy[kSlots] = {false, false};
+    size_t cap = 0;
+    void* host[2] = {nullptr, nullptr};   // pinned pieces
+    cudaStream_t stream = nullptr;
+    cudaEvent_t ev[2] = {nullptr, nullptr};
+    bool started = false, broken = false;
+    std::vector<uint8_t> ready;           // the next checkpoint's GDN vector: sized, pages in
+    size_t ready_n = 0;
+};
+// leaked on purpose: a worker may run after the statics are gone
+std::mutex& side_registry_mu() { static std::mutex* m = new std::mutex; return *m; }
+std::vector<SideCkpt*>& side_registry() { static auto* v = new std::vector<SideCkpt*>; return *v; }
+SideCkpt& side_for(int dev) {
+    std::lock_guard<std::mutex> lk(side_registry_mu());
+    for (SideCkpt* s : side_registry()) if (s->dev == dev) return *s;
+    SideCkpt* s = new SideCkpt;
+    s->dev = dev;
+    side_registry().push_back(s);
+    return *s;
+}
+void side_join(const void* only) {
+    std::vector<SideCkpt*> all;
+    {
+        std::lock_guard<std::mutex> lk(side_registry_mu());
+        all = side_registry();
+    }
+    for (SideCkpt* s : all) {
+        std::unique_lock<std::mutex> lk(s->mu);
+        s->cv.wait(lk, [&] {
+            return only == nullptr ? s->active.empty()
+                                   : std::find(s->active.begin(), s->active.end(), only) == s->active.end();
+        });
+    }
+}
+// one job: the snapshot to the host vector.  false: a CUDA call failed (the caller retries the copy synchronously).
+cudaError_t side_run(SideCkpt& s, const SideJob& j) {
+    cudaError_t e = cudaSuccess;
+    struct Held { uint8_t* dst; size_t n; } held[2] = {{nullptr, 0}, {nullptr, 0}};
+    auto land = [&](int k) {
+        if (held[k].dst == nullptr || e != cudaSuccess) return;
+        e = cudaEventSynchronize(s.ev[k]);
+        if (e == cudaSuccess) std::memcpy(held[k].dst, s.host[k], held[k].n);
+        held[k] = {nullptr, 0};
+    };
+    int b = 0;
+    for (size_t o = 0; e == cudaSuccess && o < j.n; o += SideCkpt::kPiece) {
+        const size_t k = std::min(SideCkpt::kPiece, j.n - o);
+        land(b);
+        if (e == cudaSuccess) e = cudaMemcpyAsync(s.host[b], j.stage + o, k, cudaMemcpyDeviceToHost, s.stream);
+        if (e == cudaSuccess) e = cudaEventRecord(s.ev[b], s.stream);
+        if (e == cudaSuccess) held[b] = {j.dst + o, k};
+        b ^= 1;
+    }
+    land(b);
+    land(b ^ 1);
+    return e;
+}
+void side_worker(SideCkpt* s) {
+    conversation_detail::background_thread_placement();
+    (void) cudaSetDevice(s->dev);
+    static const bool atr = std::getenv("STRATA_PARK_TRACE") != nullptr;
+    for (;;) {
+        SideJob j;
+        {
+            std::unique_lock<std::mutex> lk(s->mu);
+            s->cv.wait(lk, [&] { return !s->queue.empty(); });
+            j = s->queue.front();
+            s->queue.pop_front();
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        cudaError_t e = side_run(*s, j);
+        if (e != cudaSuccess) {   // the snapshot is still on the device: the same bytes, the plain way
+            (void) cudaGetLastError();
+            const cudaError_t e2 = cudaMemcpy(j.dst, j.stage, j.n, cudaMemcpyDeviceToHost);
+            if (e2 != cudaSuccess)
+                std::fprintf(stderr, "strata: STRATA_CKPT_STAGE_ASYNC: a checkpoint copy failed on CUDA%d (%s, then %s)\n", s->dev,
+                             cudaGetErrorString(e), cudaGetErrorString(e2));
+            (void) cudaGetLastError();
+        }
+        if (atr) std::fprintf(stderr, "strata parktrace: side ckpt CUDA%d: %.2f ms in the background\n", s->dev,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        size_t refill = 0;
+        {
+            std::lock_guard<std::mutex> lk(s->mu);
+            s->active.erase(std::find(s->active.begin(), s->active.end(), (const void*) j.dst));
+            s->busy[j.slot] = false;
+            if (s->ready.empty()) refill = s->ready_n;
+        }
+        s->cv.notify_all();
+        if (refill) {   // the next checkpoint's vector, zero-filled here instead of on the stage's loop
+            std::vector<uint8_t> v(refill);
+            std::lock_guard<std::mutex> lk(s->mu);
+            if (s->ready.empty()) s->ready = std::move(v);
+        }
+    }
+}
+// the device's snapshot buffers, pinned pieces, stream and worker for GDN states of `n` bytes; false: not available (the
+// plain copy is used).  Runs on a thread whose current device is s.dev.
+bool side_prepare(SideCkpt& s, size_t n) {
+    std::unique_lock<std::mutex> lk(s.mu);
+    if (s.broken) return false;
+    if (s.cap != n) {
+        s.cv.wait(lk, [&] { return s.active.empty(); });
+        for (void*& p : s.stage) if (p) { (void) cudaFree(p); p = nullptr; }
+        size_t fr = 0, tot = 0;
+        bool ok = cudaMemGetInfo(&fr, &tot) == cudaSuccess && fr >= 2 * n + ((size_t) 1 << 29);
+        for (int i = 0; ok && i < SideCkpt::kSlots; ++i) ok = cudaMalloc(&s.stage[i], n) == cudaSuccess;
+        if (!ok) {
+            for (void*& p : s.stage) if (p) { (void) cudaFree(p); p = nullptr; }
+            (void) cudaGetLastError();
+            s.broken = true;
+            std::fprintf(stderr, "strata: STRATA_CKPT_STAGE_ASYNC: no room for the snapshot buffers on CUDA%d; its checkpoints are copied as before\n", s.dev);
+            return false;
+        }
+        s.cap = n;
+        s.ready.clear();
+        s.ready.shrink_to_fit();
+    }
+    s.ready_n = n;
+    if (s.stream == nullptr) {
+        bool ok = cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking) == cudaSuccess &&
+                  cudaMallocHost(&s.host[0], SideCkpt::kPiece) == cudaSuccess &&
+                  cudaMallocHost(&s.host[1], SideCkpt::kPiece) == cudaSuccess;
+        for (int i = 0; ok && i < 2; ++i)
+            ok = cudaEventCreateWithFlags(&s.ev[i], cudaEventDisableTiming | cudaEventBlockingSync) == cudaSuccess;
+        if (!ok) {
+            (void) cudaGetLastError();
+            s.broken = true;
+            std::fprintf(stderr, "strata: STRATA_CKPT_STAGE_ASYNC: the copy stream of CUDA%d failed; its checkpoints are copied as before\n", s.dev);
+            return false;
+        }
+    }
+    if (!s.started) {
+        s.started = true;
+        std::thread(side_worker, &s).detach();
+    }
+    return true;
+}
+void side_release_slot(SideCkpt& s, int slot) {
+    {
+        std::lock_guard<std::mutex> lk(s.mu);
+        s.busy[slot] = false;
+    }
+    s.cv.notify_all();
+}
 }  // namespace
 
-void conversation_checkpoint_join(const void* only) {
+// STRATA_CKPT_ASYNC's one pending copy
+static void ckpt_async_join(const void* only) {
     CkptAsync& a = ckpt_async();
     std::lock_guard<std::mutex> lk(a.mu);
     if (a.pending.valid() && (only == nullptr || only == a.dst)) {
@@ -279,16 +457,75 @@ void conversation_checkpoint_join(const void* only) {
     }
 }
 
+void conversation_checkpoint_join(const void* only) {
+    ckpt_async_join(only);
+    if (ckpt_side_on()) side_join(only);   // STRATA_CKPT_STAGE_ASYNC: the per-device workers' copies
+}
+
+namespace {
+// checkpoint_save for a device with the side copy (STRATA_CKPT_STAGE_ASYNC): everything but the GDN bytes as the plain path,
+// those from a device snapshot by the device's worker.  The job is handed over last, after every call that can fail, so a
+// failed save leaves no copy running into a vector the caller is about to drop.
+bool checkpoint_save_side(SideCkpt& s, ConversationCheckpoint& c, const SessionState& ss, const ConversationStateSizes& z,
+                          size_t layers, std::string& error) {
+    static const bool atr = std::getenv("STRATA_PARK_TRACE") != nullptr;
+    const auto r0 = std::chrono::steady_clock::now();
+    c.dev_tag = 0;
+    const size_t n = z.gdn;
+    if (c.gdn.size() != n) {
+        std::vector<uint8_t> v;
+        {
+            std::lock_guard<std::mutex> lk(s.mu);
+            if (s.ready.size() == n) v = std::move(s.ready);
+            s.ready.clear();
+        }
+        if (v.size() == n) c.gdn = std::move(v);
+        else c.gdn.resize(n);
+    }
+    c.ple.resize(ss.ple_hist ? z.ple : 0);
+    c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
+    int slot = -1;
+    {
+        std::unique_lock<std::mutex> lk(s.mu);
+        s.cv.wait(lk, [&] {
+            for (int i = 0; i < SideCkpt::kSlots; ++i) if (!s.busy[i]) { slot = i; return true; }
+            return false;
+        });
+        s.busy[slot] = true;
+    }
+    if (!copy(s.stage[slot], ss.gdn_state, n, error)) { side_release_slot(s, slot); return false; }   // the snapshot
+    const auto r1 = std::chrono::steady_clock::now();   // the vectors and the snapshot
+    bool ok = copy(c.ple.data(), ss.ple_hist, c.ple.size(), error);
+    for (size_t j = 0; ok && j < layers; ++j) {
+        const auto& st = owned(ss, j);
+        ok = copy(c.tails.data() + j * z.tail, st.idx_tail, z.tail, error) &&
+             copy(c.dead.data() + j * z.dead, st.idx_dead, z.dead, error) &&
+             copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error);
+    }
+    if (!ok) { side_release_slot(s, slot); return false; }
+    {
+        std::lock_guard<std::mutex> lk(s.mu);
+        s.active.push_back(c.gdn.data());
+        s.queue.push_back({(const uint8_t*) s.stage[slot], c.gdn.data(), n, slot});
+    }
+    s.cv.notify_all();
+    if (atr) std::fprintf(stderr, "strata parktrace: side ckpt CUDA%d: vectors and snapshot %.2f ms, small copies and hand-over %.2f ms\n",
+        s.dev, std::chrono::duration<double, std::milli>(r1 - r0).count(),
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r1).count());
+    return true;
+}
+}  // namespace
+
 namespace {
 // conversation_checkpoint_save; `staged` (STRATA_CKPT_ASYNC): the GDN bytes land in `c.gdn` on the background thread
 // after this returns (conversation_checkpoint_join waits for them)
 bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const ModelGeometry& g, std::string& error,
-                     bool& staged) {
+                     bool& staged, bool allow_side = false) {
     static std::atomic<uint64_t> captures{0};
     c.capture = ++captures;   // new bytes: a new identity (ConversationCheckpoint::capture, STRATA_CKPT_PARK_REUSE)
     staged = false;
     const auto j0 = std::chrono::steady_clock::now();
-    conversation_checkpoint_join(nullptr);   // (the staging buffer is reused)
+    ckpt_async_join(nullptr);   // (the staging buffer is reused; not the per-device workers' copies: they have buffers of their own)
     if (std::getenv("STRATA_PARK_TRACE")) std::fprintf(stderr, "strata parktrace: save join %.2f ms\n",
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - j0).count());
 #if defined(STRATA_GPU_METAL)
@@ -299,6 +536,14 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
     const size_t layers = owned_qsa(ss);
     static const bool atr = std::getenv("STRATA_PARK_TRACE") != nullptr;
+    if (allow_side && ckpt_side_on() && !ckpt_async_on() && z.gdn >= ((size_t) 1 << 20)) {   // STRATA_CKPT_STAGE_ASYNC
+        int dev = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess) {
+            SideCkpt& sc = side_for(dev);
+            if (side_prepare(sc, z.gdn)) return checkpoint_save_side(sc, c, ss, z, layers, error);
+        }
+        (void) cudaGetLastError();
+    }
     const bool ready = c.gdn.size() == z.gdn;   // (a pooled checkpoint's pages are in; a fresh vector faults them all)
     const auto r0 = std::chrono::steady_clock::now();
     c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
@@ -389,7 +634,7 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
 bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState& ss,
                                   const ModelGeometry& g, std::string& error) {
     bool staged = false;
-    return checkpoint_save(c, ss, g, error, staged);
+    return checkpoint_save(c, ss, g, error, staged, true);
 }
 
 bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionState& ss,
