@@ -318,6 +318,59 @@ __global__ void __launch_bounds__(256) cvt_fix_kernel(const uint4* __restrict__ 
     }
 }
 
+// ---- STRATA_PF_HC_NOCVT ---------------------------------------------------------------------------------------------------------------
+// The writers of the BF16 image (kernels.cu) recorded the slice's max in `slot` (abs_bits<false>: the max BF16 magnitude bits << 16, 0 for an all-zero
+// slice) and wrote its FP16 image at shift 0 (half_rn(float(bf16)), xcvt_kernel<false>'s conversion), so this kernel is cvt_fix_kernel<false> with the
+// max read from the slot: g_hc.cur gets it (what xcvt_kernel's atomicMax left there: the ysc kernel, the products and inj_kernel read it from g_hc),
+// the slice is counted the same way, and a slice with a shift above 0 is rewritten from the BF16 image `x` into `out` by the same code (straight
+// rows only: the host takes this route for ldx == K).
+__global__ void __launch_bounds__(256) cvt_slot_kernel(const uint4* __restrict__ x, uint4* __restrict__ out, const unsigned n8, const float wmax,
+                                                       const unsigned* __restrict__ slot) {
+    const unsigned cur = *(volatile const unsigned*) slot;
+    const int k = shift_k(cur, wmax);
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        *(volatile unsigned*) &g_hc.cur = cur;
+        atomicAdd(&g_hc.slices, 1u);
+        atomicMax(&g_hc.xmax_all, cur);
+        atomicAdd(&g_hc.khist[k], 1u);
+        if (cur >= 0x7F800000u) atomicAdd(&g_hc.bad_x, 1u);
+    }
+    if (k == 0) return;
+    const float sc = pow2i(-k);
+    const unsigned step = gridDim.x * 256u;
+    for (unsigned i = blockIdx.x * 256u + threadIdx.x; i < n8; i += step) {
+        const uint4 v = __ldg(x + i);
+        const unsigned ws[4] = {v.x, v.y, v.z, v.w};
+        unsigned o[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float lo = to_f32<false>(ws[j] & 0xFFFFu) * sc, hi = to_f32<false>(ws[j] >> 16) * sc;
+            o[j] = (unsigned) __half_as_ushort(__float2half_rn(lo)) | ((unsigned) __half_as_ushort(__float2half_rn(hi)) << 16);
+        }
+        out[i] = make_uint4(o[0], o[1], o[2], o[3]);
+    }
+}
+// STRATA_PF_HC_NOCVT_CHECK=1: the old route's image (xcvt_kernel + cvt_fix_kernel, into the scratch `ref`) and max (saved in g_nc_ref_cur by
+// nc_save_kernel right after) against the new route's (`img`, g_hc.cur): the counts of slices, of slices with a different max, of different 16-bit
+// words and of slices with a shift (every one of them compared)
+__device__ unsigned g_nc_ref_cur;
+__device__ unsigned g_nc_chk[4];   // slices, max differs, words differ, shifted slices
+__global__ void nc_save_kernel() { g_nc_ref_cur = *(volatile unsigned*) &g_hc.cur; }
+__global__ void __launch_bounds__(256) nc_cmp_kernel(const uint4* __restrict__ ref, const uint4* __restrict__ img, const unsigned n8, const float wmax) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        const unsigned cur = *(volatile unsigned*) &g_hc.cur;
+        atomicAdd(&g_nc_chk[0], 1u);
+        if (cur != g_nc_ref_cur) atomicAdd(&g_nc_chk[1], 1u);
+        if (shift_k(cur, wmax) != 0) atomicAdd(&g_nc_chk[3], 1u);
+    }
+    unsigned bad = 0;
+    for (unsigned i = blockIdx.x * 256u + threadIdx.x; i < n8; i += gridDim.x * 256u) {
+        const uint4 a = ref[i], b = img[i];
+        bad += (a.x != b.x) + (a.y != b.y) + (a.z != b.z) + (a.w != b.w);
+    }
+    if (bad != 0) atomicAdd(&g_nc_chk[2], bad);
+}
+
 // The inject product (N 4, K 10240: the 4 columns of one hyper-connection read) on FP16 HFMA2 pairs: Y[t][n] = 2^k * sum_j x16[t][j] w16[n][j],
 // from the very FP16 image the down product reads (same slice, same shift: k from the pair's larger max |w|).  A 128-wide tile of the GEMM would
 // compute 4 useful columns of 128, so this is the dot products themselves: a block of 256 threads keeps its 5 chunks of 8 columns of the 4 weight rows

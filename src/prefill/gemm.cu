@@ -42,6 +42,7 @@
 #include "gemm_sass.cuh"   // STRATA_PF_HFMA_SASS
 #include "strata/prefill/pf_small.hpp"   // STRATA_PF_HFMA_SMALL
 #include "strata/prefill/pf_small2.hpp"   // STRATA_PF_ROUTER_V2
+#include "strata/prefill/pf_hc_nocvt.hpp"   // STRATA_PF_HC_NOCVT
 #include "strata/kernels/ktime.hpp"   // STRATA_PREFILL_TIMING=2: the hyper-connection products' kernels
 #include <cctype>
 #include <cmath>
@@ -1454,6 +1455,8 @@ struct HcDev {
     int copies = 0;
     double copy_mib = 0.0, min_free_mib = 1e30;
     float wmax_lo = 1e30f, wmax_hi = 0.0f;
+    int64_t ncv_taken = 0;                    // STRATA_PF_HC_NOCVT: slices that took the writers' max and image
+    std::map<std::string, int64_t> ncv_left;  // "product: reason" -> calls that took the old route
 };
 HcDev g_hcd[64];
 std::mutex g_hcd_mu;
@@ -1802,6 +1805,21 @@ bool Gemm::bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y,
     }
     cudaEvent_t ev_a = nullptr, ev_b = nullptr;
     const int prod = hc_prod(name);
+    // STRATA_PF_HC_NOCVT: the max and FP16 image of the activation were made by the writer of the BF16 image (kernels.cu); this product then runs
+    // cvt_slot_kernel per slice in place of memset + xcvt_kernel + cvt_fix_kernel and reads the FP16 image where it lies
+    HcImg nimg;
+    bool nocvt = false;
+    if (small && pf_hc_nocvt()) {
+        const char* nw = nullptr;
+        if (x_f16) nw = "the image is FP16 already";
+        else if (ldx != K) nw = "X row stride is not K";
+        else nocvt = hc_img_take(X, T, K, st, &nimg, &nw);
+        if (!nocvt) {
+            std::lock_guard<std::mutex> lk(g_hcd_mu);
+            ++g_hcd[dev].ncv_left[std::string(hc_prod_name(prod)) + ": " + (nw != nullptr ? nw : "?")];
+            g_hcd[dev].seen = true;
+        }
+    }
     if (hc_timing_on()) {
         std::lock_guard<std::mutex> lk(g_hcd_mu);
         auto& v = g_hctm[dev];
@@ -1843,8 +1861,22 @@ bool Gemm::bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y,
         const unsigned blocks = (unsigned) std::max<int64_t>(1, std::min<int64_t>(2048, (n8 + 1023) / 1024));
         namespace kt = strata::kernels::ktime;   // (no-ops unless STRATA_PREFILL_TIMING=2)
         kt::begin(kt::kHcXmax, st);
-        cudaMemsetAsync(sp, 0, sizeof(unsigned), st);   // HcState::cur is its first member
         const uint4* xs = reinterpret_cast<const uint4*>(X + t0 * ldx);
+        const uint16_t* xg = x16;   // the FP16 image the products read
+        if (nocvt) {
+            xg = nimg.xh + t0 * K;
+            const unsigned fix_blocks = std::min<unsigned>(blocks, 4u * (unsigned) nsm);
+            if (pf_hc_nocvt_check()) {   // the old route beside it, into the scratch (its counts are added to the read's: the slices show twice)
+                cudaMemsetAsync(sp, 0, sizeof(unsigned), st);
+                hcn::xcvt_kernel<false><<<blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(x16), (unsigned) n8, (unsigned) K8, (unsigned) ldx8);
+                hcn::cvt_fix_kernel<false><<<fix_blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(x16), (unsigned) n8, (unsigned) K8, (unsigned) ldx8, wm);
+                hcn::nc_save_kernel<<<1, 1, 0, st>>>();
+            }
+            hcn::cvt_slot_kernel<<<fix_blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(nimg.xh) + t0 * K8, (unsigned) n8, wm, nimg.slots + (t0 >> 10));
+            if (pf_hc_nocvt_check())
+                hcn::nc_cmp_kernel<<<fix_blocks, 256, 0, st>>>(reinterpret_cast<const uint4*>(x16), reinterpret_cast<const uint4*>(xg), (unsigned) n8, wm);
+        } else {
+        cudaMemsetAsync(sp, 0, sizeof(unsigned), st);   // HcState::cur is its first member
         if (small) {   // STRATA_PF_HFMA_SMALL: one pass takes the max and writes the image at shift 0; the second kernel counts the slice and redoes the image only for a shift > 0
             if (x_f16) hcn::xcvt_kernel<true><<<blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(x16), (unsigned) n8, (unsigned) K8, (unsigned) ldx8);
             else hcn::xcvt_kernel<false><<<blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(x16), (unsigned) n8, (unsigned) K8, (unsigned) ldx8);
@@ -1861,13 +1893,14 @@ bool Gemm::bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y,
             if (x_f16) hcn::cvt_kernel<true><<<blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(x16), n8, K8, ldx8, wm);
             else hcn::cvt_kernel<false><<<blocks, 256, 0, st>>>(xs, reinterpret_cast<uint4*>(x16), n8, K8, ldx8, wm);
         }
+        }
         const dim3 grid((unsigned) ((N + 127) / 128), (unsigned) ((rows + 127) / 128), (unsigned) Z);
         float* const y = Y + t0 * ldy;
         kt::begin(prod == 0 ? kt::kHcGemmDown : prod == 1 ? kt::kHcGemmUp : kt::kHcGemmInj, st);
         bool by_sass = false;
         if (sass_ysc != nullptr && sass_sink != nullptr) {   // the hand-scheduled twin of gemm_sk_kernel: it takes the scale from a word the kernel below writes
             hcn::ysc_kernel<<<1, 1, 0, st>>>(sass_ysc, wm);
-            const char* r = strata::prefill::sass::hc_slice(prod == 0, x16, hw.p, y, part, rows, N, K, ldy, Z, sass_ysc,
+            const char* r = strata::prefill::sass::hc_slice(prod == 0, xg, hw.p, y, part, rows, N, K, ldy, Z, sass_ysc,
                                                              Z == 1 ? (unsigned*) ((char*) sp + offsetof(hcn::HcState, bad_y)) : sass_sink, st, dev);
             if (r == nullptr) {
                 by_sass = true;
@@ -1885,7 +1918,7 @@ bool Gemm::bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y,
             sass_left(dev, hc_prod_name(prod), "device symbols missing");
         }
         if (!by_sass)
-            hcn::gemm_sk_kernel<<<grid, hfma::kThreads, 0, st>>>(reinterpret_cast<const uint4*>(x16), reinterpret_cast<const uint4*>(hw.p),
+            hcn::gemm_sk_kernel<<<grid, hfma::kThreads, 0, st>>>(reinterpret_cast<const uint4*>(xg), reinterpret_cast<const uint4*>(hw.p),
                                                                  Z > 1 ? part : y, (int) rows, (int) N, (int) K, (int) K8, Z > 1 ? N : ldy,
                                                                  rows * N, Z, wm);
         if (Z > 1) {
@@ -1896,10 +1929,10 @@ bool Gemm::bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y,
             kt::begin(kt::kHcGemmInj, st);
             const int64_t ldy2 = comp->ldy > 0 ? comp->ldy : comp->N;
             hcn::inj_kernel<<<(unsigned) ((rows + hcn::kInjRows - 1) / hcn::kInjRows), 256, 0, st>>>(
-                reinterpret_cast<const uint4*>(x16), reinterpret_cast<const uint4*>(hw2.p), comp->Y + t0 * ldy2, (int) rows, ldy2, wm);
+                reinterpret_cast<const uint4*>(xg), reinterpret_cast<const uint4*>(hw2.p), comp->Y + t0 * ldy2, (int) rows, ldy2, wm);
         }
         if (by_sass && sass_verify_on())
-            sass_verify_hc(dev, prod, x16, hw.p, y, rows, N, K, hc_pick_z((N + 127) / 128, (rows + 127) / 128, K, nsm), wm, st);
+            sass_verify_hc(dev, prod, xg, hw.p, y, rows, N, K, hc_pick_z((N + 127) / 128, (rows + 127) / 128, K, nsm), wm, st);
     }
     if (const cudaError_t le = cudaGetLastError(); le != cudaSuccess) {
         std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_HC: a launch failed: %s\n", cudaGetErrorString(le));
@@ -1909,6 +1942,7 @@ bool Gemm::bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y,
     std::lock_guard<std::mutex> lk(g_hcd_mu);
     g_hcd[dev].seen = true;
     ++g_hcd[dev].taken[prod];
+    if (nocvt) g_hcd[dev].ncv_taken += (T + kSl - 1) / kSl;
     if (with_inj) {
         ++g_hcd[dev].taken[2];
         comp->done = true;
@@ -1990,6 +2024,25 @@ void gemm_hfma_hc_report(int64_t tokens) {
             std::fprintf(stderr, "strata prefill: STRATA_PF_HFMA_SASS: read of %lld tokens, CUDA%d: %lld hyper-connection slices on the hand-scheduled kernels (%s), "
                                  "%lld left to the compiler kernel (%s)\n", (long long) tokens, dev, (long long) n_taken, by_kernel.empty() ? "-" : by_kernel.c_str(),
                          (long long) n_left, by_reason.empty() ? "-" : by_reason.c_str());
+        }
+        if (d.ncv_taken > 0 || !d.ncv_left.empty()) {   // STRATA_PF_HC_NOCVT
+            std::string nl;
+            int64_t n_old = 0;
+            for (const auto& [what, n] : d.ncv_left) { nl += (nl.empty() ? " (" : ", ") + what + " x" + std::to_string((long long) n); n_old += n; }
+            std::fprintf(stderr, "strata prefill: STRATA_PF_HC_NOCVT: read of %lld tokens, CUDA%d: %lld slices on the writers' max and FP16 image (no max-reduce, no conversion pass), "
+                                 "%lld products on the old route%s%s\n", (long long) tokens, dev, (long long) d.ncv_taken, (long long) n_old, nl.c_str(), nl.empty() ? "" : ")");
+        }
+        if (pf_hc_nocvt_check()) {
+            unsigned c[4] = {};
+            cudaSetDevice(dev);
+            if (cudaMemcpyFromSymbol(c, hcn::g_nc_chk, sizeof c) == cudaSuccess) {
+                std::fprintf(stderr, "strata prefill: STRATA_PF_HC_NOCVT_CHECK: read of %lld tokens, CUDA%d: %u slices compared with the old route's, %u with another max, %u 16-bit words "
+                                     "of the image differ, %u slices had a shift above 0\n", (long long) tokens, dev, c[0], c[1], c[2], c[3]);
+                unsigned z[4] = {};
+                cudaMemcpyToSymbol(hcn::g_nc_chk, z, sizeof z);
+            } else {
+                cudaGetLastError();
+            }
         }
         d = HcDev{};
     }
