@@ -578,6 +578,19 @@ static bool pf_hand_ahead() {
     static const bool v = [] { const char* e = std::getenv("STRATA_PF_HAND_AHEAD"); return e != nullptr && std::atoi(e) != 0; }();
     return v;
 }
+// STRATA_PF_HAND_DL_OVERLAP=1 (default off, with STRATA_PF_HAND_AHEAD): a hand-off through the host (between two boards) no longer
+// downloads the chunk's rows on the sending stage's loop.  Without it the sender queues the 94 MB download behind the chunk on its
+// compute stream and waits for it (28 ms a chunk at 3.3 GB/s: the next chunk cannot start before, because it overwrites R), so the
+// stage's loop is its GPU time plus the download.  Here the chunk's R is copied on the device into a staging buffer of its own (one
+// 94 MB buffer, ~0.4 ms) and the compute stream goes on at once; the download runs from the staging buffer on a copy stream and the
+// upload into the next stage's second R buffer waits for the download's event ON THE GPU (cudaStreamWaitEvent across the two dies),
+// so no host thread sits between the two.  The staging buffer is overwritten only after the compute stream has waited for the last
+// download out of it.  Same bytes, same order of every computation: bit-identical.  A case it cannot take (no room for the staging
+// buffer, a call that fails) downloads on the loop as before, counted and said once per reason.
+static bool pf_hand_dl_overlap() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_PF_HAND_DL_OVERLAP"); return e != nullptr && std::atoi(e) != 0; }();
+    return v;
+}
 struct HandAhead {   // the SENDING stage's side of its edge (stage -> next stage)
     std::mutex mu;
     std::condition_variable cv;
@@ -592,11 +605,18 @@ struct HandAhead {   // the SENDING stage's side of its edge (stage -> next stag
     double wait_ms = 0;                              // the sending stage's wait for the successor to take the chunk before
     int64_t p_ahead = 0, p_fb = 0, p_na = 0;         // as last printed
     double p_wait = 0;
+    // STRATA_PF_HAND_DL_OVERLAP
+    int64_t n_dl = 0, n_dl_fb = 0;                   // chunks downloaded off the sender's loop / that took the download on it
+    double dl_host_ms = 0;                           // the sender's host wait for the pinned slot (the upload two chunks back landing)
+    double up_wait_ms = 0;                           // the receiver's compute stream blocked at a chunk's start for rows still going up (GPU timeline; under mu)
+    int64_t p_dl = 0, p_dl_fb = 0;
+    double p_dl_host = 0, p_up_wait = 0;
 };
 struct HandAheadIn {   // the RECEIVING stage's side: which edge and job the chunk it runs belongs to
     Prefill* from = nullptr;
     int64_t seq = -1;
     bool nohost = false;   // the rows came over NVLink into the second R buffer: the pinned slot holds nothing
+    cudaEvent_t dl_ev = nullptr;   // STRATA_PF_HAND_DL_OVERLAP: the sender's "downloaded" event of this chunk (the pinned slot is valid only after it)
 };
 static void ha_mark(HandAhead& ha, int64_t taken_upto) {
     {
@@ -1388,6 +1408,19 @@ struct Prefill::Impl {
     cudaStream_t s_in = nullptr;
     cudaEvent_t rin_ready[2] = {}, rin_free[2] = {};
     bool rin_failed = false;
+    // STRATA_PF_HAND_DL_OVERLAP, this stage as the SENDER through the host: a device copy of the chunk's R (dl_stage), the stream the
+    // pinned download runs on (s_dl), "dl_stage holds the chunk" (dl_src, recorded on cs) and "the pinned slot holds the rows"
+    // (dl_ev, recorded on s_dl: the next stage's upload waits for it, and cs before it overwrites dl_stage).  dl_failed: it did not
+    // work and is not tried again
+    float* dl_stage = nullptr;
+    std::size_t dl_cap = 0;
+    cudaStream_t s_dl = nullptr;
+    cudaEvent_t dl_src = nullptr, dl_ev = nullptr;
+    bool dl_failed = false;
+    // ... and as the RECEIVER: a stopwatch (timing events on cs) around the wait for the rows still going up, read at the end of the chunk
+    cudaEvent_t upw[2] = {};
+    bool upw_pending = false;
+    HandAhead* upw_edge = nullptr;
     // C-4: the chunk's token ids on the device, for one batched embedding gather
     int32_t* tok_dev = nullptr;
     std::vector<int32_t> tok_host;
@@ -1507,6 +1540,13 @@ void Prefill::release() {
         if (b == 0 && impl_->ple_raw_dev) { (void) cudaFree(impl_->ple_raw_dev); impl_->ple_raw_dev = nullptr; }
     }
     if (impl_->s_in) (void) cudaStreamSynchronize(impl_->s_in);   // STRATA_PF_HAND_EARLY
+    if (impl_->s_dl) (void) cudaStreamSynchronize(impl_->s_dl);   // STRATA_PF_HAND_DL_OVERLAP
+    if (impl_->dl_stage) { (void) cudaFree(impl_->dl_stage); impl_->dl_stage = nullptr; }
+    if (impl_->dl_src) (void) cudaEventDestroy(impl_->dl_src);
+    if (impl_->dl_ev) (void) cudaEventDestroy(impl_->dl_ev);
+    for (cudaEvent_t& e : impl_->upw)
+        if (e) (void) cudaEventDestroy(e);
+    if (impl_->s_dl) (void) cudaStreamDestroy(impl_->s_dl);
     for (int b = 0; b < 2; ++b) {
         if (impl_->rin_ready[b]) (void) cudaEventDestroy(impl_->rin_ready[b]);
         if (impl_->rin_free[b]) (void) cudaEventDestroy(impl_->rin_free[b]);
@@ -3632,16 +3672,33 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (hand_early_ >= 0) {
                 const int b = std::exchange(hand_early_, -1);
                 if (c0 == 0 && T == n && m.rin[b] != nullptr) {
+                    // STRATA_PF_HAND_DL_OVERLAP: a stopwatch on this stream around the wait for the rows (still downloading or going up)
+                    bool timed = m.ha_in.from != nullptr && m.ha_in.dl_ev != nullptr;
+                    if (timed) {
+                        for (cudaEvent_t& e : m.upw)
+                            if (e == nullptr && cudaEventCreateWithFlags(&e, cudaEventDefault) != cudaSuccess) { timed = false; (void) cudaGetLastError(); }
+                        timed = timed && m.upw[0] != nullptr && m.upw[1] != nullptr && cudaEventRecord(m.upw[0], m.cs) == cudaSuccess;
+                    }
                     early_ok = cudaStreamWaitEvent(m.cs, m.rin_ready[b], 0) == cudaSuccess &&
+                               (!timed || cudaEventRecord(m.upw[1], m.cs) == cudaSuccess) &&
                                cudaMemcpyAsync(m.R, m.rin[b], (size_t) T * D * 4, cudaMemcpyDeviceToDevice, m.cs) == cudaSuccess &&
                                cudaEventRecord(m.rin_free[b], m.cs) == cudaSuccess;
                     if (!early_ok) (void) cudaGetLastError();
+                    if (early_ok && timed) {
+                        m.upw_pending = true;
+                        m.upw_edge = &m.ha_in.from->impl_->ha;
+                    }
                 }
                 (early_ok ? g_hand_early_used : g_hand_early_fb).fetch_add(1);
             }
             // STRATA_PF_HAND_AHEAD: a chunk that came over NVLink exists only in the second R buffer (the pinned slot holds nothing)
             if (!early_ok && m.ha_in.from != nullptr && m.ha_in.nohost) {
                 err = "prefill: the layer split's NVLink hand-off: the rows in the second R buffer could not be taken";
+                return false;
+            }
+            if (!early_ok && m.ha_in.from != nullptr && m.ha_in.dl_ev != nullptr &&
+                cudaEventSynchronize(m.ha_in.dl_ev) != cudaSuccess) {   // STRATA_PF_HAND_DL_OVERLAP: the pinned slot holds the rows once the download has landed
+                err = std::string("prefill: the layer split's hand-off download failed: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
             if (!early_ok &&
@@ -6337,7 +6394,73 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             (void) cudaGetLastError();
                         }
                     }
-                    if (!landed_a) {   // through the host: download into the pinned slot (its last upload has landed), early upload
+                    bool off_loop = false;   // STRATA_PF_HAND_DL_OVERLAP: the rows were downloaded from a staging copy on s_dl, not on this loop
+                    if (!landed_a && pf_hand_dl_overlap()) {
+                        const size_t bytes = (size_t) T * D * 4;
+                        auto no_dl = [&](int bit, const char* msg) {   // counted, said once per reason; this chunk downloads on the loop
+                            ++ha.n_dl_fb;
+                            static std::atomic<uint32_t> said_dl{0};
+                            if ((said_dl.fetch_or(1u << bit) & (1u << bit)) == 0)
+                                std::fprintf(stderr, "strata prefill: STRATA_PF_HAND_DL_OVERLAP: %s: such a hand-off downloads on the stage's "
+                                                     "loop, as before (counted, said once)\n", msg);
+                        };
+                        const core::OnDevice on_m(m.device);
+                        bool ready = true;
+                        if (m.dl_failed) {
+                            ready = false;
+                            no_dl(0, "the staging copy could not be set up earlier");
+                        } else if (m.dl_stage == nullptr) {
+                            const size_t cap = (size_t) std::max<int64_t>(m.T_max, T) * D;
+                            ready = (m.s_dl != nullptr || cudaStreamCreateWithFlags(&m.s_dl, cudaStreamNonBlocking) == cudaSuccess) &&
+                                    (m.dl_src != nullptr || cudaEventCreateWithFlags(&m.dl_src, cudaEventDisableTiming) == cudaSuccess) &&
+                                    (m.dl_ev != nullptr || cudaEventCreateWithFlags(&m.dl_ev, cudaEventDisableTiming) == cudaSuccess) &&
+                                    cudaMalloc((void**) &m.dl_stage, cap * sizeof(float)) == cudaSuccess;
+                            if (ready) {
+                                m.dl_cap = cap;
+                            } else {
+                                (void) cudaGetLastError();
+                                m.dl_stage = nullptr;
+                                m.dl_failed = true;
+                                no_dl(1, "no room for the staging copy of the chunk (or no stream or event)");
+                            }
+                        } else if ((size_t) T * D > m.dl_cap) {
+                            ready = false;
+                            no_dl(2, "the chunk does not fit the staging copy");
+                        }
+                        if (ready) {
+                            const auto tw = Clock::now();
+                            { const core::OnDevice on(nm.device); (void) cudaEventSynchronize(nm.rin_ready[b]); }   // the pinned slot: its last upload has landed
+                            ha.dl_host_ms += std::chrono::duration<double, std::milli>(Clock::now() - tw).count();
+                            // device copy of the chunk (cs waits first for the last download out of the staging copy), then the download on s_dl
+                            off_loop = cudaStreamWaitEvent(m.cs, m.dl_ev, 0) == cudaSuccess &&
+                                       cudaMemcpyAsync(m.dl_stage, m.R, bytes, cudaMemcpyDeviceToDevice, m.cs) == cudaSuccess &&
+                                       cudaEventRecord(m.dl_src, m.cs) == cudaSuccess &&
+                                       cudaStreamWaitEvent(m.s_dl, m.dl_src, 0) == cudaSuccess &&
+                                       cudaMemcpyAsync(h, m.dl_stage, bytes, cudaMemcpyDeviceToHost, m.s_dl) == cudaSuccess &&
+                                       cudaEventRecord(m.dl_ev, m.s_dl) == cudaSuccess;
+                            if (!off_loop) {
+                                (void) cudaGetLastError();
+                                (void) cudaStreamSynchronize(m.s_dl);   // whatever of it was queued has ended before the download on the loop
+                                (void) cudaGetLastError();
+                                no_dl(3, "the staging copy or its download could not be queued");
+                            }
+                        }
+                        if (off_loop) {   // the upload into the next stage's second R buffer: after the download, on the GPU (across the two dies)
+                            const core::OnDevice on_n(nm.device);
+                            const bool up = cudaStreamWaitEvent(nm.s_in, nm.rin_free[b], 0) == cudaSuccess &&
+                                            cudaStreamWaitEvent(nm.s_in, m.dl_ev, 0) == cudaSuccess &&
+                                            cudaMemcpyAsync(nm.rin[b], h, (size_t) T * D * 4, cudaMemcpyHostToDevice, nm.s_in) == cudaSuccess &&
+                                            cudaEventRecord(nm.rin_ready[b], nm.s_in) == cudaSuccess;
+                            if (!up) {
+                                (void) cudaGetLastError();
+                                off_loop = false;
+                                (void) cudaStreamSynchronize(m.s_dl);
+                                (void) cudaGetLastError();
+                                why_bit = 5; why = "the upload into the next stage's second R buffer failed";
+                            }
+                        }
+                    }
+                    if (!landed_a && !off_loop && why == nullptr) {   // through the host: download into the pinned slot (its last upload has landed), early upload
                         { const core::OnDevice on(nm.device); (void) cudaEventSynchronize(nm.rin_ready[b]); }
                         if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
                             cudaStreamSynchronize(m.cs) != cudaSuccess) {
@@ -6349,6 +6472,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                     }
                     if (why == nullptr) {
+                        if (off_loop) {   // (the in-loop download synchronized cs: here the chunk's work must have ended before its state is saved)
+                            if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                                err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
+                                return false;
+                            }
+                            ++ha.n_dl;
+                        }
                         if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
                         if (!wait_taken(j)) return false;   // the one chunk of buffer: job j-1 has taken its rows
                         if (ha.old_run.valid() && !ha.old_run.get()) {   // job j-2 has ended (the worker runs them in order)
@@ -6362,8 +6492,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (!m.hand_worker) m.hand_worker = std::make_unique<HandWorker>();
                         Prefill* const rx = next_;
                         const bool nohost = landed_a;
+                        const cudaEvent_t dle = off_loop ? m.dl_ev : nullptr;   // STRATA_PF_HAND_DL_OVERLAP
                         next_run_ = m.hand_worker->submit(std::packaged_task<bool()>(
-                            [this, rx, tokens, c0, T, p0, h, b, nohost, single_chunk, pipe_chunked, j, je] {
+                            [this, rx, tokens, c0, T, p0, h, b, nohost, dle, single_chunk, pipe_chunked, j, je] {
                             HandAhead& hs = impl_->ha;
                             struct TakenGuard {   // however the job ends, the stage before is not left waiting for it
                                 HandAhead& hs;
@@ -6382,7 +6513,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             rx->single_chunk_ = single_chunk;
                             rx->pipe_chunked_ = pipe_chunked;
                             rx->hand_early_ = b;
-                            rx->impl_->ha_in = HandAheadIn{this, j, nohost};
+                            rx->impl_->ha_in = HandAheadIn{this, j, nohost, dle};
                             const bool r = rx->run_impl(tokens + c0, T, p0, *je);
                             rx->impl_->ha_in.from = nullptr;
                             (void) cudaGetLastError();   // clear what a thread's end cleared (std::async)
@@ -6570,6 +6701,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
         err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
         return false;
+    }
+    if (m.upw_pending) {   // STRATA_PF_HAND_DL_OVERLAP: how long this stream sat blocked at the chunk's start for the rows still going up
+        m.upw_pending = false;
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, m.upw[0], m.upw[1]) == cudaSuccess && m.upw_edge != nullptr) {
+            std::lock_guard<std::mutex> lk(m.upw_edge->mu);
+            m.upw_edge->up_wait_ms += (double) ms;
+        } else {
+            (void) cudaGetLastError();
+        }
     }
     // (PR #121) an expert copy that failed on the copy stream surfaces here, not in the next request
     if (const cudaError_t cst = cudaStreamSynchronize(m.copy); cst != cudaSuccess) {
@@ -8067,6 +8208,38 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                  "the chunk before to be taken), %lld took the old wait, %lld not applicable (one-chunk reads); time stages "
                                  "waited for the chunk before to be taken (ms): %s\n", (long long) da, (long long) df, (long long) dn,
                          waits.c_str());
+    }
+    if (hand_in_ == nullptr && pf_hand_dl_overlap() && impl_) {   // STRATA_PF_HAND_DL_OVERLAP: what this read's host hand-offs did (counted, not assumed)
+        int64_t dd = 0, dfb = 0;
+        std::string waits;
+        char wb[96];
+        int edge = 0;
+        for (Prefill* p = this; p != nullptr && p->next_ != nullptr && p->impl_; p = p->next_, ++edge) {
+            HandAhead& ha = p->impl_->ha;
+            double upw = 0;
+            {
+                std::lock_guard<std::mutex> lk(ha.mu);
+                upw = ha.up_wait_ms - ha.p_up_wait;
+                ha.p_up_wait = ha.up_wait_ms;
+            }
+            const int64_t e_dl = ha.n_dl - ha.p_dl, e_fb = ha.n_dl_fb - ha.p_dl_fb;
+            const double e_host = ha.dl_host_ms - ha.p_dl_host;
+            dd += e_dl;
+            dfb += e_fb;
+            ha.p_dl = ha.n_dl;
+            ha.p_dl_fb = ha.n_dl_fb;
+            ha.p_dl_host = ha.dl_host_ms;
+            if (e_dl != 0 || e_fb != 0) {
+                std::snprintf(wb, sizeof wb, "%s%d->%d: %lld off-loop, uploads waited %.0f, host slot wait %.0f", waits.empty() ? "" : "; ", edge,
+                              edge + 1, (long long) e_dl, upw, e_host);
+                waits += wb;
+            }
+        }
+        if (dd != 0 || dfb != 0)
+            std::fprintf(stderr, "strata prefill: STRATA_PF_HAND_DL_OVERLAP: this read %lld hand-off chunks were downloaded off the sender's loop (staging "
+                                 "copy, download on a copy stream, upload queued behind it on the GPU), %lld took the download on the loop; per edge "
+                                 "(uploads waited = ms the next stage's compute stream was blocked at a chunk's start for its rows; host slot wait = "
+                                 "ms the sender's thread waited for the pinned slot): %s\n", (long long) dd, (long long) dfb, waits.c_str());
     }
     if (hand_in_ == nullptr && impl_ && impl_->plp && impl_->plp->active) {   // STRATA_PF_PLE_PEER: what this read's key products did (counted, not assumed)
         PlePeer& pp = *impl_->plp;
