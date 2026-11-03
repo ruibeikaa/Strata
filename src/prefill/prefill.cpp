@@ -3030,10 +3030,12 @@ void ple_projections(Gemm& gm, const strata::kernels::PleWeights& pw, const floa
         if (want_key) {
             kt(ktid::kPleKey);
             key_done = gm.ple_f16(e16, pw.key_bf16, key, nb, HD, N, 0);
+            if (key_done) gm.ple_f16_unscale(key, nb * HD);
         }
         if (want_val) {
             kt(ktid::kPleVal);
             val_done = gm.ple_f16(e16, pw.value_bf16, val, nb, N, N, 1);
+            if (val_done) gm.ple_f16_unscale(val, nb * N);
         }
         if (key_done && val_done) return;
     }

@@ -102,6 +102,8 @@ public:
     /// key: N 10240 K 2560) and the compiler's HFMA2 kernel (the same bits) elsewhere.  Not bitwise the BF16-rounded activation and cublasSgemm route's.  False = nothing launched (counted by reason): the caller
     /// runs bf16() on a BF16 image.
     void ple_f16_image(const float* x, uint16_t* y, int64_t n);
+    /// STRATA_PF_PLE_F16=2: ple_f16_image scales the image by 2^k (k from the image's own largest |x|, landing it in [128, 256)); ple_f16_unscale multiplies a product made from it by 2^-k (exact), n values.  No-ops at 1.
+    void ple_f16_unscale(float* Y, int64_t n);
     bool ple_f16(const uint16_t* Xh, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int prod);
 
     /// HIP gfx103x (prompt_f16()): bf16() takes X as the FP16 image the prompt path's kernels write (set_act_f16),

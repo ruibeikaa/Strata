@@ -40,6 +40,8 @@ inline bool pf_router_f16_check() { static const bool on = pf_router_f16() && pf
 // n-gram rows and the BF16 weights' resident FP16 copies on the dense HFMA2 kernels (hand-scheduled for the key where STRATA_PF_HFMA_SASS covers it), instead of the BF16-rounded rows widened to FP32 and cublasSgemm
 // on the BF16 weights widened to FP32.  NOT bitwise the FP32 route's: the activation keeps 11 mantissa bits (the FP32 route 8) and the sums are FP16 per 64 products widened to FP32.
 inline bool pf_ple_f16() { static const bool on = pf_env_on("STRATA_PF_PLE_F16"); return on; }
+// STRATA_PF_PLE_F16=2: each image is scaled by a power of two (its largest |x| to [128, 256): the n-gram rows are 0.06 at most) and the product scaled back by the exact inverse
+inline bool pf_ple_f16_scale() { static const bool on = [] { const char* e = std::getenv("STRATA_PF_PLE_F16"); return e != nullptr && std::atoi(e) >= 2; }(); return on; }
 // STRATA_PF_PLE_PEER=1 (default off, the first stage of a layer split whose next stage's die is its NVLink pair): the PLE block's key projection for the NEXT chunk runs on that die, on a stream of its own
 // (highest priority), while this stage reads the current chunk, and lands in this die's second key buffer over NVLink (cudaMemcpyPeerAsync).  The same raw rows, kernels, cuBLAS calls and weights
 // as the local product: the key is bit for bit the local key.  The first chunk of a call, a read of one chunk, a helped read and any launch that fails keep the local product (counted by reason, printed per read).

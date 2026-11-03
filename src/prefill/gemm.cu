@@ -1203,8 +1203,35 @@ std::mutex g_pl_mu;
 std::map<std::string, int64_t> g_pl_left[64];   // "key: reason" -> calls the old route ran
 std::map<std::string, int64_t> g_pl_cc[64];     // reasons the compiler's HFMA2 kernel ran instead of the hand-scheduled one
 float g_pl_wmax[64][2];                         // max |w| of the two weights' FP16 copies (under g_pl_mu)
-__device__ unsigned long long g_pl_x[4];        // max |x| bits, bad values
-__global__ void pl_image_kernel(const float4* __restrict__ x, uint2* __restrict__ y, int64_t n4) {
+__device__ unsigned long long g_pl_x[4];        // max |x| bits, bad values, 65 + the largest up-scale exponent, 65 - the smallest
+__device__ unsigned g_pl_cur;                   // STRATA_PF_PLE_F16=2: the max |x| (float bits) of the image being made
+__device__ float g_pl_sc[2];                    // its scale 2^k and the inverse 2^-k
+__global__ void pl_zero_kernel() { g_pl_cur = 0u; }
+__global__ void pl_max_kernel(const float4* __restrict__ x, int64_t n4) {
+    float mx = 0.0f;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (int64_t) gridDim.x * blockDim.x) {
+        const float4 v = x[i];
+        mx = fmaxf(mx, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+    }
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    if ((threadIdx.x & 31) == 0 && mx > 0.0f && mx < 3.0e38f) atomicMax(&g_pl_cur, __float_as_uint(mx));
+}
+// 2^k with the largest |x| of the image landing in [128, 256): k = 8 - e for max = m 2^e, m in [0.5, 1); 1 for an empty or non-finite image
+__device__ __forceinline__ int pl_scale_exp() {
+    const float mx = __uint_as_float(g_pl_cur);
+    if (!(mx > 0.0f) || !(mx < 3.0e38f)) return 0;
+    int e = 0;
+    (void) frexpf(mx, &e);
+    return max(-60, min(60, 8 - e));
+}
+__global__ void pl_image_kernel(const float4* __restrict__ x, uint2* __restrict__ y, int64_t n4, int up) {
+    const int k = up ? pl_scale_exp() : 0;
+    const float sc = __int_as_float((127 + k) << 23);   // 2^k, exact
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        g_pl_sc[0] = sc;
+        g_pl_sc[1] = __int_as_float((127 - k) << 23);
+        if (up) { atomicMax(&g_pl_x[2], (unsigned long long) (65 + k)); atomicMax(&g_pl_x[3], (unsigned long long) (65 - k)); }
+    }
     float mx = 0.0f;
     unsigned bad = 0;
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (int64_t) gridDim.x * blockDim.x) {
@@ -1215,7 +1242,7 @@ __global__ void pl_image_kernel(const float4* __restrict__ x, uint2* __restrict_
         for (int j = 0; j < 4; ++j) {
             const float f = fabsf(a[j]);
             if (!(f <= 65504.0f)) ++bad; else mx = fmaxf(mx, f);
-            h[j] = __half_as_ushort(__float2half_rn(a[j]));
+            h[j] = __half_as_ushort(__float2half_rn(a[j] * sc));   // (a power of two: the product is exact)
         }
         y[i] = make_uint2((unsigned) h[0] | ((unsigned) h[1] << 16), (unsigned) h[2] | ((unsigned) h[3] << 16));
     }
@@ -1226,6 +1253,14 @@ __global__ void pl_image_kernel(const float4* __restrict__ x, uint2* __restrict_
     if ((threadIdx.x & 31) == 0) {
         atomicMax(&g_pl_x[0], (unsigned long long) __float_as_uint(mx));
         if (bad != 0) atomicAdd(&g_pl_x[1], (unsigned long long) bad);
+    }
+}
+__global__ void pl_unscale_kernel(float4* __restrict__ y, int64_t n4) {
+    const float inv = g_pl_sc[1];
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (int64_t) gridDim.x * blockDim.x) {
+        float4 v = y[i];
+        v.x *= inv; v.y *= inv; v.z *= inv; v.w *= inv;
+        y[i] = v;
     }
 }
 void pl_report(int64_t tokens) {
@@ -1251,6 +1286,8 @@ void pl_report(int64_t tokens) {
         cudaSetDevice(d);
         cudaDeviceSynchronize();
         cudaMemcpyFromSymbol(c, g_pl_x, sizeof c);
+        char upb[96] = "";
+        if (c[2] != 0) std::snprintf(upb, sizeof upb, "; per-image up-scale 2^k, k from %d to %d, the product scaled back", (int) c[3] == 0 ? 0 : 65 - (int) c[3], (int) c[2] - 65);
         cudaMemcpyToSymbol(g_pl_x, z, sizeof z);
         cudaSetDevice(prev);
         const uint32_t mxb = (uint32_t) c[0];
@@ -1258,9 +1295,9 @@ void pl_report(int64_t tokens) {
         std::memcpy(&mx, &mxb, 4);
         std::fprintf(stderr, "strata prefill: STRATA_PF_PLE_F16: read of %lld tokens, CUDA%d: %lld PLE products (key, value) on the HFMA2 kernels (%lld on the hand-scheduled one; compiler kernel: %s), "
                              "%lld left to the FP32 route (%s); activation image: max |x| %.4g, %llu values past the FP16 range or not finite; FP16 weight copies: max |w| key %.4g, value %.4g "
-                             "(bound of one 64-product FP16 sum: %.4g of 65504)\n",
+                             "(bound of one 64-product FP16 sum: %.4g of 65504)%s\n",
                      (long long) tokens, d, (long long) taken, (long long) via_sass, by_cc.empty() ? "-" : by_cc.c_str(), (long long) left, by_left.empty() ? "-" : by_left.c_str(), (double) mx,
-                     c[1], (double) wk, (double) wv, 64.0 * (double) mx * (double) std::max(wk, wv));
+                     c[1], (double) wk, (double) wv, 64.0 * (double) mx * (double) std::max(wk, wv), upb);
     }
 }
 
@@ -1976,6 +2013,7 @@ bool Gemm::router_f16(const uint16_t*, const uint16_t*, float*, int64_t, int64_t
 }
 void Gemm::router_f16_cmp(const int32_t*, const int32_t*, const float*, const float*, int64_t, void*) {}
 void Gemm::ple_f16_image(const float*, uint16_t*, int64_t) {}
+void Gemm::ple_f16_unscale(float*, int64_t) {}
 bool Gemm::ple_f16(const uint16_t*, const uint16_t*, float*, int64_t, int64_t, int64_t, int) {
     return false;   // not the experimental sm_60 CUDA build: the FP32 route runs
 }
@@ -2335,7 +2373,18 @@ void Gemm::ple_f16_image(const float* x, uint16_t* y, int64_t n) {
     if (n <= 0) return;
     const int64_t n4 = n / 4;
     const unsigned blocks = (unsigned) std::min<int64_t>(4096, (n4 + 255) / 256);
-    pl_image_kernel<<<blocks, 256, 0, (cudaStream_t) stream_>>>(reinterpret_cast<const float4*>(x), reinterpret_cast<uint2*>(y), n4);
+    const bool up = strata::prefill::pf_ple_f16_scale();
+    if (up) {
+        pl_zero_kernel<<<1, 1, 0, (cudaStream_t) stream_>>>();
+        pl_max_kernel<<<blocks, 256, 0, (cudaStream_t) stream_>>>(reinterpret_cast<const float4*>(x), n4);
+    }
+    pl_image_kernel<<<blocks, 256, 0, (cudaStream_t) stream_>>>(reinterpret_cast<const float4*>(x), reinterpret_cast<uint2*>(y), n4, up ? 1 : 0);
+}
+// STRATA_PF_PLE_F16=2: the product of an image made with its up-scale, back by the exact inverse (a power of two)
+void Gemm::ple_f16_unscale(float* Y, int64_t n) {
+    if (n <= 0 || !strata::prefill::pf_ple_f16_scale()) return;
+    const int64_t n4 = n / 4;
+    pl_unscale_kernel<<<(unsigned) std::min<int64_t>(4096, (n4 + 255) / 256), 256, 0, (cudaStream_t) stream_>>>(reinterpret_cast<float4*>(Y), n4);
 }
 bool Gemm::ple_f16(const uint16_t* Xh, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int prod) {
     using namespace strata::prefill;
