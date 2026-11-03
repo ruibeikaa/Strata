@@ -2942,9 +2942,12 @@ bool hc_img_begin(const void* x, int64_t rows, int64_t k, void* stream, HcImg* o
         if (cudaMalloc((void**) &r.slots, kHcImgSlots * sizeof(unsigned)) != cudaSuccess) { (void) cudaGetLastError(); r.slots = nullptr; return false; }
     }
     if (r.cap < rows * k) {
+        // room for 8192 rows at least: a chunk that is larger than the one before must not stall the pipeline on a free + malloc (measured: 100 - 200 ms the first
+        // time a read has bigger chunks than any before)
+        const int64_t want = std::max<int64_t>(rows, 8192) * k;
         if (r.xh != nullptr) { cudaStreamSynchronize((cudaStream_t) stream); cudaFree(r.xh); r.xh = nullptr; r.cap = 0; }
-        if (cudaMalloc((void**) &r.xh, (size_t) (rows * k) * 2) != cudaSuccess) { (void) cudaGetLastError(); r.xh = nullptr; return false; }
-        r.cap = rows * k;
+        if (cudaMalloc((void**) &r.xh, (size_t) want * 2) != cudaSuccess) { (void) cudaGetLastError(); r.xh = nullptr; return false; }
+        r.cap = want;
     }
     if (cudaMemsetAsync(r.slots, 0, kHcImgSlots * sizeof(unsigned), (cudaStream_t) stream) != cudaSuccess) { (void) cudaGetLastError(); return false; }
     const bool keep = R == nullptr || rs == nullptr || wn == nullptr || k != 10240 || pf_hc_nocvt_check();   // the BF16 image is skipped for xn16 only

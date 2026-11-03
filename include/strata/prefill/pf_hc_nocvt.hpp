@@ -34,7 +34,17 @@ inline bool pf_hc_nocvt() {
 inline bool pf_hc_nocvt_check() {
     static const bool on = [] {
         const char* e = std::getenv("STRATA_PF_HC_NOCVT_CHECK");
-        return e != nullptr && std::atoi(e) != 0;
+        return e != nullptr && std::atoi(e) == 1;
+    }();
+    return on;
+}
+
+// STRATA_PF_HC_NOCVT_CHECK=2 (a test): the products take the old route although the records are valid - the BF16 image is rebuilt (hc_img_materialize) and
+// the old route runs on it, on every product of a real read
+inline bool pf_hc_nocvt_force_old() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_PF_HC_NOCVT_CHECK");
+        return e != nullptr && std::atoi(e) == 2;
     }();
     return on;
 }

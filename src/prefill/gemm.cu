@@ -1814,6 +1814,7 @@ bool Gemm::bf16_hfma(const uint16_t* X, bool x_f16, const uint16_t* W, float* Y,
         const char* nw = nullptr;
         if (x_f16) nw = "the image is FP16 already";
         else if (ldx != K) nw = "X row stride is not K";
+        else if (pf_hc_nocvt_force_old()) nw = "STRATA_PF_HC_NOCVT_CHECK=2: the old route on purpose";
         else nocvt = hc_img_take(X, T, K, st, &nimg, &nw);
         if (!nocvt) {
             std::lock_guard<std::mutex> lk(g_hcd_mu);
