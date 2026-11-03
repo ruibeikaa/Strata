@@ -591,6 +591,12 @@ static bool pf_hand_dl_overlap() {
     static const bool v = [] { const char* e = std::getenv("STRATA_PF_HAND_DL_OVERLAP"); return e != nullptr && std::atoi(e) != 0; }();
     return v;
 }
+// STRATA_PF_HAND_DL_OVERLAP_TEST=N (a check of the fallbacks, not a setting): 1 = the staging copy cannot be set up, 2 = every third chunk's
+// queueing "fails" once the staging copy and the download are queued, 3 = every fourth attempt's upload "fails" once it is queued
+static int pf_hand_dl_test() {
+    static const int v = [] { const char* e = std::getenv("STRATA_PF_HAND_DL_OVERLAP_TEST"); return e != nullptr ? std::atoi(e) : 0; }();
+    return v;
+}
 struct HandAhead {   // the SENDING stage's side of its edge (stage -> next stage)
     std::mutex mu;
     std::condition_variable cv;
@@ -6411,7 +6417,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             no_dl(0, "the staging copy could not be set up earlier");
                         } else if (m.dl_stage == nullptr) {
                             const size_t cap = (size_t) std::max<int64_t>(m.T_max, T) * D;
-                            ready = (m.s_dl != nullptr || cudaStreamCreateWithFlags(&m.s_dl, cudaStreamNonBlocking) == cudaSuccess) &&
+                            ready = pf_hand_dl_test() != 1 &&
+                                    (m.s_dl != nullptr || cudaStreamCreateWithFlags(&m.s_dl, cudaStreamNonBlocking) == cudaSuccess) &&
                                     (m.dl_src != nullptr || cudaEventCreateWithFlags(&m.dl_src, cudaEventDisableTiming) == cudaSuccess) &&
                                     (m.dl_ev != nullptr || cudaEventCreateWithFlags(&m.dl_ev, cudaEventDisableTiming) == cudaSuccess) &&
                                     cudaMalloc((void**) &m.dl_stage, cap * sizeof(float)) == cudaSuccess;
@@ -6438,6 +6445,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                        cudaStreamWaitEvent(m.s_dl, m.dl_src, 0) == cudaSuccess &&
                                        cudaMemcpyAsync(h, m.dl_stage, bytes, cudaMemcpyDeviceToHost, m.s_dl) == cudaSuccess &&
                                        cudaEventRecord(m.dl_ev, m.s_dl) == cudaSuccess;
+                            if (off_loop && pf_hand_dl_test() == 2 && j % 3 == 0) off_loop = false;   // (the check: the chunk's staging copy and download are queued)
                             if (!off_loop) {
                                 (void) cudaGetLastError();
                                 (void) cudaStreamSynchronize(m.s_dl);   // whatever of it was queued has ended before the download on the loop
@@ -6451,7 +6459,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                             cudaStreamWaitEvent(nm.s_in, m.dl_ev, 0) == cudaSuccess &&
                                             cudaMemcpyAsync(nm.rin[b], h, (size_t) T * D * 4, cudaMemcpyHostToDevice, nm.s_in) == cudaSuccess &&
                                             cudaEventRecord(nm.rin_ready[b], nm.s_in) == cudaSuccess;
-                            if (!up) {
+                            static std::atomic<int64_t> tried_up{0};   // (the check 3: counts attempts, since a failed one does not advance j)
+                            if (!up || (pf_hand_dl_test() == 3 && tried_up.fetch_add(1) % 4 == 3)) {
                                 (void) cudaGetLastError();
                                 off_loop = false;
                                 (void) cudaStreamSynchronize(m.s_dl);
